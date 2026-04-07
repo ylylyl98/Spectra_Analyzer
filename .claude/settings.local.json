@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/ylylyl98/pl-lorentz-overlay-fit-pyside6/main/pl_lorentz_overlay_fit_pyside6/app.py\")",
+      "Bash(curl -s \"https://api.github.com/repos/ylylyl98/pl-lorentz-overlay-fit-pyside6/contents/pl_lorentz_overlay_fit_pyside6\")",
+      "Bash(python -c \"from spectra_app.fitting import find_peak_indices, find_peaks_second_derivative, fit_multi_peak, FitResult; from spectra_app.main_window import MainWindow; print\\('All imports OK'\\)\")",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import scipy; print\\(scipy.__version__\\)\")",
+      "Bash(where python:*)",
+      "Bash(C:\\\\Users\\\\yanli\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe -m pip install scipy)",
+      "Bash(python -m pip install scipy)"
+    ]
+  }
+}
