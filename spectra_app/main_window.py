@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -52,6 +53,47 @@ from .fitting import (
     find_peaks_second_derivative,
     fit_multi_peak,
     _clamp_sg_window,
+)
+
+
+# ── Button style constants ────────────────────────────────────────────────────
+_STYLE_PRIMARY = (
+    "QPushButton {"
+    "  background: #1976d2; color: white;"
+    "  border: none; border-radius: 4px;"
+    "  padding: 5px 10px; font-weight: 600;"
+    "}"
+    "QPushButton:hover { background: #1565c0; }"
+    "QPushButton:pressed { background: #0d47a1; }"
+    "QPushButton:disabled { background: #b0bec5; color: #78909c; }"
+)
+_STYLE_TOGGLE = (
+    "QPushButton {"
+    "  background: #f5f5f5; color: #333;"
+    "  border: 1px solid #bdbdbd; border-radius: 4px;"
+    "  padding: 4px 8px;"
+    "}"
+    "QPushButton:checked { background: #f57c00; color: white; border-color: #e65100; }"
+    "QPushButton:hover:!checked { background: #eeeeee; }"
+    "QPushButton:disabled { color: #bdbdbd; border-color: #e0e0e0; }"
+)
+_STYLE_MUTED = (
+    "QPushButton {"
+    "  background: #fafafa; color: #455a64;"
+    "  border: 1px solid #cfd8dc; border-radius: 4px;"
+    "  padding: 4px 8px;"
+    "}"
+    "QPushButton:hover { background: #eceff1; }"
+    "QPushButton:disabled { color: #bdbdbd; border-color: #eee; }"
+)
+_STYLE_DANGER = (
+    "QPushButton {"
+    "  background: #fafafa; color: #c62828;"
+    "  border: 1px solid #ef9a9a; border-radius: 4px;"
+    "  padding: 4px 8px;"
+    "}"
+    "QPushButton:hover { background: #ffebee; }"
+    "QPushButton:disabled { color: #bdbdbd; border-color: #e0e0e0; }"
 )
 
 
@@ -97,6 +139,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_coords: tuple[np.ndarray, np.ndarray] | None = None
         self.batch_fit_result_map: dict[int, FitResult] = {}
         self._batch_fit_export_rows: list[dict[str, str]] = []
+        self._has_batch_fit_results: bool = False
 
         # ── UI lock helpers ──────────────────────────────────────────────────
         self._view_lock_controls: dict[QDoubleSpinBox, QCheckBox] = {}
@@ -148,35 +191,62 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
+
+        # Apply a minimal global stylesheet for consistent widget appearance
+        self.setStyleSheet(
+            "QGroupBox {"
+            "  border: 1px solid #d0d0d0; border-radius: 5px;"
+            "  margin-top: 10px; font-weight: 600; font-size: 11px;"
+            "}"
+            "QGroupBox::title {"
+            "  subcontrol-origin: margin; subcontrol-position: top left;"
+            "  left: 8px; padding: 0 4px; color: #333;"
+            "}"
+            "QTabWidget::pane { border: 1px solid #d0d0d0; border-radius: 3px; }"
+            "QTabBar::tab {"
+            "  padding: 5px 14px; font-size: 11px; border: 1px solid #ccc;"
+            "  border-bottom: none; border-top-left-radius: 3px; border-top-right-radius: 3px;"
+            "  background: #f0f0f0; color: #555;"
+            "}"
+            "QTabBar::tab:selected { background: white; color: #1565c0; font-weight: 600; }"
+            "QTabBar::tab:hover:!selected { background: #e8e8e8; }"
+            "QStatusBar { font-size: 10px; color: #555; }"
+        )
+
         split = QSplitter(Qt.Horizontal)
-        plot_panel = self._build_plot_panel()
-        left = self._build_left_panel()
-        left.setMinimumWidth(430)
-        split.addWidget(left)
-        split.addWidget(plot_panel)
         split.setChildrenCollapsible(False)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([460, 860])
+
+        left = self._build_left_panel()
+        left.setMinimumWidth(420)
+        plot_panel = self._build_plot_panel()
+
+        split.addWidget(left)
+        split.addWidget(plot_panel)
+        split.setSizes([450, 870])
+
         outer = QHBoxLayout(root)
-        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setContentsMargins(8, 8, 8, 8)
         outer.addWidget(split)
+
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Select a root folder or drag-and-drop a .dat file to start.")
+        self.statusBar().showMessage(
+            "Select a root folder or drag-and-drop a .dat file to start."
+        )
 
         # DnD overlay (child of centralWidget so it floats on top)
         self._dnd_overlay = QLabel(self.centralWidget())
         self._dnd_overlay.setAlignment(Qt.AlignCenter)
         self._dnd_overlay.setStyleSheet(
             "background: rgba(33,150,243,0.18);"
-            "color: #0d47a1;"
-            "font-size: 20px;"
-            "font-weight: bold;"
-            "border: 3px dashed #1565c0;"
-            "border-radius: 10px;"
+            "color: #0d47a1; font-size: 20px; font-weight: bold;"
+            "border: 3px dashed #1565c0; border-radius: 10px;"
         )
         self._dnd_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._dnd_overlay.setVisible(False)
+
+        # Gate navigation signals (wired here because plot panel builds the widgets)
         self.plot_gate_spin.valueChanged.connect(self._on_plot_gate_spin_changed)
         self.plot_gate_index_spin.valueChanged.connect(self._on_plot_gate_index_changed)
         self.plot_prev_gate_btn.clicked.connect(lambda: self._step_gate_index(-1))
@@ -193,17 +263,32 @@ class MainWindow(QMainWindow):
     def _make_expander(self, title: str, content: QWidget, *, expanded: bool = True) -> QWidget:
         box = QFrame()
         box.setFrameShape(QFrame.StyledPanel)
-        box.setFrameShadow(QFrame.Raised)
+        box.setFrameShadow(QFrame.Plain)
+        box.setStyleSheet(
+            "QFrame[frameShape='5'] {"  # StyledPanel = 5
+            "  border: 1px solid #d0d0d0; border-radius: 5px;"
+            "}"
+        )
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setContentsMargins(6, 4, 6, 6)
         lay.setSpacing(4)
+
         btn = QToolButton()
-        btn.setText(title)
+        btn.setText(f"  {title}")
         btn.setCheckable(True)
         btn.setChecked(expanded)
         btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        btn.setStyleSheet("QToolButton { font-weight: 600; border: none; padding: 2px 4px; text-align: left; }")
+        btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn.setStyleSheet(
+            "QToolButton {"
+            "  font-weight: 600; font-size: 11px; color: #333;"
+            "  border: none; border-radius: 3px;"
+            "  padding: 4px 4px; text-align: left;"
+            "  background: #f0f4f8;"
+            "}"
+            "QToolButton:hover { background: #e3eaf2; }"
+        )
         content.setVisible(expanded)
 
         def _toggle(on: bool) -> None:
@@ -246,129 +331,108 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
 
         panel = QWidget()
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(6)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(8)
 
-        # ── Data Source ───────────────────────────────────────────────────────
-        src = QGroupBox("")
-        src_grid = QVBoxLayout(src)
-        src_grid.setContentsMargins(6, 6, 6, 6)
-        src_grid.setSpacing(4)
+        # ── Data Source (expander, default expanded) ──────────────────────────
+        src_content = QWidget()
+        src_lay = QVBoxLayout(src_content)
+        src_lay.setContentsMargins(2, 4, 2, 4)
+        src_lay.setSpacing(6)
+
+        # Root folder row
+        root_row = QHBoxLayout()
+        root_row.setSpacing(6)
         self.root_edit = QLineEdit()
         self.root_edit.setReadOnly(True)
-        self.root_edit.setPlaceholderText("Root folder path")
-        self.browse_btn = QPushButton("Browse Root Folder")
-        self.folder_combo = QComboBox()
-        self.folder_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.folder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        src_grid.addWidget(self.root_edit)
-        src_grid.addWidget(self.browse_btn)
-        src_grid.addWidget(QLabel("Process Folder:"))
-        src_grid.addWidget(self.folder_combo)
-        lay.addWidget(self._make_expander("Data Source", src, expanded=False))
+        self.root_edit.setPlaceholderText("Root folder path…")
+        self.root_edit.setToolTip("Path to the root folder containing .dat experiment folders")
+        self.browse_btn = QPushButton("Browse…")
+        self.browse_btn.setToolTip("Open a dialog to choose the root folder")
+        self.browse_btn.setMinimumWidth(72)
+        self.browse_btn.setStyleSheet(_STYLE_PRIMARY)
+        root_row.addWidget(self.root_edit, 1)
+        root_row.addWidget(self.browse_btn)
+        src_lay.addLayout(root_row)
 
-        # ── DAT Files ─────────────────────────────────────────────────────────
-        files = QGroupBox("")
-        files_l = QVBoxLayout(files)
-        files_l.setContentsMargins(6, 6, 6, 6)
-        files_l.setSpacing(4)
+        # Process folder row
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(6)
+        folder_lbl = QLabel("Folder:")
+        folder_lbl.setFixedWidth(48)
+        folder_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+        self.folder_combo = QComboBox()
+        self.folder_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.folder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.folder_combo.setToolTip("Select the process sub-folder to list .dat files from")
+        folder_row.addWidget(folder_lbl)
+        folder_row.addWidget(self.folder_combo, 1)
+        src_lay.addLayout(folder_row)
+
+        # Separator
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.HLine)
+        sep1.setFrameShadow(QFrame.Sunken)
+        sep1.setStyleSheet("color: #ddd;")
+        src_lay.addWidget(sep1)
+
+        # File list
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.file_list.setMaximumHeight(110)
+        self.file_list.setMinimumHeight(70)
+        self.file_list.setMaximumHeight(100)
+        self.file_list.setToolTip("Double-click or select and press Load to open a .dat file")
+        self.file_list.setStyleSheet(
+            "QListWidget { border: 1px solid #ddd; border-radius: 3px; font-size: 11px; }"
+            "QListWidget::item:selected { background: #1976d2; color: white; }"
+        )
+        src_lay.addWidget(self.file_list)
+
         self.load_btn = QPushButton("Load Selected File")
-        files_l.addWidget(self.file_list)
-        files_l.addWidget(self.load_btn)
-        lay.addWidget(self._make_expander("DAT Files", files, expanded=False))
+        self.load_btn.setToolTip("Load the highlighted .dat file (double-click also works)")
+        self.load_btn.setStyleSheet(_STYLE_PRIMARY)
+        src_lay.addWidget(self.load_btn)
 
-        # ── Plot / Cursor ─────────────────────────────────────────────────────
-        params = QGroupBox("")
-        params_form = QFormLayout(params)
-        params_form.setContentsMargins(6, 6, 6, 6)
-        params_form.setSpacing(4)
-        params_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        lay.addWidget(self._make_expander("Data Source", src_content, expanded=True))
 
-        self.cmap_combo = QComboBox()
-        self.cmap_combo.addItems(["turbo", "viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r"])
-        self.cmap_combo.setCurrentText("RdBu_r")
-        self.cmap_combo.setMaximumWidth(150)
+        # ── View Settings (expander, default expanded) ────────────────────────
+        view_content = self._build_view_settings()
+        lay.addWidget(self._make_expander("View Settings", view_content, expanded=True))
 
-        self.x_axis_override_combo = QComboBox()
-        for value, label in AXIS_OVERRIDE_ITEMS:
-            self.x_axis_override_combo.addItem(label, value)
-        self.x_axis_override_combo.setMaximumWidth(220)
-        self.axis_status_label = QLabel("X-axis: no file loaded.")
-        self.axis_status_label.setWordWrap(True)
-        self.axis_status_label.setStyleSheet("color:#54606c; font-size: 10px;")
-
-        self.gate_spin = GateValueSpinBox()
-        self.gate_spin.setDecimals(6)
-        self.gate_spin.setRange(-1e12, 1e12)
-        self.gate_spin.setSingleStep(0.01)
-        self.gate_spin.setMaximumWidth(150)
-        self.apply_gate_btn = QPushButton("Apply Gate")
-
-        self.xmin_spin = QDoubleSpinBox()
-        self.xmax_spin = QDoubleSpinBox()
-        self.ymin_spin = QDoubleSpinBox()
-        self.ymax_spin = QDoubleSpinBox()
-        self.vmin_spin = QDoubleSpinBox()
-        self.vmax_spin = QDoubleSpinBox()
-        for spin in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
-                     self.ymax_spin, self.vmin_spin, self.vmax_spin):
-            spin.setDecimals(6)
-            spin.setRange(-1e12, 1e12)
-            spin.setSingleStep(0.01)
-            spin.setMaximumWidth(150)
-        self.xmin_lock = QCheckBox("Fix")
-        self.xmax_lock = QCheckBox("Fix")
-        self.ymin_lock = QCheckBox("Fix")
-        self.ymax_lock = QCheckBox("Fix")
-        self.vmin_lock = QCheckBox("Fix")
-        self.vmax_lock = QCheckBox("Fix")
-        self._view_lock_controls = {
-            self.xmin_spin: self.xmin_lock, self.xmax_spin: self.xmax_lock,
-            self.ymin_spin: self.ymin_lock, self.ymax_spin: self.ymax_lock,
-            self.vmin_spin: self.vmin_lock, self.vmax_spin: self.vmax_lock,
-        }
-        self.apply_view_btn = QPushButton("Apply View")
-        self.auto_view_btn = QPushButton("Auto View")
-        view_btn_row = self._hrow([self.apply_view_btn, self.auto_view_btn])
-
-        params_form.addRow("X-Axis Override", self.x_axis_override_combo)
-        params_form.addRow("X-Axis Status", self.axis_status_label)
-        params_form.addRow("Colormap", self.cmap_combo)
-        params_form.addRow("xmin", self._view_spin_row(self.xmin_spin, self.xmin_lock))
-        params_form.addRow("xmax", self._view_spin_row(self.xmax_spin, self.xmax_lock))
-        params_form.addRow("ymin", self._view_spin_row(self.ymin_spin, self.ymin_lock))
-        params_form.addRow("ymax", self._view_spin_row(self.ymax_spin, self.ymax_lock))
-        params_form.addRow("vmin", self._view_spin_row(self.vmin_spin, self.vmin_lock))
-        params_form.addRow("vmax", self._view_spin_row(self.vmax_spin, self.vmax_lock))
-        params_form.addRow("Gate", self.gate_spin)
-        params_form.addRow("", self.apply_gate_btn)
-        params_form.addRow("", view_btn_row)
-        lay.addWidget(self._make_expander("Plot / Cursor", params, expanded=False))
-
-        # ── Spectrum Analysis (tabs) ──────────────────────────────────────────
-        analysis_outer = QGroupBox("")
-        ao_lay = QVBoxLayout(analysis_outer)
-        ao_lay.setContentsMargins(4, 4, 4, 4)
-        ao_lay.setSpacing(4)
+        # ── Spectrum Analysis ─────────────────────────────────────────────────
+        analysis_box = QGroupBox("Spectrum Analysis")
+        ao_lay = QVBoxLayout(analysis_box)
+        ao_lay.setContentsMargins(8, 14, 8, 8)
+        ao_lay.setSpacing(6)
 
         self._analysis_tabs = QTabWidget()
         self._analysis_tabs.addTab(self._build_find_peak_tab(), "Find Peaks")
         self._analysis_tabs.addTab(self._build_lorentz_fit_tab(), "Lorentz Fit")
+        ao_lay.addWidget(self._analysis_tabs)
+
+        # Analysis output label
+        out_hdr = QLabel("Analysis Output")
+        out_hdr.setStyleSheet("font-weight: 600; color: #444; font-size: 11px; margin-top: 2px;")
+        ao_lay.addWidget(out_hdr)
 
         self.analysis_text = QPlainTextEdit()
         self.analysis_text.setReadOnly(True)
-        self.analysis_text.setMaximumHeight(120)
-
-        ao_lay.addWidget(self._analysis_tabs)
+        self.analysis_text.setMinimumHeight(70)
+        self.analysis_text.setMaximumHeight(130)
+        self.analysis_text.setStyleSheet(
+            "QPlainTextEdit {"
+            "  background: #f8f9fa; border: 1px solid #dee2e6;"
+            "  border-radius: 3px; font-family: Consolas, monospace; font-size: 10px;"
+            "  padding: 4px;"
+            "}"
+        )
         ao_lay.addWidget(self.analysis_text)
-        lay.addWidget(self._make_expander("Spectrum Analysis", analysis_outer, expanded=True))
-        lay.addStretch(1)
+
+        lay.addWidget(analysis_box, 1)
 
         # ── wire up non-tab signals ───────────────────────────────────────────
         self.browse_btn.clicked.connect(self._on_browse_root)
@@ -379,6 +443,9 @@ class MainWindow(QMainWindow):
         self.gate_spin.valueChanged.connect(self._on_gate_spin_changed)
         self.x_axis_override_combo.currentIndexChanged.connect(self._on_x_axis_override_changed)
         self.cmap_combo.currentTextChanged.connect(lambda _: self._plot_cube())
+        self.lw_min_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
+        self.lw_max_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
+        self.peak_move_limit_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
         for spin in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
                      self.ymax_spin, self.vmin_spin, self.vmax_spin):
             spin.valueChanged.connect(lambda _: self._plot_cube())
@@ -388,221 +455,455 @@ class MainWindow(QMainWindow):
         scroll.setWidget(panel)
         return scroll
 
+    # ── view settings content (used inside expander) ──────────────────────────
+
+    def _build_view_settings(self) -> QWidget:
+        """Build the View Settings panel content (X-axis, colormap, bounds, gate)."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(2, 4, 2, 4)
+        lay.setSpacing(8)
+
+        # ── X-axis override + colormap row ────────────────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(6)
+
+        x_axis_lbl = QLabel("X-Axis:")
+        x_axis_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+
+        self.x_axis_override_combo = QComboBox()
+        for value, label in AXIS_OVERRIDE_ITEMS:
+            self.x_axis_override_combo.addItem(label, value)
+        self.x_axis_override_combo.setToolTip(
+            "Override the auto-detected x-axis type. Use 'Auto Detect' unless the detection is wrong."
+        )
+
+        cmap_lbl = QLabel("Colormap:")
+        cmap_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+
+        self.cmap_combo = QComboBox()
+        self.cmap_combo.addItems(["turbo", "viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r"])
+        self.cmap_combo.setCurrentText("RdBu_r")
+        self.cmap_combo.setToolTip("Colormap used for the intensity heatmap")
+
+        top_row.addWidget(x_axis_lbl)
+        top_row.addWidget(self.x_axis_override_combo, 1)
+        top_row.addWidget(cmap_lbl)
+        top_row.addWidget(self.cmap_combo, 1)
+        lay.addLayout(top_row)
+
+        # Axis status label
+        self.axis_status_label = QLabel("X-axis: no file loaded.")
+        self.axis_status_label.setWordWrap(True)
+        self.axis_status_label.setStyleSheet(
+            "color: #607d8b; font-size: 10px;"
+            "background: #f0f4f8; border-radius: 3px; padding: 3px 5px;"
+        )
+        lay.addWidget(self.axis_status_label)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        sep.setStyleSheet("color: #e0e0e0;")
+        lay.addWidget(sep)
+
+        # ── View bounds grid (Min / Max per axis) ─────────────────────────────
+        self.xmin_spin = QDoubleSpinBox()
+        self.xmax_spin = QDoubleSpinBox()
+        self.ymin_spin = QDoubleSpinBox()
+        self.ymax_spin = QDoubleSpinBox()
+        self.vmin_spin = QDoubleSpinBox()
+        self.vmax_spin = QDoubleSpinBox()
+        for sp in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
+                   self.ymax_spin, self.vmin_spin, self.vmax_spin):
+            sp.setDecimals(6)
+            sp.setRange(-1e12, 1e12)
+            sp.setSingleStep(0.01)
+            sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.xmin_lock = QCheckBox("Fix")
+        self.xmax_lock = QCheckBox("Fix")
+        self.ymin_lock = QCheckBox("Fix")
+        self.ymax_lock = QCheckBox("Fix")
+        self.vmin_lock = QCheckBox("Fix")
+        self.vmax_lock = QCheckBox("Fix")
+        for ck in (self.xmin_lock, self.xmax_lock, self.ymin_lock,
+                   self.ymax_lock, self.vmin_lock, self.vmax_lock):
+            ck.setToolTip("When checked, this limit is not updated by 'Auto View'")
+        self._view_lock_controls = {
+            self.xmin_spin: self.xmin_lock, self.xmax_spin: self.xmax_lock,
+            self.ymin_spin: self.ymin_lock, self.ymax_spin: self.ymax_lock,
+            self.vmin_spin: self.vmin_lock, self.vmax_spin: self.vmax_lock,
+        }
+
+        bounds_box = QGroupBox("Heatmap Bounds")
+        bounds_grid = QGridLayout(bounds_box)
+        bounds_grid.setContentsMargins(8, 14, 8, 8)
+        bounds_grid.setSpacing(5)
+        bounds_grid.setHorizontalSpacing(6)
+
+        # Header row
+        hdr_min = QLabel("Min")
+        hdr_max = QLabel("Max")
+        for lbl in (hdr_min, hdr_max):
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("font-weight: 600; color: #666; font-size: 10px;")
+        bounds_grid.addWidget(hdr_min, 0, 1, 1, 2, Qt.AlignCenter)
+        bounds_grid.addWidget(hdr_max, 0, 3, 1, 2, Qt.AlignCenter)
+
+        # Row labels
+        for row_idx, txt, tip in (
+            (1, "Energy (X)", "Horizontal axis range shown on the heatmap"),
+            (2, "Gate (Y)", "Vertical axis range shown on the heatmap"),
+            (3, "Intensity", "Color (value) range for the heatmap colormap"),
+        ):
+            lbl = QLabel(txt)
+            lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            lbl.setToolTip(tip)
+            lbl.setStyleSheet("font-size: 10px; color: #444;")
+            bounds_grid.addWidget(lbl, row_idx, 0)
+
+        bounds_grid.addWidget(self.xmin_spin, 1, 1)
+        bounds_grid.addWidget(self.xmin_lock, 1, 2)
+        bounds_grid.addWidget(self.xmax_spin, 1, 3)
+        bounds_grid.addWidget(self.xmax_lock, 1, 4)
+
+        bounds_grid.addWidget(self.ymin_spin, 2, 1)
+        bounds_grid.addWidget(self.ymin_lock, 2, 2)
+        bounds_grid.addWidget(self.ymax_spin, 2, 3)
+        bounds_grid.addWidget(self.ymax_lock, 2, 4)
+
+        bounds_grid.addWidget(self.vmin_spin, 3, 1)
+        bounds_grid.addWidget(self.vmin_lock, 3, 2)
+        bounds_grid.addWidget(self.vmax_spin, 3, 3)
+        bounds_grid.addWidget(self.vmax_lock, 3, 4)
+
+        bounds_grid.setColumnStretch(1, 1)
+        bounds_grid.setColumnStretch(3, 1)
+        bounds_grid.setColumnMinimumWidth(0, 70)
+
+        # View action buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.apply_view_btn = QPushButton("Apply View")
+        self.apply_view_btn.setToolTip("Apply the current bounds to the heatmap")
+        self.apply_view_btn.setStyleSheet(_STYLE_MUTED)
+        self.auto_view_btn = QPushButton("Auto View")
+        self.auto_view_btn.setToolTip("Reset all unfixed bounds to fit the loaded data")
+        self.auto_view_btn.setStyleSheet(_STYLE_MUTED)
+        btn_row.addWidget(self.apply_view_btn, 1)
+        btn_row.addWidget(self.auto_view_btn, 1)
+        bounds_grid.addLayout(btn_row, 4, 0, 1, 5)
+        lay.addWidget(bounds_box)
+
+        # ── Gate control ──────────────────────────────────────────────────────
+        gate_box = QGroupBox("Gate Selection")
+        gate_form = QFormLayout(gate_box)
+        gate_form.setContentsMargins(8, 14, 8, 8)
+        gate_form.setSpacing(5)
+        gate_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.gate_spin = GateValueSpinBox()
+        self.gate_spin.setDecimals(6)
+        self.gate_spin.setRange(-1e12, 1e12)
+        self.gate_spin.setSingleStep(0.01)
+        self.gate_spin.setToolTip(
+            "Type a gate value and press Apply Gate to jump to it.\n"
+            "Use the navigation controls in the plot header for interactive stepping."
+        )
+        self.apply_gate_btn = QPushButton("Apply")
+        self.apply_gate_btn.setToolTip("Jump to the gate value entered above")
+        self.apply_gate_btn.setStyleSheet(_STYLE_MUTED)
+        self.apply_gate_btn.setMaximumWidth(60)
+        gate_w = QWidget()
+        gate_l = QHBoxLayout(gate_w)
+        gate_l.setContentsMargins(0, 0, 0, 0)
+        gate_l.setSpacing(6)
+        gate_l.addWidget(self.gate_spin, 1)
+        gate_l.addWidget(self.apply_gate_btn)
+        gate_form.addRow("Value:", gate_w)
+        lay.addWidget(gate_box)
+
+        return w
+
     # ── Find Peaks tab ────────────────────────────────────────────────────────
 
     def _build_find_peak_tab(self) -> QWidget:
         tab = QWidget()
         lay = QVBoxLayout(tab)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(5)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(8)
 
-        # Detection mode
+        # ── Detection Mode ────────────────────────────────────────────────────
         mode_box = QGroupBox("Detection Mode")
-        mode_l = QVBoxLayout(mode_box)
-        mode_l.setContentsMargins(6, 6, 6, 4)
-        mode_l.setSpacing(2)
+        mode_l = QHBoxLayout(mode_box)
+        mode_l.setContentsMargins(10, 14, 10, 8)
+        mode_l.setSpacing(16)
         self._orig_radio = QRadioButton("Original Spectrum")
-        self._d2_radio = QRadioButton("Second Derivative")
-        self._orig_radio.setToolTip("Find peaks directly from the displayed spectrum. Best for clean traces.")
-        self._d2_radio.setToolTip("Use the second derivative to separate overlapping peaks in noisier spectra.")
+        self._d2_radio = QRadioButton("2nd Derivative")
+        self._orig_radio.setToolTip(
+            "Find peaks directly from the spectrum intensity.\nBest for clean, well-separated traces."
+        )
+        self._d2_radio.setToolTip(
+            "Compute the second derivative to locate shoulders and overlapping peaks.\n"
+            "More robust for noisy or closely spaced features."
+        )
         self._orig_radio.setChecked(True)
         mode_l.addWidget(self._orig_radio)
         mode_l.addWidget(self._d2_radio)
+        mode_l.addStretch(1)
         lay.addWidget(mode_box)
 
         # ── Original spectrum params ──────────────────────────────────────────
         self._orig_params_widget = QWidget()
         orig_form = QFormLayout(self._orig_params_widget)
-        orig_form.setContentsMargins(0, 0, 0, 0)
-        orig_form.setSpacing(3)
+        orig_form.setContentsMargins(2, 0, 2, 0)
+        orig_form.setSpacing(4)
         orig_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.peak_mode_combo = QComboBox()
         self.peak_mode_combo.addItems(["Peaks", "Dips"])
-        self.peak_mode_combo.setToolTip("Choose whether the algorithm should look for upward peaks or downward dips.")
+        self.peak_mode_combo.setToolTip("Peaks = maxima; Dips = minima in the spectrum.")
 
         self.prom_spin = QDoubleSpinBox()
         self.prom_spin.setDecimals(4)
         self.prom_spin.setRange(0.0, 1.0)
         self.prom_spin.setSingleStep(0.005)
         self.prom_spin.setValue(0.05)
-        self.prom_spin.setToolTip("Fraction of signal range required as minimum prominence.")
+        self.prom_spin.setToolTip(
+            "Minimum prominence as a fraction of the signal range.\n"
+            "Higher = only the tallest peaks pass; Lower = more sensitive."
+        )
 
         self.distance_spin = QSpinBox()
         self.distance_spin.setRange(1, 1000)
         self.distance_spin.setValue(5)
-        self.distance_spin.setToolTip("Minimum distance between peaks in sample points.")
+        self.distance_spin.setToolTip("Minimum separation between peaks in sample points.")
 
         self.max_peaks_spin = QSpinBox()
         self.max_peaks_spin.setRange(1, 30)
         self.max_peaks_spin.setValue(6)
-        self.max_peaks_spin.setToolTip("Maximum number of peaks to keep after detection.")
+        self.max_peaks_spin.setToolTip("Keep at most this many peaks after sorting by prominence.")
 
-        self.peak_smooth_chk = QCheckBox("Smooth")
-        self.peak_smooth_chk.setToolTip("Apply light smoothing before peak finding to reduce small noise spikes.")
+        self.peak_smooth_chk = QCheckBox("Enable")
+        self.peak_smooth_chk.setToolTip("Smooth the trace before peak finding to suppress noise spikes.")
         self.peak_smooth_win_spin = QSpinBox()
         self.peak_smooth_win_spin.setRange(3, 501)
         self.peak_smooth_win_spin.setValue(11)
-        self.peak_smooth_win_spin.setMaximumWidth(70)
-        self.peak_smooth_win_spin.setToolTip("Savitzky-Golay window for smoothing before peak finding.")
+        self.peak_smooth_win_spin.setMaximumWidth(65)
+        self.peak_smooth_win_spin.setToolTip("Savitzky-Golay window length (must be odd).")
+        smooth_row = self._hrow([self.peak_smooth_chk, QLabel("Win:"), self.peak_smooth_win_spin])
 
-        orig_form.addRow("Peak Type", self.peak_mode_combo)
-        orig_form.addRow("Prominence", self.prom_spin)
-        orig_form.addRow("Min Distance (pts)", self.distance_spin)
-        orig_form.addRow("Max Peaks", self.max_peaks_spin)
-        orig_form.addRow("Smoothing", self._hrow([self.peak_smooth_chk, QLabel("Win"), self.peak_smooth_win_spin]))
+        orig_form.addRow("Type:", self.peak_mode_combo)
+        orig_form.addRow("Prominence:", self.prom_spin)
+        orig_form.addRow("Min Distance (pts):", self.distance_spin)
+        orig_form.addRow("Max Peaks:", self.max_peaks_spin)
+        orig_form.addRow("Pre-smooth:", smooth_row)
 
         # ── Second-derivative params ──────────────────────────────────────────
         self._d2_params_widget = QWidget()
         d2_form = QFormLayout(self._d2_params_widget)
-        d2_form.setContentsMargins(0, 0, 0, 0)
-        d2_form.setSpacing(3)
+        d2_form.setContentsMargins(2, 0, 2, 0)
+        d2_form.setSpacing(4)
         d2_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.d2_mode_combo = QComboBox()
         self.d2_mode_combo.addItems(["Peaks", "Dips"])
-        self.d2_mode_combo.setToolTip("Choose whether second-derivative detection should return peaks or dips.")
+        self.d2_mode_combo.setToolTip("Peaks = maxima; Dips = minima in the second-derivative trace.")
 
         self.d2_sg_win_spin = QSpinBox()
         self.d2_sg_win_spin.setRange(3, 501)
         self.d2_sg_win_spin.setValue(11)
-        self.d2_sg_win_spin.setToolTip("Savitzky-Golay window for computing second derivative (must be odd).")
+        self.d2_sg_win_spin.setToolTip("Savitzky-Golay window for computing the second derivative (must be odd).")
 
         self.d2_sg_poly_spin = QSpinBox()
         self.d2_sg_poly_spin.setRange(1, 6)
         self.d2_sg_poly_spin.setValue(3)
-        self.d2_sg_poly_spin.setToolTip("Polynomial order for Savitzky-Golay filter.")
+        self.d2_sg_poly_spin.setToolTip("Polynomial order for the Savitzky-Golay filter.")
 
         self.d2_prom_spin = QDoubleSpinBox()
         self.d2_prom_spin.setDecimals(4)
         self.d2_prom_spin.setRange(0.0, 1.0)
         self.d2_prom_spin.setSingleStep(0.005)
         self.d2_prom_spin.setValue(0.03)
-        self.d2_prom_spin.setToolTip("Fraction of d² signal range required as prominence.")
+        self.d2_prom_spin.setToolTip("Prominence threshold as fraction of the d² signal range.")
 
         self.d2_dist_spin = QSpinBox()
         self.d2_dist_spin.setRange(1, 1000)
         self.d2_dist_spin.setValue(3)
-        self.d2_dist_spin.setToolTip("Minimum distance between detected peaks in sample points.")
+        self.d2_dist_spin.setToolTip("Minimum separation between detected peaks in sample points.")
 
         self.d2_sep_spin = QDoubleSpinBox()
         self.d2_sep_spin.setDecimals(5)
         self.d2_sep_spin.setRange(0.0, 100.0)
         self.d2_sep_spin.setSingleStep(0.001)
         self.d2_sep_spin.setValue(0.0)
-        self.d2_sep_spin.setToolTip("Minimum separation in energy (eV). 0 = use Min Distance only.")
+        self.d2_sep_spin.setToolTip("Minimum peak separation in energy units. 0 = use sample-point distance only.")
 
         self.d2_max_peaks_spin = QSpinBox()
         self.d2_max_peaks_spin.setRange(1, 30)
         self.d2_max_peaks_spin.setValue(6)
-        self.d2_max_peaks_spin.setToolTip("Maximum number of candidates kept from second-derivative detection.")
+        self.d2_max_peaks_spin.setToolTip("Maximum candidates to keep after sorting by d² prominence.")
 
         self.d2_target_spin = QSpinBox()
         self.d2_target_spin.setRange(0, 30)
         self.d2_target_spin.setValue(0)
-        self.d2_target_spin.setToolTip("0 = keep top-N by Max Peaks. N > 0 = keep exactly top N by d² prominence.")
+        self.d2_target_spin.setToolTip(
+            "0 = keep top-N by Max Peaks.\n"
+            "N > 0 = keep exactly N candidates sorted by d² prominence."
+        )
 
-        d2_form.addRow("Peak Type", self.d2_mode_combo)
-        d2_form.addRow("SG Window", self.d2_sg_win_spin)
-        d2_form.addRow("SG Poly Order", self.d2_sg_poly_spin)
-        d2_form.addRow("D² Prominence", self.d2_prom_spin)
-        d2_form.addRow("Min Distance (pts)", self.d2_dist_spin)
-        d2_form.addRow("Min Sep (eV)", self.d2_sep_spin)
-        d2_form.addRow("Max Peaks", self.d2_max_peaks_spin)
-        d2_form.addRow("Target Count (0=auto)", self.d2_target_spin)
+        d2_form.addRow("Type:", self.d2_mode_combo)
+        d2_form.addRow("SG Window:", self.d2_sg_win_spin)
+        d2_form.addRow("SG Poly Order:", self.d2_sg_poly_spin)
+        d2_form.addRow("D² Prominence:", self.d2_prom_spin)
+        d2_form.addRow("Min Distance (pts):", self.d2_dist_spin)
+        d2_form.addRow("Min Sep (energy):", self.d2_sep_spin)
+        d2_form.addRow("Max Peaks:", self.d2_max_peaks_spin)
+        d2_form.addRow("Target Count (0=auto):", self.d2_target_spin)
         self._d2_params_widget.setVisible(False)
 
-        params_box = QGroupBox("Parameters")
+        params_box = QGroupBox("Detection Parameters")
         params_l = QVBoxLayout(params_box)
-        params_l.setContentsMargins(6, 6, 6, 4)
-        params_l.setSpacing(2)
+        params_l.setContentsMargins(8, 14, 8, 8)
+        params_l.setSpacing(4)
         params_l.addWidget(self._orig_params_widget)
         params_l.addWidget(self._d2_params_widget)
         lay.addWidget(params_box)
 
-        # ── Actions ───────────────────────────────────────────────────────────
-        self.find_btn = QPushButton("Find Peaks (Current Gate)")
-        self.batch_find_btn = QPushButton("Find Peaks – All Gates")
-        self.find_btn.setToolTip("Detect peaks only for the currently selected gate trace.")
-        self.batch_find_btn.setToolTip("Run peak detection across every gate and show the result on the heatmap.")
-        lay.addWidget(self.find_btn)
-        lay.addWidget(self.batch_find_btn)
+        # ── Primary Actions ───────────────────────────────────────────────────
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+        self.find_btn = QPushButton("Find Peaks (This Gate)")
+        self.batch_find_btn = QPushButton("Find Peaks — All Gates")
+        self.find_btn.setToolTip(
+            "Detect peaks on the currently displayed spectrum trace only.\n"
+            "Result appears as markers on the spectrum plot."
+        )
+        self.batch_find_btn.setToolTip(
+            "Run peak detection on every gate and overlay results on the heatmap.\n"
+            "Use this before 'Batch Fit All Gates' in the Lorentz Fit tab."
+        )
+        self.find_btn.setStyleSheet(_STYLE_PRIMARY)
+        self.batch_find_btn.setStyleSheet(_STYLE_PRIMARY)
+        action_row.addWidget(self.find_btn, 1)
+        action_row.addWidget(self.batch_find_btn, 1)
+        lay.addLayout(action_row)
 
-        self.lasso_mode_btn = QPushButton("Heatmap Lasso Mode")
+        # ── Heatmap Tools ─────────────────────────────────────────────────────
+        heatmap_box = QGroupBox("Heatmap Peak Editing")
+        heatmap_l = QVBoxLayout(heatmap_box)
+        heatmap_l.setContentsMargins(8, 14, 8, 8)
+        heatmap_l.setSpacing(5)
+
+        # Lasso + circle toggles row
+        mode_btn_row = QHBoxLayout()
+        mode_btn_row.setSpacing(6)
+        self.lasso_mode_btn = QPushButton("Lasso Select")
         self.lasso_mode_btn.setCheckable(True)
         self.lasso_mode_btn.setToolTip(
-            "Turn on heatmap lasso capture.\n"
-            "Drag on the heatmap to select many all-gate peaks at once."
+            "Enable lasso mode: drag a freehand region on the heatmap to select\n"
+            "all-gate peaks inside it. Normal gate selection is temporarily disabled."
         )
-        self.delete_lasso_btn = QPushButton("Delete Lasso Selection (Heatmap)")
-        self.delete_lasso_btn.setEnabled(False)
-        self.delete_lasso_btn.setToolTip("Delete every heatmap peak currently selected by the lasso.")
-        self.clear_lasso_btn = QPushButton("Clear Heatmap Selection")
-        self.clear_lasso_btn.setEnabled(False)
-        self.clear_lasso_btn.setToolTip("Keep the peaks, but clear the current lasso selection highlight.")
+        self.lasso_mode_btn.setStyleSheet(_STYLE_TOGGLE)
+        self.circle_delete_btn = QPushButton("Circle Delete")
+        self.circle_delete_btn.setCheckable(True)
+        self.circle_delete_btn.setToolTip(
+            "Enable circle-delete mode: drag on the heatmap to define a circle\n"
+            "and delete all all-gate peaks inside it."
+        )
+        self.circle_delete_btn.setStyleSheet(_STYLE_TOGGLE)
+        mode_btn_row.addWidget(self.lasso_mode_btn, 1)
+        mode_btn_row.addWidget(self.circle_delete_btn, 1)
+        heatmap_l.addLayout(mode_btn_row)
 
+        # Lasso helper hint (shown only when lasso is active)
         self.lasso_helper_label = QLabel(
-            "Heatmap lasso: drag on the colormap to select multiple all-gate peaks, then delete or clear the selection."
+            "Lasso active — drag on the heatmap to select peaks, then delete or clear below."
         )
         self.lasso_helper_label.setWordWrap(True)
-        self.lasso_helper_label.setStyleSheet("color:#54606c; font-size: 10px;")
+        self.lasso_helper_label.setStyleSheet(
+            "color: #e65100; font-size: 10px;"
+            "background: #fff3e0; border-radius: 3px; padding: 3px 5px;"
+        )
         self.lasso_helper_label.setVisible(False)
+        heatmap_l.addWidget(self.lasso_helper_label)
 
+        # Lasso action row
+        lasso_action_row = QHBoxLayout()
+        lasso_action_row.setSpacing(6)
+        self.delete_lasso_btn = QPushButton("Delete Lasso Selection")
+        self.delete_lasso_btn.setEnabled(False)
+        self.delete_lasso_btn.setToolTip("Delete every heatmap peak inside the current lasso selection.")
+        self.delete_lasso_btn.setStyleSheet(_STYLE_DANGER)
+        self.clear_lasso_btn = QPushButton("Clear Selection")
+        self.clear_lasso_btn.setEnabled(False)
+        self.clear_lasso_btn.setToolTip("Keep the peaks but clear the lasso highlight.")
+        self.clear_lasso_btn.setStyleSheet(_STYLE_MUTED)
+        lasso_action_row.addWidget(self.delete_lasso_btn, 1)
+        lasso_action_row.addWidget(self.clear_lasso_btn, 1)
+        heatmap_l.addLayout(lasso_action_row)
+
+        # Global cleanup row
+        global_row = QHBoxLayout()
+        global_row.setSpacing(6)
+        self.clear_batch_peaks_btn = QPushButton("Clear All Heatmap Peaks")
+        self.clear_batch_peaks_btn.setToolTip(
+            "Remove every detected all-gates peak from the heatmap overlay.\n"
+            "This does not affect single-gate trace peaks."
+        )
+        self.clear_batch_peaks_btn.setStyleSheet(_STYLE_DANGER)
         self.save_peaks_csv_btn = QPushButton("Save Peaks CSV")
         self.save_peaks_csv_btn.setToolTip(
-            "Save all-gates peak positions (batch_peak_map) to CSV.\n"
-            "If no all-gates data, saves current gate peaks."
+            "Save the peaks currently overlaid on the heatmap to a CSV file.\n"
+            "If no all-gates overlay exists, exports the current gate peaks only."
         )
-        self.circle_delete_btn = QPushButton("Circle Delete on Heatmap")
-        self.circle_delete_btn.setCheckable(True)
-        self.circle_delete_btn.setToolTip("Drag on heatmap to delete all-gate peaks inside the circle.")
-        self.clear_batch_peaks_btn = QPushButton("Clear All Peaks (All Gates)")
-        self.clear_batch_peaks_btn.setToolTip("Remove every detected all-gates heatmap peak from the current batch result.")
+        self.save_peaks_csv_btn.setStyleSheet(_STYLE_MUTED)
+        global_row.addWidget(self.clear_batch_peaks_btn, 1)
+        global_row.addWidget(self.save_peaks_csv_btn, 1)
+        heatmap_l.addLayout(global_row)
+        lay.addWidget(heatmap_box)
 
-        # ── Per-peak delete ───────────────────────────────────────────────────
+        # ── Current Trace Editing ─────────────────────────────────────────────
+        trace_box = QGroupBox("Current-Trace Peak Editing")
+        trace_l = QVBoxLayout(trace_box)
+        trace_l.setContentsMargins(8, 14, 8, 8)
+        trace_l.setSpacing(5)
+
         self.peak_delete_spin = QSpinBox()
         self.peak_delete_spin.setRange(1, 1)
         self.peak_delete_spin.setValue(1)
         self.peak_delete_spin.setMaximumWidth(60)
-        self.delete_peak_btn = QPushButton("Delete Peak # From Current Trace")
-        self.clear_peaks_btn = QPushButton("Clear Current-Trace Peaks")
-        self.peak_delete_spin.setToolTip("Select which numbered peak to remove from the current gate.")
-        self.delete_peak_btn.setToolTip("Delete the numbered peak from the current gate.")
-        self.clear_peaks_btn.setToolTip("Remove all currently selected peaks from the current gate.")
+        self.peak_delete_spin.setToolTip("Choose which numbered peak to remove from the current gate trace.")
 
-        selection_box = QGroupBox("Heatmap Batch Selection")
-        selection_l = QVBoxLayout(selection_box)
-        selection_l.setContentsMargins(6, 6, 6, 4)
-        selection_l.setSpacing(4)
-        selection_l.addWidget(self._hrow([self.lasso_mode_btn, self.delete_lasso_btn, self.clear_lasso_btn]))
-        selection_l.addWidget(self.lasso_helper_label)
-        lay.addWidget(selection_box)
+        self.delete_peak_btn = QPushButton("Delete Peak #")
+        self.delete_peak_btn.setToolTip("Delete the peak selected by the spinner above from the current trace.")
+        self.delete_peak_btn.setStyleSheet(_STYLE_DANGER)
 
-        single_box = QGroupBox("Current Trace Editing")
-        single_l = QVBoxLayout(single_box)
-        single_l.setContentsMargins(6, 6, 6, 4)
-        single_l.setSpacing(4)
-        single_l.addWidget(self._hrow([QLabel("Peak #"), self.peak_delete_spin]))
-        single_l.addWidget(self.delete_peak_btn)
-        single_l.addWidget(self.clear_peaks_btn)
-        lay.addWidget(single_box)
+        self.clear_peaks_btn = QPushButton("Clear All Trace Peaks")
+        self.clear_peaks_btn.setToolTip("Remove all peaks from the current gate trace.")
+        self.clear_peaks_btn.setStyleSheet(_STYLE_DANGER)
 
-        global_box = QGroupBox("All-Gates Cleanup")
-        global_l = QVBoxLayout(global_box)
-        global_l.setContentsMargins(6, 6, 6, 4)
-        global_l.setSpacing(4)
-        global_l.addWidget(self.circle_delete_btn)
-        global_l.addWidget(self.clear_batch_peaks_btn)
-        global_l.addWidget(self.save_peaks_csv_btn)
-        lay.addWidget(global_box)
+        del_row = QHBoxLayout()
+        del_row.setSpacing(6)
+        del_row.addWidget(QLabel("Peak #:"))
+        del_row.addWidget(self.peak_delete_spin)
+        del_row.addWidget(self.delete_peak_btn, 1)
+        trace_l.addLayout(del_row)
+        trace_l.addWidget(self.clear_peaks_btn)
+        lay.addWidget(trace_box)
 
+        # ── Interaction hint ──────────────────────────────────────────────────
         hint = QLabel(
-            "Spectrum: Left-click=Add peak  |  Right-click=Remove nearest  |  "
-            "Drag near peak=Move peak.\n"
-            "Heatmap: Left-click=Select gate  |  Lasso mode=Select all-gate peaks  |  Circle mode=Delete in region."
+            "Spectrum: L-click = add peak  |  R-click = remove nearest  |  Drag near peak = move\n"
+            "Heatmap: L-click = jump to gate  |  R-click = remove peak on gate line"
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color:#54606c; font-size: 10px;")
+        hint.setStyleSheet(
+            "color: #607d8b; font-size: 10px;"
+            "background: #f0f4f8; border-radius: 3px; padding: 3px 5px;"
+        )
         lay.addWidget(hint)
         lay.addStretch(1)
 
@@ -628,18 +929,25 @@ class MainWindow(QMainWindow):
     def _build_lorentz_fit_tab(self) -> QWidget:
         tab = QWidget()
         lay = QVBoxLayout(tab)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(5)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(8)
 
-        # ── Seeds source ──────────────────────────────────────────────────────
-        seeds_box = QGroupBox("Initial Seeds Source")
+        # ── Seeds Source ──────────────────────────────────────────────────────
+        seeds_box = QGroupBox("Initial Peak Seeds")
         seeds_l = QVBoxLayout(seeds_box)
-        seeds_l.setContentsMargins(6, 6, 6, 4)
-        seeds_l.setSpacing(3)
-        self._seeds_from_find_peak_radio = QRadioButton("From Find Peaks tab (default)")
+        seeds_l.setContentsMargins(8, 14, 8, 8)
+        seeds_l.setSpacing(5)
+
+        self._seeds_from_find_peak_radio = QRadioButton("From Find Peaks tab")
         self._seeds_from_csv_radio = QRadioButton("From CSV file")
-        self._seeds_from_find_peak_radio.setToolTip("Use peaks found in the Find Peaks tab as fit starting points.")
-        self._seeds_from_csv_radio.setToolTip("Load your own per-gate seed positions from a CSV file.")
+        self._seeds_from_find_peak_radio.setToolTip(
+            "Use the peaks detected in the Find Peaks tab as initial centers for fitting.\n"
+            "Run 'Find Peaks – All Gates' first for batch fitting."
+        )
+        self._seeds_from_csv_radio.setToolTip(
+            "Load a CSV with columns [gate, peak_energy] to use as fit seeds.\n"
+            "Useful when you have known peak positions from a reference."
+        )
         self._seeds_from_find_peak_radio.setChecked(True)
         seeds_l.addWidget(self._seeds_from_find_peak_radio)
         seeds_l.addWidget(self._seeds_from_csv_radio)
@@ -647,27 +955,34 @@ class MainWindow(QMainWindow):
         self._csv_seeds_row = QWidget()
         csv_row_l = QHBoxLayout(self._csv_seeds_row)
         csv_row_l.setContentsMargins(0, 2, 0, 0)
-        csv_row_l.setSpacing(4)
+        csv_row_l.setSpacing(6)
         self.load_seeds_csv_btn = QPushButton("Load Seeds CSV…")
-        self.load_seeds_csv_btn.setToolTip("Load a CSV of initial peak positions to guide fitting.")
+        self.load_seeds_csv_btn.setToolTip("Open a CSV file with [gate, peak_energy] columns.")
+        self.load_seeds_csv_btn.setStyleSheet(_STYLE_MUTED)
         self._csv_path_label = QLabel("(none loaded)")
-        self._csv_path_label.setStyleSheet("color:#54606c; font-size: 10px;")
+        self._csv_path_label.setStyleSheet(
+            "color: #607d8b; font-size: 10px; font-style: italic;"
+        )
         csv_row_l.addWidget(self.load_seeds_csv_btn)
         csv_row_l.addWidget(self._csv_path_label, 1)
         self._csv_seeds_row.setVisible(False)
         seeds_l.addWidget(self._csv_seeds_row)
         lay.addWidget(seeds_box)
 
+        # Axis info label
         self.fit_axis_label = QLabel("Analysis axis: no file loaded.")
         self.fit_axis_label.setWordWrap(True)
-        self.fit_axis_label.setStyleSheet("color:#54606c; font-size: 10px;")
+        self.fit_axis_label.setStyleSheet(
+            "color: #607d8b; font-size: 10px;"
+            "background: #f0f4f8; border-radius: 3px; padding: 3px 5px;"
+        )
         lay.addWidget(self.fit_axis_label)
 
-        # ── Fit range ─────────────────────────────────────────────────────────
+        # ── Fit Range ─────────────────────────────────────────────────────────
         range_box = QGroupBox("Fit Range")
         range_form = QFormLayout(range_box)
-        range_form.setContentsMargins(6, 6, 6, 4)
-        range_form.setSpacing(3)
+        range_form.setContentsMargins(8, 14, 8, 8)
+        range_form.setSpacing(5)
         range_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.fit_xmin_spin = QDoubleSpinBox()
@@ -676,17 +991,24 @@ class MainWindow(QMainWindow):
             sp.setDecimals(6)
             sp.setRange(-1e12, 1e12)
             sp.setSingleStep(0.01)
-            sp.setMaximumWidth(120)
-            sp.setToolTip("Limit fitting to this x-axis window so the optimizer ignores unrelated features.")
+            sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            sp.setToolTip(
+                "Constrain the fit to this x-axis window.\n"
+                "Data outside this range is ignored by the optimizer."
+            )
         self.fit_xmin_lock = QCheckBox("Fix")
         self.fit_xmax_lock = QCheckBox("Fix")
+        for ck in (self.fit_xmin_lock, self.fit_xmax_lock):
+            ck.setToolTip("When checked, this limit is not overwritten by 'Full Range'")
         self._fit_lock_controls = {
             self.fit_xmin_spin: self.fit_xmin_lock,
             self.fit_xmax_spin: self.fit_xmax_lock,
         }
-        self.fit_full_btn = QPushButton("Full")
-        self.fit_full_btn.setMaximumWidth(46)
-        self.fit_full_btn.setToolTip("Reset the fit range to the full currently loaded x-axis span.")
+
+        self.fit_full_btn = QPushButton("Full Range")
+        self.fit_full_btn.setToolTip("Reset the fit range to the full x-axis span of the loaded file.")
+        self.fit_full_btn.setStyleSheet(_STYLE_MUTED)
+
         xmax_w = QWidget()
         xmax_l = QHBoxLayout(xmax_w)
         xmax_l.setContentsMargins(0, 0, 0, 0)
@@ -694,83 +1016,131 @@ class MainWindow(QMainWindow):
         xmax_l.addWidget(self._view_spin_row(self.fit_xmax_spin, self.fit_xmax_lock))
         xmax_l.addWidget(self.fit_full_btn)
 
-        self.fit_smooth_chk = QCheckBox("Smooth")
-        self.fit_smooth_chk.setToolTip("Smooth the trace before fitting when noise is making the fit unstable.")
+        self.fit_smooth_chk = QCheckBox("Enable")
+        self.fit_smooth_chk.setToolTip(
+            "Apply Savitzky-Golay smoothing to the trace before fitting.\n"
+            "Helps when noise is destabilizing curve_fit convergence."
+        )
         self.fit_smooth_win_spin = QSpinBox()
         self.fit_smooth_win_spin.setRange(3, 501)
         self.fit_smooth_win_spin.setValue(11)
-        self.fit_smooth_win_spin.setMaximumWidth(70)
-        self.fit_smooth_win_spin.setToolTip("Savitzky-Golay window size used when fit smoothing is enabled.")
+        self.fit_smooth_win_spin.setMaximumWidth(65)
+        self.fit_smooth_win_spin.setToolTip("Savitzky-Golay window length (must be odd).")
+        smooth_row = self._hrow([self.fit_smooth_chk, QLabel("Win:"), self.fit_smooth_win_spin])
 
-        range_form.addRow("Fit xmin", self._view_spin_row(self.fit_xmin_spin, self.fit_xmin_lock))
-        range_form.addRow("Fit xmax", xmax_w)
-        range_form.addRow("Smoothing", self._hrow([self.fit_smooth_chk, QLabel("Win"), self.fit_smooth_win_spin]))
+        range_form.addRow("xmin:", self._view_spin_row(self.fit_xmin_spin, self.fit_xmin_lock))
+        range_form.addRow("xmax:", xmax_w)
+        range_form.addRow("Pre-smooth:", smooth_row)
         lay.addWidget(range_box)
 
-        # ── Fit parameters / bounds ───────────────────────────────────────────
-        bounds_box = QGroupBox("Fit Parameters")
-        bounds_form = QFormLayout(bounds_box)
-        bounds_form.setContentsMargins(6, 6, 6, 4)
-        bounds_form.setSpacing(3)
-        bounds_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        # ── Fit Parameters ────────────────────────────────────────────────────
+        params_box = QGroupBox("Fit Parameters")
+        params_form = QFormLayout(params_box)
+        params_form.setContentsMargins(8, 14, 8, 8)
+        params_form.setSpacing(5)
+        params_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.fit_model_combo = QComboBox()
         self.fit_model_combo.addItems(["Lorentzian", "Gaussian"])
         self.fit_model_combo.setCurrentText("Lorentzian")
-        self.fit_model_combo.setMaximumWidth(130)
-        self.fit_model_combo.setToolTip("Choose the line shape used to model each detected peak.")
-
-        self.lw_min_spin = QDoubleSpinBox()
-        self.lw_min_spin.setDecimals(6)
-        self.lw_min_spin.setRange(0.0, 100.0)
-        self.lw_min_spin.setSingleStep(0.001)
-        self.lw_min_spin.setValue(0.001)
-        self.lw_min_spin.setToolTip("Minimum linewidth / FWHM in eV. 0 = nearly zero.")
-
-        self.lw_max_spin = QDoubleSpinBox()
-        self.lw_max_spin.setDecimals(6)
-        self.lw_max_spin.setRange(0.0, 100.0)
-        self.lw_max_spin.setSingleStep(0.01)
-        self.lw_max_spin.setValue(0.05)
-        self.lw_max_spin.setToolTip("Maximum linewidth / FWHM in eV. 0 = auto (2× fit range).")
-
-        self.peak_move_limit_spin = QDoubleSpinBox()
-        self.peak_move_limit_spin.setDecimals(6)
-        self.peak_move_limit_spin.setRange(0.0, 100.0)
-        self.peak_move_limit_spin.setSingleStep(0.005)
-        self.peak_move_limit_spin.setValue(0.01)
-        self.peak_move_limit_spin.setToolTip(
-            "Maximum shift of fitted peak center from seed (eV). 0 = unconstrained."
+        self.fit_model_combo.setToolTip(
+            "Lorentzian: Cauchy-Lorentz lineshape — wider tails, typical for spectral lines.\n"
+            "Gaussian: Gaussian lineshape — narrower tails, typical for inhomogeneous broadening."
         )
+
+        self.lw_min_spin = QSpinBox()
+        self.lw_min_spin.setRange(0, 10000)
+        self.lw_min_spin.setSingleStep(1)
+        self.lw_min_spin.setValue(10)
+        self.lw_min_spin.setSuffix(" pt")
+        self.lw_min_spin.setToolTip(
+            "Minimum allowed FWHM linewidth in data points.\n"
+            "The equivalent size in the current analysis-axis units is shown to the right."
+        )
+        self.lw_min_value_label = QLabel(self._format_pts_conversion(int(self.lw_min_spin.value())))
+        self.lw_min_value_label.setStyleSheet("color: #607d8b; font-size: 10px;")
+
+        self.lw_max_spin = QSpinBox()
+        self.lw_max_spin.setRange(0, 10000)
+        self.lw_max_spin.setSingleStep(1)
+        self.lw_max_spin.setValue(50)
+        self.lw_max_spin.setSuffix(" pt")
+        self.lw_max_value_label = QLabel(self._format_pts_conversion(int(self.lw_max_spin.value())))
+        self.lw_max_value_label.setStyleSheet("color: #607d8b; font-size: 10px;")
+        self.lw_max_spin.setToolTip(
+            "Maximum allowed FWHM linewidth. 0 = unconstrained (uses 2× fit range)."
+        )
+
+        self.peak_move_limit_spin = QSpinBox()
+        self.peak_move_limit_spin.setRange(0, 10000)
+        self.peak_move_limit_spin.setSingleStep(1)
+        self.peak_move_limit_spin.setValue(10)
+        self.peak_move_limit_spin.setSuffix(" pt")
+        self.peak_move_limit_spin.setToolTip(
+            "Maximum allowed shift of the fitted center from its seed in data points.\n"
+            "0 = unconstrained. The equivalent size in the current analysis-axis units is shown to the right."
+        )
+        self.peak_move_value_label = QLabel(self._format_pts_conversion(int(self.peak_move_limit_spin.value())))
+        self.peak_move_value_label.setStyleSheet("color: #607d8b; font-size: 10px;")
 
         self.maxfev_spin = QSpinBox()
         self.maxfev_spin.setRange(100, 2000000)
         self.maxfev_spin.setValue(20000)
         self.maxfev_spin.setSingleStep(5000)
-        self.maxfev_spin.setToolTip("Maximum function evaluations for scipy curve_fit.")
+        self.maxfev_spin.setToolTip(
+            "Maximum number of function evaluations for scipy.optimize.curve_fit.\n"
+            "Increase if fits are failing due to non-convergence."
+        )
 
-        bounds_form.addRow("Model", self.fit_model_combo)
-        bounds_form.addRow("Linewidth min (eV)", self.lw_min_spin)
-        bounds_form.addRow("Linewidth max (eV)", self.lw_max_spin)
-        bounds_form.addRow("Peak move limit (eV)", self.peak_move_limit_spin)
-        bounds_form.addRow("Max iterations", self.maxfev_spin)
-        lay.addWidget(bounds_box)
+        params_form.addRow("Line Shape:", self.fit_model_combo)
+        params_form.addRow("Min Linewidth:", self._hrow([self.lw_min_spin, self.lw_min_value_label]))
+        params_form.addRow("Max Linewidth:", self._hrow([self.lw_max_spin, self.lw_max_value_label]))
+        params_form.addRow("Max Peak Shift:", self._hrow([self.peak_move_limit_spin, self.peak_move_value_label]))
+        params_form.addRow("Max Iterations:", self.maxfev_spin)
+        lay.addWidget(params_box)
 
-        # ── Action buttons ────────────────────────────────────────────────────
+        # ── Primary fit actions ────────────────────────────────────────────────
+        fit_action_row = QHBoxLayout()
+        fit_action_row.setSpacing(6)
         self.fit_btn = QPushButton("Fit Current Gate")
         self.batch_fit_btn = QPushButton("Batch Fit All Gates")
+        self.fit_btn.setToolTip(
+            "Fit the currently displayed gate trace using seeds from the active source.\n"
+            "Result overlaid immediately on the spectrum plot."
+        )
+        self.batch_fit_btn.setToolTip(
+            "Fit every gate using seeds from the active source.\n"
+            "Requires 'Find Peaks – All Gates' (or a seeds CSV) to have been run first."
+        )
+        self.fit_btn.setStyleSheet(_STYLE_PRIMARY)
+        self.batch_fit_btn.setStyleSheet(_STYLE_PRIMARY)
+        fit_action_row.addWidget(self.fit_btn, 1)
+        fit_action_row.addWidget(self.batch_fit_btn, 1)
+        lay.addLayout(fit_action_row)
+
+        # ── Secondary actions ──────────────────────────────────────────────────
+        secondary_row = QHBoxLayout()
+        secondary_row.setSpacing(6)
         self.clear_fit_btn = QPushButton("Clear Fit")
         self.export_fit_btn = QPushButton("Export Fit CSV")
+        self.clear_fit_btn.setToolTip("Remove the fit overlay from the spectrum plot.")
+        self.export_fit_btn.setToolTip(
+            "Save fitted peak centers, widths, amplitudes and quality metrics to CSV.\n"
+            "Exports all batch-fit results when available; otherwise exports the current gate only."
+        )
+        self.clear_fit_btn.setStyleSheet(_STYLE_MUTED)
+        self.export_fit_btn.setStyleSheet(_STYLE_MUTED)
+        secondary_row.addWidget(self.clear_fit_btn, 1)
+        secondary_row.addWidget(self.export_fit_btn, 1)
+        lay.addLayout(secondary_row)
+
         self.export_spec_btn = QPushButton("Export Spectrum CSV")
-        self.fit_btn.setToolTip("Fit the currently selected gate trace using the active seed list.")
-        self.batch_fit_btn.setToolTip("Repeat fitting for all gates and export the collected results.")
-        self.clear_fit_btn.setToolTip("Remove the current fit overlay from the spectrum plot.")
-        self.export_fit_btn.setToolTip("Save the current fit parameters to CSV.")
-        self.export_spec_btn.setToolTip("Save the current spectrum, fit-range mask, and analysis trace to CSV.")
-        lay.addWidget(self.fit_btn)
-        lay.addWidget(self.batch_fit_btn)
-        lay.addWidget(self._hrow([self.clear_fit_btn, self.export_fit_btn]))
+        self.export_spec_btn.setToolTip(
+            "Save the current gate's raw spectrum, fit-range mask, and smoothed analysis trace to CSV."
+        )
+        self.export_spec_btn.setStyleSheet(_STYLE_MUTED)
         lay.addWidget(self.export_spec_btn)
+
         lay.addStretch(1)
 
         # ── wire signals ──────────────────────────────────────────────────────
@@ -791,27 +1161,79 @@ class MainWindow(QMainWindow):
     def _build_plot_panel(self) -> QWidget:
         panel = QWidget()
         lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
         self.figure = Figure(figsize=(8.0, 6.0), tight_layout=False)
         self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
+
+        # ── Gate navigation bar ───────────────────────────────────────────────
+        gate_bar = QFrame()
+        gate_bar.setFrameShape(QFrame.StyledPanel)
+        gate_bar.setStyleSheet(
+            "QFrame { background: #f5f7fa; border: none; border-bottom: 1px solid #ddd; }"
+        )
+        gate_lay = QHBoxLayout(gate_bar)
+        gate_lay.setContentsMargins(8, 4, 8, 4)
+        gate_lay.setSpacing(6)
+
+        gate_lbl = QLabel("Gate:")
+        gate_lbl.setStyleSheet("font-weight: 600; color: #444; font-size: 11px;")
+
         self.plot_gate_spin = GateValueSpinBox()
         self.plot_gate_spin.setDecimals(6)
         self.plot_gate_spin.setRange(-1e12, 1e12)
-        self.plot_gate_spin.setMaximumWidth(150)
+        self.plot_gate_spin.setMinimumWidth(120)
+        self.plot_gate_spin.setMaximumWidth(160)
+        self.plot_gate_spin.setToolTip(
+            "Current gate value. Spin or type to navigate; plot updates immediately."
+        )
+
+        sep_lbl = QLabel("|")
+        sep_lbl.setStyleSheet("color: #ccc; font-size: 14px;")
+
+        idx_lbl = QLabel("Index:")
+        idx_lbl.setStyleSheet("color: #555; font-size: 11px;")
+
         self.plot_gate_index_spin = QSpinBox()
         self.plot_gate_index_spin.setRange(1, 1)
-        self.plot_gate_index_spin.setMaximumWidth(80)
-        self.plot_prev_gate_btn = QPushButton("<")
-        self.plot_prev_gate_btn.setMaximumWidth(32)
-        self.plot_next_gate_btn = QPushButton(">")
-        self.plot_next_gate_btn.setMaximumWidth(32)
-        self.plot_gate_row = self._hrow([
-            QLabel("Gate"), self.plot_gate_spin,
-            QLabel("Index"), self.plot_gate_index_spin,
-            self.plot_prev_gate_btn, self.plot_next_gate_btn,
-        ])
+        self.plot_gate_index_spin.setMinimumWidth(55)
+        self.plot_gate_index_spin.setMaximumWidth(70)
+        self.plot_gate_index_spin.setToolTip("Gate index (1-based). Spin to step through all gates.")
+
+        self.plot_prev_gate_btn = QPushButton("◀")
+        self.plot_next_gate_btn = QPushButton("▶")
+        for btn in (self.plot_prev_gate_btn, self.plot_next_gate_btn):
+            btn.setFixedWidth(30)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(
+                "QPushButton {"
+                "  background: #fff; border: 1px solid #ccc; border-radius: 3px;"
+                "  font-size: 10px; color: #333;"
+                "}"
+                "QPushButton:hover { background: #e8f0fe; border-color: #1976d2; }"
+                "QPushButton:pressed { background: #c5d8fb; }"
+                "QPushButton:disabled { color: #bbb; border-color: #e0e0e0; }"
+            )
+        self.plot_prev_gate_btn.setToolTip("Step to the previous gate (←)")
+        self.plot_next_gate_btn.setToolTip("Step to the next gate (→)")
+
+        gate_lay.addWidget(gate_lbl)
+        gate_lay.addWidget(self.plot_gate_spin)
+        gate_lay.addWidget(self.plot_prev_gate_btn)
+        gate_lay.addWidget(self.plot_next_gate_btn)
+        gate_lay.addWidget(sep_lbl)
+        gate_lay.addWidget(idx_lbl)
+        gate_lay.addWidget(self.plot_gate_index_spin)
+        gate_lay.addStretch(1)
+
+        # Keep reference for legacy attribute access
+        self.plot_gate_row = gate_bar
+
         lay.addWidget(self.toolbar)
-        lay.addWidget(self.plot_gate_row)
+        lay.addWidget(gate_bar)
         lay.addWidget(self.canvas, 1)
         return panel
 
@@ -1110,6 +1532,100 @@ class MainWindow(QMainWindow):
                     seen.add(key)
         return [name for name in base if any(name in row for row in rows)] + extra
 
+    def _upsert_fit_export_row(self, row: dict[str, str]) -> None:
+        gate_key = row.get("gate")
+        if gate_key is None:
+            self._batch_fit_export_rows.append(dict(row))
+            return
+        for idx, existing in enumerate(self._batch_fit_export_rows):
+            if existing.get("gate") == gate_key:
+                self._batch_fit_export_rows[idx] = dict(row)
+                return
+        self._batch_fit_export_rows.append(dict(row))
+
+    def _analysis_axis_step(self) -> float | None:
+        if self.current_cube is None:
+            return None
+        x = np.asarray(self.current_cube.energy, dtype=float)
+        if x.size < 2:
+            return None
+        finite = x[np.isfinite(x)]
+        if finite.size < 2:
+            return None
+        span = float(np.nanmax(finite) - np.nanmin(finite))
+        n_points = max(1, int(finite.size))
+        if span <= 0:
+            return None
+        return span / n_points
+
+    def _pts_to_axis_units(self, points: int) -> float | None:
+        step = self._analysis_axis_step()
+        if step is None:
+            return None
+        return float(max(0, int(points))) * step
+
+    def _format_pts_conversion(self, points: int) -> str:
+        unit = self.current_cube.energy_label if self.current_cube is not None else "x-axis units"
+        axis_value = self._pts_to_axis_units(points)
+        if axis_value is None:
+            return f"{int(points)} pt"
+        return f"{int(points)} pt ({axis_value:.6g} {unit})"
+
+    def _update_fit_param_unit_labels(self) -> None:
+        if not hasattr(self, "lw_min_value_label"):
+            return
+        self.lw_min_value_label.setText(self._format_pts_conversion(int(self.lw_min_spin.value())))
+        self.lw_max_value_label.setText(self._format_pts_conversion(int(self.lw_max_spin.value())))
+        self.peak_move_value_label.setText(self._format_pts_conversion(int(self.peak_move_limit_spin.value())))
+
+    def _current_peak_overlay_rows(self) -> list[tuple[float, float, float]]:
+        if self.current_cube is None:
+            return []
+        cube = self.current_cube
+        rows: list[tuple[float, float, float]] = []
+        if self.batch_peak_map:
+            for gi, idxs in sorted(self.batch_peak_map.items()):
+                gate_v = float(cube.gate[gi])
+                arr = np.asarray(idxs, dtype=int)
+                arr = arr[(arr >= 0) & (arr < cube.energy.size)]
+                for idx in arr:
+                    rows.append((gate_v, float(cube.energy[idx]), float(cube.z[gi, idx])))
+            return rows
+        valid = self._current_trace_peak_indices()
+        if valid.size == 0:
+            return []
+        gate_used, _ = self._nearest_spectrum(self.current_gate)
+        gi = self._current_gate_index()
+        for idx in valid:
+            rows.append((gate_used, float(cube.energy[idx]), float(cube.z[gi, idx])))
+        return rows
+
+    def _current_peak_overlay_by_gate(self) -> list[tuple[float, list[tuple[float, float, float]]]]:
+        if self.current_cube is None:
+            return []
+        cube = self.current_cube
+        grouped: list[tuple[float, list[tuple[float, float, float]]]] = []
+        if self.batch_peak_map:
+            for gi, idxs in sorted(self.batch_peak_map.items()):
+                gate_v = float(cube.gate[gi])
+                arr = np.asarray(idxs, dtype=int)
+                arr = arr[(arr >= 0) & (arr < cube.energy.size)]
+                peaks: list[tuple[float, float, float]] = []
+                for idx in arr:
+                    peaks.append((float(cube.energy[idx]), float(cube.z[gi, idx]), float(cube.x_original[idx])))
+                if peaks:
+                    grouped.append((gate_v, peaks))
+            return grouped
+        valid = self._current_trace_peak_indices()
+        if valid.size == 0:
+            return []
+        gate_used, _ = self._nearest_spectrum(self.current_gate)
+        gi = self._current_gate_index()
+        peaks = []
+        for idx in valid:
+            peaks.append((float(cube.energy[idx]), float(cube.z[gi, idx]), float(cube.x_original[idx])))
+        return [(gate_used, peaks)] if peaks else []
+
     def _sync_current_trace_peaks_to_batch_map(self) -> None:
         if self.current_cube is None or not self.batch_peak_map:
             return
@@ -1321,6 +1837,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_coords = None
         self.batch_fit_result_map = {}
         self._batch_fit_export_rows = []
+        self._has_batch_fit_results = False
         self._lasso_selected_peak_ids = []
         self._clear_lasso_selection_visual()
         self._update_lasso_actions()
@@ -1334,6 +1851,7 @@ class MainWindow(QMainWindow):
         self._set_view_limits_to_auto()
         self._set_fit_range_to_full()
         self._refresh_axis_status()
+        self._update_fit_param_unit_labels()
         self._plot_cube()
         self.analysis_text.setPlainText(
             f"Loaded: {path.name}\n"
@@ -1366,6 +1884,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_coords = None
         self.batch_fit_result_map = {}
         self._batch_fit_export_rows = []
+        self._has_batch_fit_results = False
         self._cached_d2 = None
         self._lasso_selected_peak_ids = []
         self._clear_lasso_selection_visual()
@@ -1378,6 +1897,7 @@ class MainWindow(QMainWindow):
         self._set_view_limits_to_auto()
         self._set_fit_range_to_full()
         self._refresh_axis_status()
+        self._update_fit_param_unit_labels()
         self._plot_cube()
 
     # =========================================================================
@@ -1621,45 +2141,49 @@ class MainWindow(QMainWindow):
             self._show_error("Load a DAT file first.")
             return
         cube = self.current_cube
-        default = Path(self.current_folder) / f"{cube.title}_peaks.csv"
+        self._sync_current_trace_peaks_to_batch_map()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default = Path(self.current_folder) / f"{cube.title}_peaks_{stamp}.csv"
         out_path, _ = QFileDialog.getSaveFileName(self, "Save Peaks CSV", str(default), "CSV Files (*.csv)")
         if not out_path:
             return
-        rows: list[tuple[float, float]] = []
-        if self.batch_peak_map:
-            # All-gates data
-            for gi, idxs in sorted(self.batch_peak_map.items()):
-                gate_v = float(cube.gate[gi])
-                arr = np.asarray(idxs, dtype=int)
-                arr = arr[(arr >= 0) & (arr < cube.energy.size)]
-                for i in arr:
-                    rows.append((gate_v, float(cube.energy[i])))
-        else:
-            # Current gate only
-            valid = self._current_trace_peak_indices()
-            if valid.size == 0:
-                self._show_error("No peaks to save. Find peaks first.")
-                return
-            gate_used, _ = self._nearest_spectrum(self.current_gate)
-            for i in valid:
-                rows.append((gate_used, float(cube.energy[i])))
+        rows_by_gate = self._current_peak_overlay_by_gate()
+        if not rows_by_gate:
+            self._show_error("No peaks to save. Find peaks first.")
+            return
         try:
             with Path(out_path).open("w", newline="", encoding="utf-8") as fh:
                 wr = csv.writer(fh)
-                wr.writerow(["gate", "peak_x", "analysis_axis", "original_x", "original_axis"])
-                for gate_v, e_v in rows:
-                    idx = int(np.argmin(np.abs(cube.energy - e_v)))
-                    wr.writerow([
-                        f"{gate_v:.10g}",
-                        f"{e_v:.10g}",
-                        cube.energy_label,
-                        f"{cube.x_original[idx]:.10g}",
-                        cube.x_original_label,
+                max_peaks = max(len(peaks) for _, peaks in rows_by_gate)
+                header = ["gate", "analysis_axis", "original_axis", "peak_count"]
+                for peak_no in range(1, max_peaks + 1):
+                    header.extend([
+                        f"peak_{peak_no}_x",
+                        f"peak_{peak_no}_intensity",
+                        f"peak_{peak_no}_original_x",
                     ])
+                wr.writerow(header)
+                for gate_v, peaks in rows_by_gate:
+                    row = [
+                        f"{gate_v:.10g}",
+                        cube.energy_label,
+                        cube.x_original_label,
+                        str(len(peaks)),
+                    ]
+                    for e_v, intensity_v, orig_x_v in peaks:
+                        row.extend([
+                            f"{e_v:.10g}",
+                            f"{intensity_v:.10g}",
+                            f"{orig_x_v:.10g}",
+                        ])
+                    missing = max_peaks - len(peaks)
+                    if missing > 0:
+                        row.extend([""] * (3 * missing))
+                    wr.writerow(row)
         except Exception as exc:
             self._show_error(f"Failed to save peaks CSV: {exc}")
             return
-        self.statusBar().showMessage(f"Saved peaks CSV: {out_path} ({len(rows)} rows)")
+        self.statusBar().showMessage(f"Saved peaks CSV: {out_path} ({len(rows_by_gate)} gates)")
 
     def _on_delete_peak_by_number(self) -> None:
         if self.current_cube is None or self.peak_indices.size == 0:
@@ -1832,10 +2356,10 @@ class MainWindow(QMainWindow):
             )
             return
 
-        lw_min = float(self.lw_min_spin.value())
-        lw_max_v = float(self.lw_max_spin.value())
+        lw_min = float(self._pts_to_axis_units(int(self.lw_min_spin.value())) or 0.0)
+        lw_max_v = float(self._pts_to_axis_units(int(self.lw_max_spin.value())) or 0.0)
         lw_max = lw_max_v if lw_max_v > lw_min else 0.0
-        peak_move = float(self.peak_move_limit_spin.value())
+        peak_move = float(self._pts_to_axis_units(int(self.peak_move_limit_spin.value())) or 0.0)
         maxfev = int(self.maxfev_spin.value())
 
         try:
@@ -1857,9 +2381,13 @@ class MainWindow(QMainWindow):
         self._fit_gate_idx = self._current_gate_index()
         self.batch_fit_map[self._fit_gate_idx] = np.asarray(res.centers, dtype=float)
         self.batch_fit_result_map[self._fit_gate_idx] = res
-        self._batch_fit_export_rows = [
-            self._fit_result_to_export_row(float(self.current_gate), res.model, self.current_cube.energy_label, res, status="ok")
-        ]
+        fit_row = self._fit_result_to_export_row(
+            float(gate_used), res.model, self.current_cube.energy_label, res, status="ok"
+        )
+        if self._has_batch_fit_results:
+            self._upsert_fit_export_row(fit_row)
+        else:
+            self._batch_fit_export_rows = [fit_row]
         self._sync_batch_fit_coords()
         self.current_gate = gate_used
         self._update_spectrum_only()
@@ -1880,6 +2408,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_coords = None
         self.batch_fit_result_map = {}
         self._batch_fit_export_rows = []
+        self._has_batch_fit_results = False
         self._update_spectrum_only()
 
     def _on_batch_fit_all_gates(self) -> None:
@@ -1905,10 +2434,10 @@ class MainWindow(QMainWindow):
             self._show_error("Fit range is too narrow for batch fit.")
             return
 
-        lw_min = float(self.lw_min_spin.value())
-        lw_max_v = float(self.lw_max_spin.value())
+        lw_min = float(self._pts_to_axis_units(int(self.lw_min_spin.value())) or 0.0)
+        lw_max_v = float(self._pts_to_axis_units(int(self.lw_max_spin.value())) or 0.0)
         lw_max = lw_max_v if lw_max_v > lw_min else 0.0
-        peak_move = float(self.peak_move_limit_spin.value())
+        peak_move = float(self._pts_to_axis_units(int(self.peak_move_limit_spin.value())) or 0.0)
         maxfev = int(self.maxfev_spin.value())
         xlo, xhi = self._fit_range_bounds()
 
@@ -1969,6 +2498,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_map = fit_map
         self.batch_fit_result_map = fit_result_map
         self._batch_fit_export_rows = [dict(row) for row in rows]
+        self._has_batch_fit_results = True
         self._sync_batch_fit_coords()
         if self.current_cube.gate.size:
             current_gate_idx = self._current_gate_index()
@@ -2043,7 +2573,7 @@ class MainWindow(QMainWindow):
             self._show_error("Load a DAT file first.")
             return
         active_fit = self._active_fit_result()
-        has_batch = bool(self._batch_fit_export_rows)
+        has_batch = self._has_batch_fit_results and bool(self._batch_fit_export_rows)
         if not has_batch and active_fit is None:
             self._show_error("Run a fit first.")
             return

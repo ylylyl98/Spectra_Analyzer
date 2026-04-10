@@ -12,7 +12,8 @@
       "Bash(python -c \"import scipy; print\\(scipy.__version__\\)\")",
       "Bash(where python:*)",
       "Bash(C:\\\\Users\\\\yanli\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe -m pip install scipy)",
-      "Bash(python -m pip install scipy)"
+      "Bash(python -m pip install scipy)",
+      "Bash(.venv/Scripts/python.exe -c ':*)"
     ]
   }
 }
