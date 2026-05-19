@@ -14,7 +14,7 @@ from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.widgets import LassoSelector
 from scipy.signal import savgol_filter
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QCursor, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -26,10 +26,12 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -55,6 +57,12 @@ from .fitting import (
     _clamp_sg_window,
 )
 
+
+# ── Matplotlib tab10 palette (used for peak labels) ──────────────────────────
+_TAB10 = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
 
 # ── Button style constants ────────────────────────────────────────────────────
 _STYLE_PRIMARY = (
@@ -120,7 +128,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Spectra Analyzer (PySide6)")
-        self.setMinimumSize(1240, 800)
+        self.setMinimumSize(1440, 860)
 
         # ── data state ──────────────────────────────────────────────────────
         self.current_root = ""
@@ -130,9 +138,12 @@ class MainWindow(QMainWindow):
         self.current_gate = 0.0
         self.peak_indices: np.ndarray = np.asarray([], dtype=int)
         self._peak_gate_idx: int | None = None
+        self.peak_kind_lookup: dict[int, bool] = {}              # energy_idx → True=peak
+        self.peak_label_lookup: dict[tuple[int, int], int] = {}  # (gate_idx, energy_idx) → label (1-based override)
         self.batch_peak_coords: tuple[np.ndarray, np.ndarray] | None = None
         self.batch_peak_records: list[tuple[int, int]] = []
         self.batch_peak_map: dict[int, np.ndarray] = {}
+        self.batch_peak_kind_lookup: dict[tuple[int, int], bool] = {}  # (gate_idx, energy_idx) → True=peak
         self.fit_result: FitResult | None = None
         self._fit_gate_idx: int | None = None
         self.batch_fit_map: dict[int, np.ndarray] = {}
@@ -196,21 +207,27 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             "QGroupBox {"
             "  border: 1px solid #d0d0d0; border-radius: 5px;"
-            "  margin-top: 10px; font-weight: 600; font-size: 11px;"
+            "  margin-top: 8px; font-weight: 600; font-size: 11px;"
             "}"
             "QGroupBox::title {"
             "  subcontrol-origin: margin; subcontrol-position: top left;"
             "  left: 8px; padding: 0 4px; color: #333;"
             "}"
-            "QTabWidget::pane { border: 1px solid #d0d0d0; border-radius: 3px; }"
+            "QTabWidget::pane {"
+            "  border: 1px solid #d0d0d0; border-radius: 3px;"
+            "  top: -1px;"
+            "}"
             "QTabBar::tab {"
-            "  padding: 5px 14px; font-size: 11px; border: 1px solid #ccc;"
+            "  padding: 4px 12px; font-size: 11px; border: 1px solid #ccc;"
             "  border-bottom: none; border-top-left-radius: 3px; border-top-right-radius: 3px;"
             "  background: #f0f0f0; color: #555;"
             "}"
             "QTabBar::tab:selected { background: white; color: #1565c0; font-weight: 600; }"
             "QTabBar::tab:hover:!selected { background: #e8e8e8; }"
             "QStatusBar { font-size: 10px; color: #555; }"
+            "QScrollArea { border: none; }"
+            "QSplitter::handle { background: #e0e0e0; }"
+            "QSplitter::handle:horizontal { width: 3px; }"
         )
 
         split = QSplitter(Qt.Horizontal)
@@ -219,12 +236,12 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(1, 1)
 
         left = self._build_left_panel()
-        left.setMinimumWidth(420)
+        left.setMinimumWidth(490)
         plot_panel = self._build_plot_panel()
 
         split.addWidget(left)
         split.addWidget(plot_panel)
-        split.setSizes([450, 870])
+        split.setSizes([510, 930])
 
         outer = QHBoxLayout(root)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -334,9 +351,10 @@ class MainWindow(QMainWindow):
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
 
         panel = QWidget()
+        panel.setMinimumWidth(470)
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(8)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(6)
 
         # ── Data Source (expander, default expanded) ──────────────────────────
         src_content = QWidget()
@@ -383,8 +401,8 @@ class MainWindow(QMainWindow):
         # File list
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.file_list.setMinimumHeight(70)
-        self.file_list.setMaximumHeight(100)
+        self.file_list.setMinimumHeight(55)
+        self.file_list.setMaximumHeight(80)
         self.file_list.setToolTip("Double-click or select and press Load to open a .dat file")
         self.file_list.setStyleSheet(
             "QListWidget { border: 1px solid #ddd; border-radius: 3px; font-size: 11px; }"
@@ -406,8 +424,8 @@ class MainWindow(QMainWindow):
         # ── Spectrum Analysis ─────────────────────────────────────────────────
         analysis_box = QGroupBox("Spectrum Analysis")
         ao_lay = QVBoxLayout(analysis_box)
-        ao_lay.setContentsMargins(8, 14, 8, 8)
-        ao_lay.setSpacing(6)
+        ao_lay.setContentsMargins(6, 14, 6, 6)
+        ao_lay.setSpacing(4)
 
         self._analysis_tabs = QTabWidget()
         self._analysis_tabs.addTab(self._build_find_peak_tab(), "Find Peaks")
@@ -421,8 +439,8 @@ class MainWindow(QMainWindow):
 
         self.analysis_text = QPlainTextEdit()
         self.analysis_text.setReadOnly(True)
-        self.analysis_text.setMinimumHeight(70)
-        self.analysis_text.setMaximumHeight(130)
+        self.analysis_text.setMinimumHeight(60)
+        self.analysis_text.setMaximumHeight(105)
         self.analysis_text.setStyleSheet(
             "QPlainTextEdit {"
             "  background: #f8f9fa; border: 1px solid #dee2e6;"
@@ -461,17 +479,10 @@ class MainWindow(QMainWindow):
         """Build the View Settings panel content (X-axis, colormap, bounds, gate)."""
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(2, 4, 2, 4)
-        lay.setSpacing(8)
+        lay.setContentsMargins(2, 2, 2, 4)
+        lay.setSpacing(6)
 
-        # ── X-axis override + colormap row ────────────────────────────────────
-        top_row = QHBoxLayout()
-        top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(6)
-
-        x_axis_lbl = QLabel("X-Axis:")
-        x_axis_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
-
+        # ── X-axis override + colormap (2-column form) ────────────────────────
         self.x_axis_override_combo = QComboBox()
         for value, label in AXIS_OVERRIDE_ITEMS:
             self.x_axis_override_combo.addItem(label, value)
@@ -479,19 +490,20 @@ class MainWindow(QMainWindow):
             "Override the auto-detected x-axis type. Use 'Auto Detect' unless the detection is wrong."
         )
 
-        cmap_lbl = QLabel("Colormap:")
-        cmap_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
-
         self.cmap_combo = QComboBox()
         self.cmap_combo.addItems(["turbo", "viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r"])
         self.cmap_combo.setCurrentText("RdBu_r")
         self.cmap_combo.setToolTip("Colormap used for the intensity heatmap")
 
-        top_row.addWidget(x_axis_lbl)
-        top_row.addWidget(self.x_axis_override_combo, 1)
-        top_row.addWidget(cmap_lbl)
-        top_row.addWidget(self.cmap_combo, 1)
-        lay.addLayout(top_row)
+        top_form = QFormLayout()
+        top_form.setContentsMargins(0, 0, 0, 0)
+        top_form.setSpacing(4)
+        top_form.setHorizontalSpacing(8)
+        top_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        top_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        top_form.addRow("X-Axis:", self.x_axis_override_combo)
+        top_form.addRow("Colormap:", self.cmap_combo)
+        lay.addLayout(top_form)
 
         # Axis status label
         self.axis_status_label = QLabel("X-axis: no file loaded.")
@@ -517,9 +529,10 @@ class MainWindow(QMainWindow):
         self.vmax_spin = QDoubleSpinBox()
         for sp in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
                    self.ymax_spin, self.vmin_spin, self.vmax_spin):
-            sp.setDecimals(6)
+            sp.setDecimals(4)
             sp.setRange(-1e12, 1e12)
             sp.setSingleStep(0.01)
+            sp.setMinimumWidth(90)
             sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.xmin_lock = QCheckBox("Fix")
@@ -539,9 +552,9 @@ class MainWindow(QMainWindow):
 
         bounds_box = QGroupBox("Heatmap Bounds")
         bounds_grid = QGridLayout(bounds_box)
-        bounds_grid.setContentsMargins(8, 14, 8, 8)
-        bounds_grid.setSpacing(5)
-        bounds_grid.setHorizontalSpacing(6)
+        bounds_grid.setContentsMargins(8, 14, 8, 6)
+        bounds_grid.setSpacing(4)
+        bounds_grid.setHorizontalSpacing(5)
 
         # Header row
         hdr_min = QLabel("Min")
@@ -581,7 +594,7 @@ class MainWindow(QMainWindow):
 
         bounds_grid.setColumnStretch(1, 1)
         bounds_grid.setColumnStretch(3, 1)
-        bounds_grid.setColumnMinimumWidth(0, 70)
+        bounds_grid.setColumnMinimumWidth(0, 62)
 
         # View action buttons
         btn_row = QHBoxLayout()
@@ -600,9 +613,11 @@ class MainWindow(QMainWindow):
         # ── Gate control ──────────────────────────────────────────────────────
         gate_box = QGroupBox("Gate Selection")
         gate_form = QFormLayout(gate_box)
-        gate_form.setContentsMargins(8, 14, 8, 8)
-        gate_form.setSpacing(5)
+        gate_form.setContentsMargins(8, 14, 8, 6)
+        gate_form.setSpacing(4)
+        gate_form.setHorizontalSpacing(8)
         gate_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        gate_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.gate_spin = GateValueSpinBox()
         self.gate_spin.setDecimals(6)
@@ -632,8 +647,8 @@ class MainWindow(QMainWindow):
     def _build_find_peak_tab(self) -> QWidget:
         tab = QWidget()
         lay = QVBoxLayout(tab)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(8)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(5)
 
         # ── Detection Mode ────────────────────────────────────────────────────
         mode_box = QGroupBox("Detection Mode")
@@ -658,13 +673,15 @@ class MainWindow(QMainWindow):
         # ── Original spectrum params ──────────────────────────────────────────
         self._orig_params_widget = QWidget()
         orig_form = QFormLayout(self._orig_params_widget)
-        orig_form.setContentsMargins(2, 0, 2, 0)
-        orig_form.setSpacing(4)
+        orig_form.setContentsMargins(2, 2, 2, 2)
+        orig_form.setSpacing(3)
+        orig_form.setHorizontalSpacing(8)
         orig_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        orig_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.peak_mode_combo = QComboBox()
-        self.peak_mode_combo.addItems(["Peaks", "Dips"])
-        self.peak_mode_combo.setToolTip("Peaks = maxima; Dips = minima in the spectrum.")
+        self.peak_mode_combo.addItems(["Peaks", "Dips", "Both"])
+        self.peak_mode_combo.setToolTip("Peaks = maxima; Dips = minima; Both = detect each independently.")
 
         self.prom_spin = QDoubleSpinBox()
         self.prom_spin.setDecimals(4)
@@ -686,6 +703,11 @@ class MainWindow(QMainWindow):
         self.max_peaks_spin.setValue(6)
         self.max_peaks_spin.setToolTip("Keep at most this many peaks after sorting by prominence.")
 
+        self.max_dips_spin = QSpinBox()
+        self.max_dips_spin.setRange(1, 30)
+        self.max_dips_spin.setValue(6)
+        self.max_dips_spin.setToolTip("Keep at most this many dips after sorting by prominence (Both mode only).")
+
         self.peak_smooth_chk = QCheckBox("Enable")
         self.peak_smooth_chk.setToolTip("Smooth the trace before peak finding to suppress noise spikes.")
         self.peak_smooth_win_spin = QSpinBox()
@@ -697,20 +719,26 @@ class MainWindow(QMainWindow):
 
         orig_form.addRow("Type:", self.peak_mode_combo)
         orig_form.addRow("Prominence:", self.prom_spin)
-        orig_form.addRow("Min Distance (pts):", self.distance_spin)
+        orig_form.addRow("Min Distance:", self.distance_spin)
         orig_form.addRow("Max Peaks:", self.max_peaks_spin)
+        orig_form.addRow("Max Dips:", self.max_dips_spin)
         orig_form.addRow("Pre-smooth:", smooth_row)
+        # Hide Max Dips row until "Both" is selected
+        orig_form.labelForField(self.max_dips_spin).setVisible(False)
+        self.max_dips_spin.setVisible(False)
 
         # ── Second-derivative params ──────────────────────────────────────────
         self._d2_params_widget = QWidget()
         d2_form = QFormLayout(self._d2_params_widget)
-        d2_form.setContentsMargins(2, 0, 2, 0)
-        d2_form.setSpacing(4)
+        d2_form.setContentsMargins(2, 2, 2, 2)
+        d2_form.setSpacing(3)
+        d2_form.setHorizontalSpacing(8)
         d2_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        d2_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.d2_mode_combo = QComboBox()
-        self.d2_mode_combo.addItems(["Peaks", "Dips"])
-        self.d2_mode_combo.setToolTip("Peaks = maxima; Dips = minima in the second-derivative trace.")
+        self.d2_mode_combo.addItems(["Peaks", "Dips", "Both"])
+        self.d2_mode_combo.setToolTip("Peaks = maxima; Dips = minima; Both = detect each independently.")
 
         self.d2_sg_win_spin = QSpinBox()
         self.d2_sg_win_spin.setRange(3, 501)
@@ -746,6 +774,11 @@ class MainWindow(QMainWindow):
         self.d2_max_peaks_spin.setValue(6)
         self.d2_max_peaks_spin.setToolTip("Maximum candidates to keep after sorting by d² prominence.")
 
+        self.d2_max_dips_spin = QSpinBox()
+        self.d2_max_dips_spin.setRange(1, 30)
+        self.d2_max_dips_spin.setValue(6)
+        self.d2_max_dips_spin.setToolTip("Maximum dip candidates to keep by d² prominence (Both mode only).")
+
         self.d2_target_spin = QSpinBox()
         self.d2_target_spin.setRange(0, 30)
         self.d2_target_spin.setValue(0)
@@ -758,10 +791,14 @@ class MainWindow(QMainWindow):
         d2_form.addRow("SG Window:", self.d2_sg_win_spin)
         d2_form.addRow("SG Poly Order:", self.d2_sg_poly_spin)
         d2_form.addRow("D² Prominence:", self.d2_prom_spin)
-        d2_form.addRow("Min Distance (pts):", self.d2_dist_spin)
+        d2_form.addRow("Min Distance:", self.d2_dist_spin)
         d2_form.addRow("Min Sep (energy):", self.d2_sep_spin)
         d2_form.addRow("Max Peaks:", self.d2_max_peaks_spin)
-        d2_form.addRow("Target Count (0=auto):", self.d2_target_spin)
+        d2_form.addRow("Max Dips:", self.d2_max_dips_spin)
+        d2_form.addRow("Target Count:", self.d2_target_spin)
+        # Hide Max Dips row until "Both" is selected
+        d2_form.labelForField(self.d2_max_dips_spin).setVisible(False)
+        self.d2_max_dips_spin.setVisible(False)
         self._d2_params_widget.setVisible(False)
 
         params_box = QGroupBox("Detection Parameters")
@@ -909,6 +946,8 @@ class MainWindow(QMainWindow):
 
         # ── wire signals ──────────────────────────────────────────────────────
         self._orig_radio.toggled.connect(self._on_detect_mode_changed)
+        self.peak_mode_combo.currentTextChanged.connect(self._on_orig_type_changed)
+        self.d2_mode_combo.currentTextChanged.connect(self._on_d2_type_changed)
         self.find_btn.clicked.connect(self._on_find_peaks)
         self.batch_find_btn.clicked.connect(self._on_batch_find_peaks_all_gates)
         self.lasso_mode_btn.toggled.connect(self._on_lasso_mode_toggled)
@@ -1600,19 +1639,25 @@ class MainWindow(QMainWindow):
             rows.append((gate_used, float(cube.energy[idx]), float(cube.z[gi, idx])))
         return rows
 
-    def _current_peak_overlay_by_gate(self) -> list[tuple[float, list[tuple[float, float, float]]]]:
+    def _current_peak_overlay_by_gate(self) -> list[tuple[float, list[tuple[float, float, float, str]]]]:
         if self.current_cube is None:
             return []
         cube = self.current_cube
-        grouped: list[tuple[float, list[tuple[float, float, float]]]] = []
+        grouped: list[tuple[float, list[tuple[float, float, float, str]]]] = []
         if self.batch_peak_map:
             for gi, idxs in sorted(self.batch_peak_map.items()):
                 gate_v = float(cube.gate[gi])
                 arr = np.asarray(idxs, dtype=int)
                 arr = arr[(arr >= 0) & (arr < cube.energy.size)]
-                peaks: list[tuple[float, float, float]] = []
-                for idx in arr:
-                    peaks.append((float(cube.energy[idx]), float(cube.z[gi, idx]), float(cube.x_original[idx])))
+                # Sort peaks by resolved label so CSV columns align with labels
+                sorted_arr = sorted(
+                    [int(ei) for ei in arr],
+                    key=lambda ei: self._resolved_peak_label(gi, ei),
+                )
+                peaks: list[tuple[float, float, float, str]] = []
+                for idx in sorted_arr:
+                    kind_str = "peak" if self.batch_peak_kind_lookup.get((gi, int(idx)), True) else "dip"
+                    peaks.append((float(cube.energy[idx]), float(cube.z[gi, idx]), float(cube.x_original[idx]), kind_str))
                 if peaks:
                     grouped.append((gate_v, peaks))
             return grouped
@@ -1621,9 +1666,14 @@ class MainWindow(QMainWindow):
             return []
         gate_used, _ = self._nearest_spectrum(self.current_gate)
         gi = self._current_gate_index()
+        sorted_valid = sorted(
+            [int(ei) for ei in valid],
+            key=lambda ei: self._resolved_peak_label(gi, ei),
+        )
         peaks = []
-        for idx in valid:
-            peaks.append((float(cube.energy[idx]), float(cube.z[gi, idx]), float(cube.x_original[idx])))
+        for idx in sorted_valid:
+            kind_str = "peak" if self.peak_kind_lookup.get(int(idx), True) else "dip"
+            peaks.append((float(cube.energy[idx]), float(cube.z[gi, idx]), float(cube.x_original[idx]), kind_str))
         return [(gate_used, peaks)] if peaks else []
 
     def _sync_current_trace_peaks_to_batch_map(self) -> None:
@@ -1635,6 +1685,8 @@ class MainWindow(QMainWindow):
         valid = self._current_trace_peak_indices()
         if valid.size > 0:
             self.batch_peak_map[gate_idx] = np.asarray(valid, dtype=int)
+            for ei in valid:
+                self.batch_peak_kind_lookup[(gate_idx, int(ei))] = self.peak_kind_lookup.get(int(ei), True)
         else:
             self.batch_peak_map.pop(gate_idx, None)
         self._sync_batch_peak_coords()
@@ -1715,6 +1767,10 @@ class MainWindow(QMainWindow):
         if self.batch_peak_map:
             self.peak_indices = np.asarray(self.batch_peak_map.get(gate_idx, []), dtype=int)
             self._peak_gate_idx = gate_idx
+            self.peak_kind_lookup = {
+                int(ei): self.batch_peak_kind_lookup.get((gate_idx, int(ei)), True)
+                for ei in self.peak_indices
+            }
             self._refresh_peak_delete_controls()
         self._sync_gate_controls()
         if update_plot:
@@ -1828,6 +1884,7 @@ class MainWindow(QMainWindow):
         self.current_dat_path = path
         self.peak_indices = np.asarray([], dtype=int)
         self._peak_gate_idx = None
+        self.peak_label_lookup = {}
         self.batch_peak_map = {}
         self.batch_peak_coords = None
         self.batch_peak_records = []
@@ -1875,6 +1932,7 @@ class MainWindow(QMainWindow):
         self.current_cube = cube
         self.peak_indices = np.asarray([], dtype=int)
         self._peak_gate_idx = None
+        self.peak_label_lookup = {}
         self.batch_peak_map = {}
         self.batch_peak_coords = None
         self.batch_peak_records = []
@@ -1987,6 +2045,100 @@ class MainWindow(QMainWindow):
         self._d2_params_widget.setVisible(not orig_is_checked)
         self._cached_d2 = None
 
+    def _on_orig_type_changed(self, text: str) -> None:
+        both = (text == "Both")
+        orig_form = self._orig_params_widget.layout()
+        orig_form.labelForField(self.max_dips_spin).setVisible(both)
+        self.max_dips_spin.setVisible(both)
+
+    def _on_d2_type_changed(self, text: str) -> None:
+        both = (text == "Both")
+        d2_form = self._d2_params_widget.layout()
+        d2_form.labelForField(self.d2_max_dips_spin).setVisible(both)
+        self.d2_max_dips_spin.setVisible(both)
+
+    def _auto_kind(self, y: np.ndarray, idx: int) -> bool:
+        """Return True if index looks like a peak (concave-down), False for dip."""
+        n = y.size
+        lo = max(0, idx - 2)
+        hi = min(n - 1, idx + 2)
+        if hi - lo < 2:
+            return True
+        d2 = float(np.diff(y[lo : hi + 1], 2).mean())
+        return d2 < 0
+
+    def _auto_rank_by_x(self, gate_idx: int) -> dict[int, int]:
+        """Return {energy_idx: 1-based rank} for all peaks in a gate, sorted by x-position."""
+        idxs = list(self.batch_peak_map.get(gate_idx, np.asarray([], dtype=int)))
+        if not idxs and self._peak_gate_idx == gate_idx:
+            idxs = list(self.peak_indices)
+        sorted_idxs = sorted(int(i) for i in idxs)
+        return {ei: rank for rank, ei in enumerate(sorted_idxs, start=1)}
+
+    def _resolved_peak_label(self, gate_idx: int, energy_idx: int) -> int:
+        """Return the peak label: manual override if set, otherwise auto x-rank."""
+        override = self.peak_label_lookup.get((int(gate_idx), int(energy_idx)))
+        if override is not None:
+            return override
+        return self._auto_rank_by_x(gate_idx).get(int(energy_idx), 1)
+
+    def _peak_label_color(self, label: int) -> str:
+        """Return tab10 hex color string for a 1-based label index."""
+        return _TAB10[(int(label) - 1) % len(_TAB10)]
+
+    def _show_peak_context_menu(self, x_click: float) -> None:
+        """Right-click context menu on spectrum plot: Set Label or Delete Peak."""
+        if self.current_cube is None:
+            return
+        trace_peak_indices = self._current_trace_peak_indices()
+        if trace_peak_indices.size == 0:
+            return
+        x = self.current_cube.energy
+        peak_x = x[trace_peak_indices]
+        x_span = max(float(np.nanmax(x) - np.nanmin(x)), 1e-12)
+        dists = np.abs(peak_x - x_click)
+        nearest_arr_idx = int(np.argmin(dists))
+        if dists[nearest_arr_idx] > 0.02 * x_span:
+            return
+        nearest_idx = int(trace_peak_indices[nearest_arr_idx])
+        gate_idx = self._current_gate_index()
+        current_label = self._resolved_peak_label(gate_idx, nearest_idx)
+
+        menu = QMenu(self)
+        set_label_action = menu.addAction(f"Set Label…  (current: {current_label})")
+        set_label_action.setData("set_label")
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete Peak")
+        delete_action.setData("delete")
+        chosen = menu.exec(QCursor.pos())
+
+        if chosen is None:
+            return
+        chosen_data = chosen.data()
+
+        if chosen_data == "delete":
+            self.peak_label_lookup.pop((gate_idx, nearest_idx), None)
+            self.peak_indices = np.asarray(
+                self.peak_indices[self.peak_indices != nearest_idx], dtype=int
+            )
+            self._sync_current_trace_peaks_to_batch_map()
+            self.fit_result = None
+            self._refresh_peak_delete_controls()
+            gate_used, y = self._nearest_spectrum(self.current_gate)
+            self._update_spectrum_only()
+            self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
+        elif chosen_data == "set_label":
+            new_label, ok = QInputDialog.getInt(
+                self, "Set Peak Label",
+                "Label index (1 = first peak, 2 = second, …):",
+                value=current_label, min=1, max=99,
+            )
+            if ok:
+                self.peak_label_lookup[(gate_idx, nearest_idx)] = new_label
+                gate_used, y = self._nearest_spectrum(self.current_gate)
+                self._update_spectrum_only()
+                self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
+
     def _on_find_peaks(self) -> None:
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
@@ -2004,7 +2156,7 @@ class MainWindow(QMainWindow):
         if self._d2_radio.isChecked():
             # Second-derivative mode
             try:
-                idx_local, d2y = find_peaks_second_derivative(
+                idx_local, kinds_local, d2y = find_peaks_second_derivative(
                     xr, yr,
                     mode=self._peak_mode(),  # type: ignore[arg-type]
                     sg_window=int(self.d2_sg_win_spin.value()),
@@ -2013,6 +2165,7 @@ class MainWindow(QMainWindow):
                     d2_distance=int(self.d2_dist_spin.value()),
                     d2_sep_ev=float(self.d2_sep_spin.value()),
                     max_peaks=int(self.d2_max_peaks_spin.value()),
+                    max_dips=int(self.d2_max_dips_spin.value()),
                     target_count=int(self.d2_target_spin.value()),
                 )
                 self._cached_d2 = (xr, d2y)
@@ -2026,12 +2179,13 @@ class MainWindow(QMainWindow):
                 if win >= 3 and yr.size > win:
                     yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
             try:
-                idx_local = find_peak_indices(
+                idx_local, kinds_local = find_peak_indices(
                     xr, yr,
                     mode=self._peak_mode(),  # type: ignore[arg-type]
                     prominence_frac=float(self.prom_spin.value()),
                     min_distance=int(self.distance_spin.value()),
                     max_peaks=int(self.max_peaks_spin.value()),
+                    max_dips=int(self.max_dips_spin.value()),
                 )
             except Exception as exc:
                 self._show_error(str(exc))
@@ -2040,7 +2194,19 @@ class MainWindow(QMainWindow):
 
         idx = np.asarray(mask_idx[idx_local], dtype=int) if idx_local.size else np.asarray([], dtype=int)
         self.peak_indices = idx
+        self.peak_kind_lookup = {int(ei): bool(k) for ei, k in zip(idx, kinds_local)}
         self._peak_gate_idx = int(np.argmin(np.abs(self.current_cube.gate - float(gate_used))))
+        gate_idx = self._peak_gate_idx
+        # Remove stale kind entries for this gate then write new ones
+        for key in [k for k in self.batch_peak_kind_lookup if k[0] == gate_idx]:
+            del self.batch_peak_kind_lookup[key]
+        if idx.size > 0:
+            self.batch_peak_map[gate_idx] = np.asarray(idx, dtype=int)
+            for ei, k in zip(idx, kinds_local):
+                self.batch_peak_kind_lookup[(gate_idx, int(ei))] = bool(k)
+        else:
+            self.batch_peak_map.pop(gate_idx, None)
+        self._sync_batch_peak_coords()
         self.fit_result = None
         self._refresh_peak_delete_controls()
         self.gate_spin.blockSignals(True)
@@ -2068,15 +2234,18 @@ class MainWindow(QMainWindow):
         prom = float(self.prom_spin.value())
         min_dist = int(self.distance_spin.value())
         max_peaks_o = int(self.max_peaks_spin.value())
+        max_dips_o = int(self.max_dips_spin.value())
         sg_win = int(self.d2_sg_win_spin.value())
         sg_poly = int(self.d2_sg_poly_spin.value())
         d2_prom = float(self.d2_prom_spin.value())
         d2_dist = int(self.d2_dist_spin.value())
         d2_sep = float(self.d2_sep_spin.value())
         d2_max = int(self.d2_max_peaks_spin.value())
+        d2_max_dips = int(self.d2_max_dips_spin.value())
         d2_tgt = int(self.d2_target_spin.value())
 
         peak_map: dict[int, np.ndarray] = {}
+        batch_kind_lookup: dict[tuple[int, int], bool] = {}
         ok_count = 0
         peak_total = 0
 
@@ -2086,22 +2255,24 @@ class MainWindow(QMainWindow):
 
             try:
                 if use_d2:
-                    idx_local, _ = find_peaks_second_derivative(
+                    idx_local, kinds_local, _ = find_peaks_second_derivative(
                         xr, yr,
                         mode=peak_mode,  # type: ignore[arg-type]
                         sg_window=sg_win, sg_polyorder=sg_poly,
                         d2_prom_frac=d2_prom, d2_distance=d2_dist,
-                        d2_sep_ev=d2_sep, max_peaks=d2_max, target_count=d2_tgt,
+                        d2_sep_ev=d2_sep, max_peaks=d2_max, max_dips=d2_max_dips,
+                        target_count=d2_tgt,
                     )
                 else:
                     if self.peak_smooth_chk.isChecked():
                         win = _clamp_sg_window(yr.size, int(self.peak_smooth_win_spin.value()))
                         if win >= 3 and yr.size > win:
                             yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
-                    idx_local = find_peak_indices(
+                    idx_local, kinds_local = find_peak_indices(
                         xr, yr,
                         mode=peak_mode,  # type: ignore[arg-type]
-                        prominence_frac=prom, min_distance=min_dist, max_peaks=max_peaks_o,
+                        prominence_frac=prom, min_distance=min_dist,
+                        max_peaks=max_peaks_o, max_dips=max_dips_o,
                     )
             except Exception:
                 continue
@@ -2110,15 +2281,23 @@ class MainWindow(QMainWindow):
                 continue
             ok_count += 1
             peak_total += int(idx_local.size)
-            peak_map[gi] = np.asarray(mask_idx[idx_local], dtype=int)
+            full_idx = np.asarray(mask_idx[idx_local], dtype=int)
+            peak_map[gi] = full_idx
+            for fi, ki in zip(full_idx, kinds_local):
+                batch_kind_lookup[(gi, int(fi))] = bool(ki)
 
             if gi % 25 == 0:
                 self.statusBar().showMessage(f"Batch peak finding… gate {gi+1}/{cube.gate.size}")
                 QApplication.processEvents()
 
         self.batch_peak_map = peak_map
+        self.batch_peak_kind_lookup = batch_kind_lookup
         current_gate_idx = self._current_gate_index()
         self.peak_indices = np.asarray(peak_map.get(current_gate_idx, []), dtype=int)
+        self.peak_kind_lookup = {
+            int(ei): batch_kind_lookup.get((current_gate_idx, int(ei)), True)
+            for ei in self.peak_indices
+        }
         self._peak_gate_idx = current_gate_idx
         self._lasso_selected_peak_ids = []
         self._clear_lasso_selection_visual()
@@ -2158,6 +2337,7 @@ class MainWindow(QMainWindow):
                 header = ["gate", "analysis_axis", "original_axis", "peak_count"]
                 for peak_no in range(1, max_peaks + 1):
                     header.extend([
+                        f"peak_{peak_no}_type",
                         f"peak_{peak_no}_x",
                         f"peak_{peak_no}_intensity",
                         f"peak_{peak_no}_original_x",
@@ -2170,15 +2350,16 @@ class MainWindow(QMainWindow):
                         cube.x_original_label,
                         str(len(peaks)),
                     ]
-                    for e_v, intensity_v, orig_x_v in peaks:
+                    for e_v, intensity_v, orig_x_v, kind_str in peaks:
                         row.extend([
+                            kind_str,
                             f"{e_v:.10g}",
                             f"{intensity_v:.10g}",
                             f"{orig_x_v:.10g}",
                         ])
                     missing = max_peaks - len(peaks)
                     if missing > 0:
-                        row.extend([""] * (3 * missing))
+                        row.extend([""] * (4 * missing))
                     wr.writerow(row)
         except Exception as exc:
             self._show_error(f"Failed to save peaks CSV: {exc}")
@@ -2195,6 +2376,7 @@ class MainWindow(QMainWindow):
             return
         idx_to_remove = int(self.peak_indices[n - 1])
         self.peak_indices = np.asarray(self.peak_indices[self.peak_indices != idx_to_remove], dtype=int)
+        self.peak_label_lookup.pop((self._current_gate_index(), idx_to_remove), None)
         self._sync_current_trace_peaks_to_batch_map()
         self.fit_result = None
         self._refresh_peak_delete_controls()
@@ -2205,8 +2387,12 @@ class MainWindow(QMainWindow):
     def _on_clear_peaks(self) -> None:
         if self.current_cube is None:
             return
+        gate_idx = self._current_gate_index()
+        for key in [k for k in self.peak_label_lookup if k[0] == gate_idx]:
+            del self.peak_label_lookup[key]
         self.peak_indices = np.asarray([], dtype=int)
-        self._peak_gate_idx = self._current_gate_index()
+        self.peak_kind_lookup = {}
+        self._peak_gate_idx = gate_idx
         self._sync_current_trace_peaks_to_batch_map()
         self.fit_result = None
         self._refresh_peak_delete_controls()
@@ -2216,6 +2402,8 @@ class MainWindow(QMainWindow):
 
     def _on_clear_batch_peaks(self) -> None:
         self.batch_peak_map = {}
+        self.batch_peak_kind_lookup = {}
+        self.peak_label_lookup = {}
         self.batch_peak_coords = None
         self.batch_peak_records = []
         self._batch_delete_circle_start = None
@@ -2307,6 +2495,9 @@ class MainWindow(QMainWindow):
             if kept.size:
                 new_map[int(gi)] = kept
         self.batch_peak_map = new_map
+        for gi, ei_set in delete_map.items():
+            for ei in ei_set:
+                self.peak_label_lookup.pop((int(gi), int(ei)), None)
         self._lasso_selected_peak_ids = []
         self._clear_lasso_selection_visual()
         self._update_lasso_actions()
@@ -2362,16 +2553,25 @@ class MainWindow(QMainWindow):
         peak_move = float(self._pts_to_axis_units(int(self.peak_move_limit_spin.value())) or 0.0)
         maxfev = int(self.maxfev_spin.value())
 
+        fit_mode = self._peak_mode()
+        fit_kinds: np.ndarray | None = None
+        if fit_mode == "Both" and self.current_cube is not None:
+            x_arr = self.current_cube.energy
+            fit_kinds = np.asarray([
+                self.peak_kind_lookup.get(int(np.argmin(np.abs(x_arr - c))), True)
+                for c in centers_in
+            ], dtype=bool)
         try:
             res = fit_multi_peak(
                 xr, yr,
                 centers_hint=centers_in,
                 model=self.fit_model_combo.currentText(),  # type: ignore[arg-type]
-                mode=self._peak_mode(),  # type: ignore[arg-type]
+                mode=fit_mode,  # type: ignore[arg-type]
                 linewidth_min=lw_min,
                 linewidth_max=lw_max,
                 peak_move_limit=peak_move,
                 maxfev=maxfev,
+                kinds=fit_kinds,
             )
         except Exception as exc:
             self._show_error(f"Fit failed: {exc}")
@@ -2427,6 +2627,7 @@ class MainWindow(QMainWindow):
 
         model = str(self.fit_model_combo.currentText())
         peak_mode = self._peak_mode()
+        use_kinds = (peak_mode == "Both")
         x = cube.energy
         mask = self._fit_mask(x)
         xr_base = np.asarray(x[mask], dtype=float)
@@ -2466,6 +2667,15 @@ class MainWindow(QMainWindow):
                 )
                 continue
 
+            batch_kinds: np.ndarray | None = None
+            if use_kinds and self.current_cube is not None:
+                x_arr = cube.energy
+                batch_kinds = np.asarray([
+                    self.batch_peak_kind_lookup.get(
+                        (gi, int(np.argmin(np.abs(x_arr - c)))), True
+                    )
+                    for c in centers_in
+                ], dtype=bool)
             try:
                 res = fit_multi_peak(
                     xr_base, yr,
@@ -2474,6 +2684,7 @@ class MainWindow(QMainWindow):
                     mode=peak_mode,  # type: ignore[arg-type]
                     linewidth_min=lw_min, linewidth_max=lw_max,
                     peak_move_limit=peak_move, maxfev=maxfev,
+                    kinds=batch_kinds,
                 )
             except Exception as exc:
                 fail_count += 1
@@ -2821,22 +3032,50 @@ class MainWindow(QMainWindow):
         if trace_peak_indices.size > 0:
             px = x[trace_peak_indices]
             py = y[trace_peak_indices]
-            self._spec_ax.vlines(px, y0, y1, colors="#d62728", linestyles=":", linewidth=0.9, alpha=0.55, zorder=2)
+            trace_kinds = np.asarray(
+                [self.peak_kind_lookup.get(int(ei), True) for ei in trace_peak_indices], dtype=bool
+            )
+            gate_idx_cur = self._current_gate_index()
+            trace_labels = [
+                self._resolved_peak_label(gate_idx_cur, int(ei)) for ei in trace_peak_indices
+            ]
+            trace_colors = [self._peak_label_color(lbl) for lbl in trace_labels]
+            # Vertical dashed lines: colored by label
+            for xi_v, col_v in zip(px, trace_colors):
+                self._spec_ax.vlines(
+                    xi_v, y0, y1, colors=col_v, linestyles=":", linewidth=0.9, alpha=0.55, zorder=2
+                )
+            has_lasso_drawn = False
+            legend_labels_added: set[int] = set()
             for i, (xi, yi) in enumerate(zip(px, py)):
+                is_peak = bool(trace_kinds[i])
+                marker = "^" if is_peak else "v"
+                lbl = trace_labels[i]
+                base_color = trace_colors[i]
                 if int(trace_peak_indices[i]) in lasso_energy_idxs:
-                    self._spec_ax.scatter([xi], [yi], s=104, facecolors="#fff176",
-                                          edgecolors="#ff00c8", linewidths=1.6, zorder=6)
+                    self._spec_ax.scatter(
+                        [xi], [yi], s=110, marker=marker,
+                        facecolors="#fff176", edgecolors="#ff00c8", linewidths=1.6, zorder=6,
+                    )
+                    has_lasso_drawn = True
                 elif sel_idx is not None and i == sel_idx:
-                    # Selected via spinbox: orange
-                    self._spec_ax.scatter([xi], [yi], s=88, color="#ff9800",
-                                          edgecolors="#111111", linewidths=0.9, zorder=5)
+                    self._spec_ax.scatter(
+                        [xi], [yi], s=90, marker=marker,
+                        color="#ff9800", edgecolors="#111111", linewidths=0.9, zorder=5,
+                    )
                 else:
-                    self._spec_ax.scatter([xi], [yi], s=36, color="#d62728", zorder=4)
-            # Add legend proxy once
-            self._spec_ax.scatter([], [], s=36, color="#d62728", label="Peaks")
-            if lasso_energy_idxs:
-                self._spec_ax.scatter([], [], s=104, facecolors="#fff176",
-                                      edgecolors="#ff00c8", linewidths=1.6, label="Heatmap Lasso Selected")
+                    kind_str = "Peak" if is_peak else "Dip"
+                    leg_label = f"{kind_str} {lbl}" if lbl not in legend_labels_added else ""
+                    self._spec_ax.scatter(
+                        [xi], [yi], s=50, marker=marker, color=base_color, zorder=4,
+                        **({"label": leg_label} if leg_label else {}),
+                    )
+                    legend_labels_added.add(lbl)
+            if has_lasso_drawn:
+                self._spec_ax.scatter(
+                    [], [], s=110, marker="^", facecolors="#fff176",
+                    edgecolors="#ff00c8", linewidths=1.6, label="Heatmap Lasso Selected",
+                )
 
         if fit_centers.size > 0:
             fit_y = np.interp(fit_centers, x, y)
@@ -2915,29 +3154,64 @@ class MainWindow(QMainWindow):
         self._heat_fit_artists = []
         self._heat_peak_texts = []
 
-        # Batch peaks (all gates, cyan circles)
+        # Batch peaks (all gates) — colored by resolved label (tab10)
         if self.batch_peak_coords is not None:
             bx, by = self.batch_peak_coords
             if bx.size and by.size:
+                b_kinds = np.asarray(
+                    [self.batch_peak_kind_lookup.get(rec, True) for rec in self.batch_peak_records], dtype=bool
+                )
+                b_labels = [self._resolved_peak_label(rec[0], rec[1]) for rec in self.batch_peak_records]
                 selected_ids = set(self._lasso_selected_peak_ids)
                 selected_mask = np.asarray([rec in selected_ids for rec in self.batch_peak_records], dtype=bool)
-                unselected_mask = ~selected_mask if selected_mask.size else np.asarray([], dtype=bool)
-                if selected_mask.size == 0 or np.any(unselected_mask):
-                    self._heat_batch_peak_artists.append(
-                        self._heat_ax.scatter(
-                            bx[unselected_mask] if selected_mask.size else bx,
-                            by[unselected_mask] if selected_mask.size else by,
-                            s=20, marker="o",
-                            facecolors="none", edgecolors="#00e5ff", linewidths=0.85,
-                            alpha=0.98, zorder=24, label="All-Gate Peaks",
+                unsel = ~selected_mask
+                # Unselected: draw per unique label so each gets its tab10 color
+                unique_labels = sorted(set(b_labels))
+                legend_added: set[int] = set()
+                for lbl in unique_labels:
+                    lbl_mask = np.asarray([l == lbl for l in b_labels], dtype=bool)
+                    col = self._peak_label_color(lbl)
+                    m_pk = unsel & lbl_mask & b_kinds
+                    m_dp = unsel & lbl_mask & ~b_kinds
+                    leg_pk = f"Peak {lbl}" if lbl not in legend_added else ""
+                    if m_pk.any():
+                        self._heat_batch_peak_artists.append(
+                            self._heat_ax.scatter(
+                                bx[m_pk], by[m_pk], s=20, marker="^",
+                                facecolors="none", edgecolors=col, linewidths=0.85,
+                                alpha=0.98, zorder=24,
+                                **({"label": leg_pk} if leg_pk else {}),
+                            )
                         )
-                    )
-                if selected_mask.size and np.any(selected_mask):
+                        legend_added.add(lbl)
+                    leg_dp = f"Dip {lbl}" if lbl not in legend_added else ""
+                    if m_dp.any():
+                        self._heat_batch_peak_artists.append(
+                            self._heat_ax.scatter(
+                                bx[m_dp], by[m_dp], s=20, marker="v",
+                                facecolors="none", edgecolors=col, linewidths=0.85,
+                                alpha=0.98, zorder=24,
+                                **({"label": leg_dp} if leg_dp else {}),
+                            )
+                        )
+                        legend_added.add(lbl)
+                # Lasso-selected (all labels) — yellow fill, magenta edge
+                m_sel_pk = selected_mask & b_kinds
+                if m_sel_pk.any():
                     self._heat_batch_peak_artists.append(
                         self._heat_ax.scatter(
-                            bx[selected_mask], by[selected_mask], s=64, marker="o",
+                            bx[m_sel_pk], by[m_sel_pk], s=64, marker="^",
                             facecolors="#fff176", edgecolors="#ff00c8", linewidths=1.6,
                             alpha=1.0, zorder=25, label="Lasso Selected",
+                        )
+                    )
+                m_sel_dp = selected_mask & ~b_kinds
+                if m_sel_dp.any():
+                    self._heat_batch_peak_artists.append(
+                        self._heat_ax.scatter(
+                            bx[m_sel_dp], by[m_sel_dp], s=64, marker="v",
+                            facecolors="#fff176", edgecolors="#ff00c8", linewidths=1.6,
+                            alpha=1.0, zorder=25,
                         )
                     )
 
@@ -2956,45 +3230,44 @@ class MainWindow(QMainWindow):
         if trace_peak_indices.size == 0:
             return
         valid = trace_peak_indices
-        if valid.size == 0:
-            return
         px = np.asarray(x[valid], dtype=float)
         py = np.full_like(px, float(gate_used), dtype=float)
+        tr_kinds = np.asarray(
+            [self.peak_kind_lookup.get(int(ei), True) for ei in valid], dtype=bool
+        )
+        gate_idx_tr = self._current_gate_index()
+        tr_labels = [self._resolved_peak_label(gate_idx_tr, int(ei)) for ei in valid]
+        tr_colors = [self._peak_label_color(lbl) for lbl in tr_labels]
         sel_idx = self._selected_peak_array_index()
 
-        if sel_idx is not None and 0 <= sel_idx < px.size:
-            mask = np.ones(px.size, dtype=bool)
-            mask[sel_idx] = False
-            if np.any(mask):
+        # Draw trace peak markers one-by-one so each gets its label color
+        for i in range(px.size):
+            is_peak = bool(tr_kinds[i])
+            marker = "^" if is_peak else "v"
+            col = tr_colors[i]
+            if sel_idx is not None and i == sel_idx:
                 self._heat_peak_artists.append(
                     self._heat_ax.scatter(
-                        px[mask], py[mask], s=42, marker="o",
-                        facecolors="#ffeb3b", edgecolors="#1f1f1f", linewidths=0.8,
-                        zorder=30, label="Peaks@Gate",
+                        [px[i]], [py[i]], s=88, marker=marker,
+                        facecolors="#ff9800", edgecolors="#111111", linewidths=0.9,
+                        zorder=31, label="Selected@Gate",
                     )
                 )
-            self._heat_peak_artists.append(
-                self._heat_ax.scatter(
-                    [px[sel_idx]], [py[sel_idx]], s=88, marker="o",
-                    facecolors="#ff9800", edgecolors="#111111", linewidths=0.9,
-                    zorder=31, label="Selected@Gate",
+            else:
+                self._heat_peak_artists.append(
+                    self._heat_ax.scatter(
+                        [px[i]], [py[i]], s=42, marker=marker,
+                        facecolors=col, edgecolors="#1f1f1f", linewidths=0.8,
+                        zorder=30,
+                    )
                 )
-            )
-        else:
-            self._heat_peak_artists.append(
-                self._heat_ax.scatter(
-                    px, py, s=42, marker="o",
-                    facecolors="#ffeb3b", edgecolors="#1f1f1f", linewidths=0.8,
-                    zorder=30, label="Peaks@Gate",
-                )
-            )
 
         y0, y1 = self._heat_ax.get_ylim()
         yoff = 0.018 * abs(float(y1 - y0))
-        for i, xv in enumerate(px, start=1):
-            is_sel = (sel_idx is not None) and (i - 1 == sel_idx)
+        for i, (xv, lbl) in enumerate(zip(px, tr_labels)):
+            is_sel = (sel_idx is not None) and (i == sel_idx)
             txt = self._heat_ax.text(
-                float(xv), float(gate_used + yoff), str(i),
+                float(xv), float(gate_used + yoff), str(lbl),
                 fontsize=(9 if is_sel else 8),
                 color="#111111",
                 ha="center", va="bottom", zorder=31,
@@ -3043,10 +3316,7 @@ class MainWindow(QMainWindow):
                 return
 
             if event.button == 3:
-                if self._remove_manual_peak_near(float(event.xdata)):
-                    gate_used, y = self._nearest_spectrum(self.current_gate)
-                    self._update_spectrum_only()
-                    self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
+                self._show_peak_context_menu(float(event.xdata))
                 return
 
         # ── Heatmap ───────────────────────────────────────────────────────────
@@ -3184,6 +3454,7 @@ class MainWindow(QMainWindow):
         gate_idx = self._current_gate_index()
         if self._peak_gate_idx != gate_idx:
             self.peak_indices = np.asarray([], dtype=int)
+            self.peak_kind_lookup = {}
             self._peak_gate_idx = gate_idx
         x = self.current_cube.energy
         idx = int(np.argmin(np.abs(x - float(x_click))))
@@ -3191,6 +3462,8 @@ class MainWindow(QMainWindow):
             return False
         merged = np.concatenate([self.peak_indices, np.asarray([idx], dtype=int)])
         self.peak_indices = np.asarray(np.unique(merged), dtype=int)
+        _, y_cur = self._nearest_spectrum(self.current_gate)
+        self.peak_kind_lookup[idx] = self._auto_kind(y_cur, idx)
         self._sync_current_trace_peaks_to_batch_map()
         self.fit_result = None
         self._refresh_peak_delete_controls()
@@ -3210,6 +3483,7 @@ class MainWindow(QMainWindow):
         if abs(float(x[nearest_idx]) - float(x_click)) > 0.02 * x_span:
             return False
         self.peak_indices = np.asarray(self.peak_indices[self.peak_indices != nearest_idx], dtype=int)
+        self.peak_label_lookup.pop((gate_idx, nearest_idx), None)
         self._sync_current_trace_peaks_to_batch_map()
         self.fit_result = None
         self._refresh_peak_delete_controls()
@@ -3250,6 +3524,8 @@ class MainWindow(QMainWindow):
             py = np.full(px.shape, float(gates[gi]), dtype=float)
             keep = np.hypot((px - center_x) / xspan, (py - center_y) / yspan) > radius_n
             deleted += int(np.count_nonzero(~keep))
+            for ei in arr[~keep]:
+                self.peak_label_lookup.pop((int(gi), int(ei)), None)
             if np.any(keep):
                 new_map[int(gi)] = np.asarray(arr[keep], dtype=int)
         self.batch_peak_map = new_map
