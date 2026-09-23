@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,10 +15,14 @@ from matplotlib.path import Path as MplPath
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.widgets import LassoSelector
 from scipy.signal import savgol_filter
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QCursor, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import Qt, QObject, QEvent, QPointF, QSettings, QSignalBlocker
+from PySide6.QtGui import QCursor, QDragEnterEvent, QDropEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
+    QAbstractSlider,
+    QScrollBar,
+    QTabBar,
     QAbstractItemView,
     QCheckBox,
     QComboBox,
@@ -49,6 +55,11 @@ from PySide6.QtWidgets import (
 )
 
 from .dat_io import AXIS_OVERRIDE_ITEMS, DataCube, list_dat_files, list_dat_folders, load_dat_cube
+from .custom_colormaps import resolve_colormap
+from .plot_state import PlotStateStore, source_fingerprint
+from .title_templates import (BUILTIN_PRESET, FIELDS, manual_settings, parse_angle_map,
+                              render_title, validate_preset, validate_title_settings)
+from .image_export import PLOT_FONT_SIZE, export_figure_png, style_plot_axis, style_heatmap_colorbar, position_heatmap_title
 from .fitting import (
     FitResult,
     find_peak_indices,
@@ -105,6 +116,36 @@ _STYLE_DANGER = (
 )
 
 
+class _PageWheelFilter(QObject):
+    """Wheel gestures scroll pages; value controls and plots never consume them."""
+    def eventFilter(self, watched, event):
+        if event.type() != QEvent.Wheel or not isinstance(watched, QWidget):
+            return False
+        widget = watched
+        blocked = False
+        while widget is not None:
+            if isinstance(widget, (QAbstractSpinBox, QComboBox, QTabBar, FigureCanvasQTAgg)):
+                blocked = True
+            if isinstance(widget, QAbstractSlider) and not isinstance(widget, QScrollBar):
+                blocked = True
+            if isinstance(widget, QScrollArea):
+                if blocked:
+                    viewport = widget.viewport()
+                    forwarded = QWheelEvent(
+                        QPointF(viewport.mapFromGlobal(event.globalPosition().toPoint())),
+                        event.globalPosition(), event.pixelDelta(), event.angleDelta(),
+                        event.buttons(), event.modifiers(), event.phase(), event.inverted(),
+                    )
+                    QApplication.sendEvent(viewport, forwarded)
+                    event.accept()
+                    return True
+                return False
+            widget = widget.parentWidget()
+        if blocked:
+            event.accept()
+        return blocked
+
+
 class GateValueSpinBox(QDoubleSpinBox):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -155,6 +196,11 @@ class MainWindow(QMainWindow):
         # ── UI lock helpers ──────────────────────────────────────────────────
         self._view_lock_controls: dict[QDoubleSpinBox, QCheckBox] = {}
         self._fit_lock_controls: dict[QDoubleSpinBox, QCheckBox] = {}
+        self._view_callbacks_ready = False
+        self._view_syncing = False
+        self._heat_mesh = None
+        self._heat_colorbar = None
+        self._last_valid_color_limits: tuple[float, float] | None = None
 
         # ── matplotlib axes/artists ──────────────────────────────────────────
         self._heat_ax = None
@@ -192,7 +238,18 @@ class MainWindow(QMainWindow):
         self._csv_seeds_map: dict[int, list[float]] | None = None
         self._csv_seeds_path: str = ""
 
+        self._annotation_source = None
+        self._annotation_settings = QSettings("SpectraAnalyzer", "SpectraAnalyzer")
+        self._title_source = None
+        self._title_presets, self._default_title_settings = self._load_title_preferences()
+        self._title_settings = self._copy_title_settings(self._default_title_settings)
+        self._plot_state_store = PlotStateStore()
+        self._loaded_source_fingerprint: str | None = None
         self._build_ui()
+        app = QApplication.instance()
+        if not hasattr(app, "_page_wheel_filter"):
+            app._page_wheel_filter = _PageWheelFilter(app)
+            app.installEventFilter(app._page_wheel_filter)
         self.setAcceptDrops(True)
 
     # =========================================================================
@@ -265,6 +322,7 @@ class MainWindow(QMainWindow):
 
         # Gate navigation signals (wired here because plot panel builds the widgets)
         self.plot_gate_spin.valueChanged.connect(self._on_plot_gate_spin_changed)
+        self.plot_gate_spin.editingFinished.connect(self._on_plot_gate_spin_edit_finished)
         self.plot_gate_index_spin.valueChanged.connect(self._on_plot_gate_index_changed)
         self.plot_prev_gate_btn.clicked.connect(lambda: self._step_gate_index(-1))
         self.plot_next_gate_btn.clicked.connect(lambda: self._step_gate_index(1))
@@ -457,8 +515,6 @@ class MainWindow(QMainWindow):
         self.folder_combo.currentIndexChanged.connect(self._on_folder_changed)
         self.load_btn.clicked.connect(self._on_load_selected_file)
         self.file_list.itemDoubleClicked.connect(lambda _: self._on_load_selected_file())
-        self.apply_gate_btn.clicked.connect(self._on_apply_gate)
-        self.gate_spin.valueChanged.connect(self._on_gate_spin_changed)
         self.x_axis_override_combo.currentIndexChanged.connect(self._on_x_axis_override_changed)
         self.cmap_combo.currentTextChanged.connect(lambda _: self._plot_cube())
         self.lw_min_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
@@ -466,7 +522,9 @@ class MainWindow(QMainWindow):
         self.peak_move_limit_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
         for spin in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
                      self.ymax_spin, self.vmin_spin, self.vmax_spin):
-            spin.valueChanged.connect(lambda _: self._plot_cube())
+            spin.valueChanged.connect(
+                lambda _value, changed_spin=spin: self._on_view_limit_changed(changed_spin)
+            )
         self.apply_view_btn.clicked.connect(self._plot_cube)
         self.auto_view_btn.clicked.connect(self._on_auto_view)
 
@@ -491,7 +549,10 @@ class MainWindow(QMainWindow):
         )
 
         self.cmap_combo = QComboBox()
-        self.cmap_combo.addItems(["turbo", "viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r"])
+        self.cmap_combo.addItems([
+            "turbo", "viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r",
+            "RdBu_r_p0p45", "RdBu_r_p0p6",
+        ])
         self.cmap_combo.setCurrentText("RdBu_r")
         self.cmap_combo.setToolTip("Colormap used for the intensity heatmap")
 
@@ -503,6 +564,48 @@ class MainWindow(QMainWindow):
         top_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         top_form.addRow("X-Axis:", self.x_axis_override_combo)
         top_form.addRow("Colormap:", self.cmap_combo)
+        self.fix_annotations_chk = QCheckBox("Fix annotations")
+        self.fix_annotations_chk.setChecked(
+            self._annotation_settings.value("plot_annotations/fixed", True, type=bool))
+        self.fix_annotations_chk.setToolTip(
+            "Keep Y/Z annotations for new files. In Manual title mode, also keep the title. "
+            "Templates always generate a fresh title for each new file; edits override only that DAT. "
+            "Previously opened files always recall their own saved plot settings.")
+        top_form.addRow("", self.fix_annotations_chk)
+        self.plot_title_edit = QLineEdit()
+        self.plot_title_edit.setPlaceholderText("Optional plot title (blank by default)")
+        self.plot_title_edit.setMaxLength(2147483647)
+        self.y_axis_name_edit = QLineEdit()
+        self.y_axis_unit_edit = QLineEdit()
+        self.y_axis_unit_edit.setPlaceholderText("Optional unit")
+        self._annotation_edits = {
+            "plot_title": self.plot_title_edit,
+            "y_axis_name": self.y_axis_name_edit,
+            "y_axis_unit": self.y_axis_unit_edit,
+        }
+        for field, edit in self._annotation_edits.items():
+            edit.setToolTip("Plot annotation only; does not change the data or its units.")
+            if self.fix_annotations_chk.isChecked():
+                edit.setText(self._annotation_settings.value(f"plot_annotations/{field}", "", type=str))
+            edit.textChanged.connect(
+                lambda text, field=field: self._save_plot_annotation(field, text))
+        top_form.addRow("Plot title:", self.plot_title_edit)
+        self._build_title_controls(top_form)
+        top_form.addRow("Y-axis name:", self.y_axis_name_edit)
+        top_form.addRow("Y-axis unit:", self.y_axis_unit_edit)
+        self.signal_title_combo = QComboBox()
+        self.signal_title_combo.setEditable(True)
+        self.signal_title_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.signal_title_combo.addItems(["ΔR/R (a. u.)", "d²(ΔR/R)/dE² (a. u.)", "PL (a. u.)"])
+        self.signal_title_combo.setToolTip(
+            "Colorbar annotation only; choosing a derivative label does not process the data.")
+        if self.fix_annotations_chk.isChecked():
+            self.signal_title_combo.setCurrentText(self._annotation_settings.value(
+                "plot_annotations/signal_title", "ΔR/R (a. u.)", type=str))
+        self.signal_title_combo.currentTextChanged.connect(
+            lambda text: self._save_plot_annotation("signal_title", text))
+        top_form.addRow("Z signal title:", self.signal_title_combo)
+        self.fix_annotations_chk.toggled.connect(self._on_fix_annotations_toggled)
         lay.addLayout(top_form)
 
         # Axis status label
@@ -543,12 +646,16 @@ class MainWindow(QMainWindow):
         self.vmax_lock = QCheckBox("Fix")
         for ck in (self.xmin_lock, self.xmax_lock, self.ymin_lock,
                    self.ymax_lock, self.vmin_lock, self.vmax_lock):
-            ck.setToolTip("When checked, this limit is not updated by 'Auto View'")
+            ck.setToolTip("Fix this bound; Auto View and automatic color limits leave it unchanged")
         self._view_lock_controls = {
             self.xmin_spin: self.xmin_lock, self.xmax_spin: self.xmax_lock,
             self.ymin_spin: self.ymin_lock, self.ymax_spin: self.ymax_lock,
             self.vmin_spin: self.vmin_lock, self.vmax_spin: self.vmax_lock,
         }
+        for lock_box in self._view_lock_controls.values():
+            lock_box.toggled.connect(
+                lambda checked, changed_lock=lock_box: self._on_view_lock_toggled(changed_lock, checked)
+            )
 
         bounds_box = QGroupBox("Heatmap Bounds")
         bounds_grid = QGridLayout(bounds_box)
@@ -603,42 +710,14 @@ class MainWindow(QMainWindow):
         self.apply_view_btn.setToolTip("Apply the current bounds to the heatmap")
         self.apply_view_btn.setStyleSheet(_STYLE_MUTED)
         self.auto_view_btn = QPushButton("Auto View")
-        self.auto_view_btn.setToolTip("Reset all unfixed bounds to fit the loaded data")
+        self.auto_view_btn.setToolTip(
+            "Reset unfixed X/Y bounds to the full data and update unfixed intensity bounds from the visible heatmap"
+        )
         self.auto_view_btn.setStyleSheet(_STYLE_MUTED)
         btn_row.addWidget(self.apply_view_btn, 1)
         btn_row.addWidget(self.auto_view_btn, 1)
         bounds_grid.addLayout(btn_row, 4, 0, 1, 5)
         lay.addWidget(bounds_box)
-
-        # ── Gate control ──────────────────────────────────────────────────────
-        gate_box = QGroupBox("Gate Selection")
-        gate_form = QFormLayout(gate_box)
-        gate_form.setContentsMargins(8, 14, 8, 6)
-        gate_form.setSpacing(4)
-        gate_form.setHorizontalSpacing(8)
-        gate_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        gate_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        self.gate_spin = GateValueSpinBox()
-        self.gate_spin.setDecimals(6)
-        self.gate_spin.setRange(-1e12, 1e12)
-        self.gate_spin.setSingleStep(0.01)
-        self.gate_spin.setToolTip(
-            "Type a gate value and press Apply Gate to jump to it.\n"
-            "Use the navigation controls in the plot header for interactive stepping."
-        )
-        self.apply_gate_btn = QPushButton("Apply")
-        self.apply_gate_btn.setToolTip("Jump to the gate value entered above")
-        self.apply_gate_btn.setStyleSheet(_STYLE_MUTED)
-        self.apply_gate_btn.setMaximumWidth(60)
-        gate_w = QWidget()
-        gate_l = QHBoxLayout(gate_w)
-        gate_l.setContentsMargins(0, 0, 0, 0)
-        gate_l.setSpacing(6)
-        gate_l.addWidget(self.gate_spin, 1)
-        gate_l.addWidget(self.apply_gate_btn)
-        gate_form.addRow("Value:", gate_w)
-        lay.addWidget(gate_box)
 
         return w
 
@@ -1048,6 +1127,12 @@ class MainWindow(QMainWindow):
         self.fit_full_btn.setToolTip("Reset the fit range to the full x-axis span of the loaded file.")
         self.fit_full_btn.setStyleSheet(_STYLE_MUTED)
 
+        self.use_current_x_range_btn = QPushButton("Use Current X Range")
+        self.use_current_x_range_btn.setToolTip(
+            "Copy the currently visible heatmap X bounds into the independent fit range."
+        )
+        self.use_current_x_range_btn.setStyleSheet(_STYLE_MUTED)
+
         xmax_w = QWidget()
         xmax_l = QHBoxLayout(xmax_w)
         xmax_l.setContentsMargins(0, 0, 0, 0)
@@ -1069,6 +1154,14 @@ class MainWindow(QMainWindow):
 
         range_form.addRow("xmin:", self._view_spin_row(self.fit_xmin_spin, self.fit_xmin_lock))
         range_form.addRow("xmax:", xmax_w)
+        range_form.addRow("Visible X:", self.use_current_x_range_btn)
+        self.fit_range_summary_label = QLabel("Detection range: —\nFit range: —")
+        self.fit_range_summary_label.setWordWrap(True)
+        self.fit_range_summary_label.setStyleSheet(
+            "color: #607d8b; font-size: 10px; background: #f0f4f8;"
+            " border-radius: 3px; padding: 3px 5px;"
+        )
+        range_form.addRow(self.fit_range_summary_label)
         range_form.addRow("Pre-smooth:", smooth_row)
         lay.addWidget(range_box)
 
@@ -1157,20 +1250,31 @@ class MainWindow(QMainWindow):
         fit_action_row.addWidget(self.batch_fit_btn, 1)
         lay.addLayout(fit_action_row)
 
+        # One context-sensitive current-gate action: it detects first when no
+        # Find Peaks seeds exist, and fits directly once seeds are ready.
+        self.detect_then_fit_btn = self.fit_btn
+        self.fit_readiness_label = QLabel("Fit preparation: load data first.")
+        self.fit_readiness_label.setWordWrap(True)
+        self.fit_readiness_label.setStyleSheet("color: #607d8b; font-size: 10px;")
+        lay.addWidget(self.fit_readiness_label)
+
         # ── Secondary actions ──────────────────────────────────────────────────
         secondary_row = QHBoxLayout()
         secondary_row.setSpacing(6)
         self.clear_fit_btn = QPushButton("Clear Fit")
-        self.export_fit_btn = QPushButton("Export Fit CSV")
+        self.export_current_fit_btn = QPushButton("Export Current Gate CSV")
+        self.export_all_fit_btn = QPushButton("Export All Results CSV")
         self.clear_fit_btn.setToolTip("Remove the fit overlay from the spectrum plot.")
-        self.export_fit_btn.setToolTip(
-            "Save fitted peak centers, widths, amplitudes and quality metrics to CSV.\n"
-            "Exports all batch-fit results when available; otherwise exports the current gate only."
+        self.export_current_fit_btn.setToolTip("Save only the selected gate's fit result to CSV.")
+        self.export_all_fit_btn.setToolTip(
+            "Save all individually fitted and batch-fitted gates, including recorded failures, to CSV."
         )
         self.clear_fit_btn.setStyleSheet(_STYLE_MUTED)
-        self.export_fit_btn.setStyleSheet(_STYLE_MUTED)
+        self.export_current_fit_btn.setStyleSheet(_STYLE_MUTED)
+        self.export_all_fit_btn.setStyleSheet(_STYLE_MUTED)
         secondary_row.addWidget(self.clear_fit_btn, 1)
-        secondary_row.addWidget(self.export_fit_btn, 1)
+        secondary_row.addWidget(self.export_current_fit_btn, 1)
+        secondary_row.addWidget(self.export_all_fit_btn, 1)
         lay.addLayout(secondary_row)
 
         self.export_spec_btn = QPushButton("Export Spectrum CSV")
@@ -1183,15 +1287,18 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
 
         # ── wire signals ──────────────────────────────────────────────────────
-        self._seeds_from_csv_radio.toggled.connect(self._csv_seeds_row.setVisible)
+        self._seeds_from_csv_radio.toggled.connect(self._on_seed_source_changed)
+        self._seeds_from_find_peak_radio.toggled.connect(self._on_seed_source_changed)
         self.load_seeds_csv_btn.clicked.connect(self._on_load_seeds_csv)
-        self.fit_xmin_spin.valueChanged.connect(lambda _: self._update_spectrum_only())
-        self.fit_xmax_spin.valueChanged.connect(lambda _: self._update_spectrum_only())
+        self.fit_xmin_spin.valueChanged.connect(self._on_fit_range_changed)
+        self.fit_xmax_spin.valueChanged.connect(self._on_fit_range_changed)
         self.fit_full_btn.clicked.connect(self._on_set_fit_full_range)
-        self.fit_btn.clicked.connect(self._on_fit)
+        self.use_current_x_range_btn.clicked.connect(self._on_use_current_x_range)
         self.batch_fit_btn.clicked.connect(self._on_batch_fit_all_gates)
+        self.fit_btn.clicked.connect(self._on_fit_or_detect_current_gate)
         self.clear_fit_btn.clicked.connect(self._on_clear_fit)
-        self.export_fit_btn.clicked.connect(self._on_export_fit_csv)
+        self.export_current_fit_btn.clicked.connect(self._on_export_current_fit_csv)
+        self.export_all_fit_btn.clicked.connect(self._on_export_all_fit_csv)
         self.export_spec_btn.clicked.connect(self._on_export_spectrum_csv)
         return tab
 
@@ -1203,8 +1310,9 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        self.figure = Figure(figsize=(8.0, 6.0), tight_layout=False)
+        self.figure = Figure(figsize=(8.0, 6.0), layout="none")
         self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.mpl_connect("resize_event", self._layout_live_plots)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
 
@@ -1224,6 +1332,7 @@ class MainWindow(QMainWindow):
         self.plot_gate_spin = GateValueSpinBox()
         self.plot_gate_spin.setDecimals(6)
         self.plot_gate_spin.setRange(-1e12, 1e12)
+        self.plot_gate_spin.setKeyboardTracking(False)
         self.plot_gate_spin.setMinimumWidth(120)
         self.plot_gate_spin.setMaximumWidth(160)
         self.plot_gate_spin.setToolTip(
@@ -1271,7 +1380,21 @@ class MainWindow(QMainWindow):
         # Keep reference for legacy attribute access
         self.plot_gate_row = gate_bar
 
-        lay.addWidget(self.toolbar)
+        toolbar_row = QWidget()
+        toolbar_lay = QHBoxLayout(toolbar_row)
+        toolbar_lay.setContentsMargins(0, 0, 0, 0)
+        toolbar_lay.setSpacing(6)
+        toolbar_lay.addWidget(self.toolbar, 1)
+        self.export_png_btn = QPushButton("Export PNG")
+        self.export_png_btn.setToolTip(
+            "Plot area: 4 inches wide by 3 inches high; 300 DPI; 12 pt fonts. Saves directly beside the DAT with the next export number. Title, axes labels and colorbar are outside this area."
+        )
+        self.export_png_btn.setStyleSheet(_STYLE_MUTED)
+        self.export_png_btn.setEnabled(False)
+        self.export_png_btn.clicked.connect(self._on_export_png)
+        toolbar_lay.addWidget(self.export_png_btn)
+
+        lay.addWidget(toolbar_row)
         lay.addWidget(gate_bar)
         lay.addWidget(self.canvas, 1)
         return panel
@@ -1735,10 +1858,9 @@ class MainWindow(QMainWindow):
 
     def _sync_gate_controls(self) -> None:
         if self.current_cube is None or self.current_cube.gate.size == 0:
-            for spin in (self.gate_spin, self.plot_gate_spin):
-                spin.blockSignals(True)
-                spin.set_allowed_values(np.asarray([], dtype=float))
-                spin.blockSignals(False)
+            self.plot_gate_spin.blockSignals(True)
+            self.plot_gate_spin.set_allowed_values(np.asarray([], dtype=float))
+            self.plot_gate_spin.blockSignals(False)
             self.plot_gate_index_spin.blockSignals(True)
             self.plot_gate_index_spin.setRange(1, 1)
             self.plot_gate_index_spin.setValue(1)
@@ -1747,11 +1869,10 @@ class MainWindow(QMainWindow):
         gates = np.asarray(self.current_cube.gate, dtype=float)
         gate_idx = self._current_gate_index()
         gate_value = float(gates[gate_idx])
-        for spin in (self.gate_spin, self.plot_gate_spin):
-            spin.blockSignals(True)
-            spin.set_allowed_values(gates)
-            spin.setValue(gate_value)
-            spin.blockSignals(False)
+        self.plot_gate_spin.blockSignals(True)
+        self.plot_gate_spin.set_allowed_values(gates)
+        self.plot_gate_spin.setValue(gate_value)
+        self.plot_gate_spin.blockSignals(False)
         self.plot_gate_index_spin.blockSignals(True)
         self.plot_gate_index_spin.setRange(1, int(gates.size))
         self.plot_gate_index_spin.setValue(gate_idx + 1)
@@ -1773,6 +1894,7 @@ class MainWindow(QMainWindow):
             }
             self._refresh_peak_delete_controls()
         self._sync_gate_controls()
+        self._refresh_fit_readiness()
         if update_plot:
             self._update_spectrum_only()
 
@@ -1795,9 +1917,80 @@ class MainWindow(QMainWindow):
 
     # ── CSV seeds helpers ─────────────────────────────────────────────────────
 
+    def _on_seed_source_changed(self, checked: bool) -> None:
+        if hasattr(self, "_csv_seeds_row"):
+            self._csv_seeds_row.setVisible(self._seeds_from_csv_radio.isChecked())
+        self._refresh_fit_readiness()
+
+    def _fit_seed_status(self) -> tuple[np.ndarray, np.ndarray, str, bool]:
+        """Return active seeds, in-range seeds, explanation, and detect availability."""
+        if self.current_cube is None:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float), "Fit preparation: load data first.", False
+        seeds = np.asarray(self._get_seeds_for_current_gate(), dtype=float)
+        xlo, xhi = self._fit_range_bounds()
+        in_range = seeds[(seeds >= xlo) & (seeds <= xhi)] if seeds.size else np.asarray([], dtype=float)
+        if self._seeds_from_csv_radio.isChecked():
+            if self._csv_seeds_map is None:
+                return seeds, in_range, "CSV source selected, but no seeds CSV is loaded.", False
+            if seeds.size == 0:
+                return seeds, in_range, f"CSV source has no seeds for Current Gate {self.current_gate:.6g}.", False
+            if in_range.size == 0:
+                return seeds, in_range, (
+                    f"CSV seeds for Current Gate are outside fit range "
+                    f"({xlo:.6g}–{xhi:.6g})."
+                ), False
+            return seeds, in_range, f"CSV seeds ready: {in_range.size} in fit range.", False
+        if seeds.size == 0:
+            return seeds, in_range, (
+                f"No Current Gate seeds. Detect peaks in visible X range "
+                f"({self._peak_search_bounds()[0]:.6g}–{self._peak_search_bounds()[1]:.6g}) first."
+            ), True
+        if in_range.size == 0:
+            return seeds, in_range, (
+                f"Current Gate seeds are outside fit range ({xlo:.6g}–{xhi:.6g}); "
+                "edit the fit range or the seeds."
+            ), False
+        return seeds, in_range, f"Find Peaks seeds ready: {in_range.size} in fit range.", False
+
+    def _refresh_fit_readiness(self) -> None:
+        if not hasattr(self, "fit_readiness_label"):
+            return
+        _seeds, in_range, message, can_detect = self._fit_seed_status()
+        self.fit_readiness_label.setText(f"Fit preparation: {message}")
+        self.fit_btn.setText("Detect Then Fit Current Gate" if can_detect else "Fit Current Gate")
+        self.fit_btn.setEnabled(bool(can_detect or in_range.size))
+        self._refresh_export_actions()
+
+    def _on_fit_or_detect_current_gate(self) -> None:
+        _seeds, _in_range, _message, can_detect = self._fit_seed_status()
+        if can_detect:
+            self._on_detect_then_fit_current_gate()
+        else:
+            self._on_fit()
+
+    def _on_detect_then_fit_current_gate(self) -> None:
+        if self.current_cube is None:
+            self._show_error("Load a DAT file first.")
+            return
+        if self._seeds_from_csv_radio.isChecked():
+            self._show_error("Detect Then Fit is available only for the Find Peaks source.")
+            return
+        seeds, in_range, _message, _can_detect = self._fit_seed_status()
+        if seeds.size:
+            self._on_fit()
+            return
+        self._on_find_peaks()
+        _seeds, in_range, message, _can_detect = self._fit_seed_status()
+        if in_range.size:
+            self._on_fit()
+        elif not _seeds.size:
+            self._show_error(f"No peaks found in visible X range. {message}")
+
     def _get_seeds_for_current_gate(self) -> np.ndarray:
         """Return energy values (eV) to use as fit seeds for the current gate."""
-        if self._seeds_from_csv_radio.isChecked() and self._csv_seeds_map is not None:
+        if self._seeds_from_csv_radio.isChecked():
+            if self._csv_seeds_map is None:
+                return np.asarray([], dtype=float)
             gi = self._current_gate_index()
             return np.asarray(self._csv_seeds_map.get(gi, []), dtype=float)
         trace_peaks = self._current_trace_peak_indices()
@@ -1807,7 +2000,9 @@ class MainWindow(QMainWindow):
 
     def _get_seeds_for_gate_idx(self, gi: int) -> np.ndarray:
         """Return energy values (eV) to use as fit seeds for gate index gi."""
-        if self._seeds_from_csv_radio.isChecked() and self._csv_seeds_map is not None:
+        if self._seeds_from_csv_radio.isChecked():
+            if self._csv_seeds_map is None:
+                return np.asarray([], dtype=float)
             return np.asarray(self._csv_seeds_map.get(gi, []), dtype=float)
         peaks_idx = np.asarray(self.batch_peak_map.get(gi, []), dtype=int)
         if peaks_idx.size == 0 or self.current_cube is None:
@@ -1829,6 +2024,14 @@ class MainWindow(QMainWindow):
     # =========================================================================
     #  File loading & data state
     # =========================================================================
+
+    def _reset_csv_seed_source(self) -> None:
+        self._csv_seeds_map = None
+        self._csv_seeds_path = ""
+        if hasattr(self, "_csv_path_label"):
+            self._csv_path_label.setText("(none loaded)")
+        if hasattr(self, "_seeds_from_find_peak_radio"):
+            self._seeds_from_find_peak_radio.setChecked(True)
 
     def _on_browse_root(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose Root Folder", self.current_root or ".")
@@ -1876,11 +2079,24 @@ class MainWindow(QMainWindow):
     def _load_dat_file_direct(self, path: Path) -> None:
         """Load a .dat file directly (called from file list or drag-and-drop)."""
         try:
-            cube = load_dat_cube(path, x_axis_override=self._selected_x_axis_override())
+            fingerprint = source_fingerprint(path)
+            save_notice = self._save_current_plot_state()
+            saved_plot, recall_notice = self._plot_state_store.load(path, fingerprint)
+            if saved_plot is not None and self.cmap_combo.findText(saved_plot["colormap"]) < 0:
+                saved_plot = None
+                recall_notice = "Saved plot settings ignored: the colormap is unavailable."
+            override = saved_plot["axis_override"] if saved_plot else self._selected_x_axis_override()
+            cube = load_dat_cube(path, x_axis_override=override)
+            if source_fingerprint(path) != fingerprint:
+                raise ValueError("DAT content changed while loading. Please load it again.")
         except Exception as exc:
             self._show_error(str(exc))
             return
         self.current_cube = cube
+        self._loaded_source_fingerprint = fingerprint
+        self._annotation_source = None
+        self._title_source = None
+        self._last_valid_color_limits = None
         self.current_dat_path = path
         self.peak_indices = np.asarray([], dtype=int)
         self._peak_gate_idx = None
@@ -1895,6 +2111,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_result_map = {}
         self._batch_fit_export_rows = []
         self._has_batch_fit_results = False
+        self._reset_csv_seed_source()
         self._lasso_selected_peak_ids = []
         self._clear_lasso_selection_visual()
         self._update_lasso_actions()
@@ -1905,11 +2122,21 @@ class MainWindow(QMainWindow):
         self._sync_gate_controls()
         # Update folder for CSV dialog defaults
         self.current_folder = str(path.parent)
+        if saved_plot is None:
+            with QSignalBlocker(self.fix_annotations_chk):
+                self.fix_annotations_chk.setChecked(
+                    self._annotation_settings.value("plot_annotations/fixed", True, type=bool))
         self._set_view_limits_to_auto()
         self._set_fit_range_to_full()
+        if saved_plot is not None:
+            self._restore_plot_controls(saved_plot)
         self._refresh_axis_status()
+        self._refresh_fit_range_summary()
+        self._refresh_fit_readiness()
         self._update_fit_param_unit_labels()
         self._plot_cube()
+        if saved_plot is not None:
+            self._restore_effective_plot_limits(saved_plot)
         self.analysis_text.setPlainText(
             f"Loaded: {path.name}\n"
             f"Detected x-axis: {cube.x_original_label}\n"
@@ -1917,7 +2144,81 @@ class MainWindow(QMainWindow):
             "Use Find Peaks tab to detect peaks, then Lorentz Fit tab to fit.\n"
             "Drag-and-drop a .dat or .csv file onto the window as an alternative to browse."
         )
-        self.statusBar().showMessage(f"Loaded: {path.name}")
+        notice = " ".join(part for part in (save_notice, recall_notice) if part)
+        suffix = f" — {notice}" if notice else (" — saved plot restored" if saved_plot else "")
+        self.statusBar().showMessage(f"Loaded: {path.name}{suffix}")
+
+    def _save_current_plot_state(self) -> str:
+        if (self.current_dat_path is None or self.current_cube is None
+                or self._loaded_source_fingerprint is None
+                or self._heat_ax is None or self._heat_mesh is None):
+            return ""
+        bounds = ("xmin", "xmax", "ymin", "ymax", "vmin", "vmax")
+        plot = {
+            "axis_override": self.current_cube.x_override,
+            "colormap": self.cmap_combo.currentText(),
+            "annotations": {**{name: edit.text() for name, edit in self._annotation_edits.items()},
+                            "signal_title": self.signal_title_combo.currentText()},
+            "fix_annotations": self.fix_annotations_chk.isChecked(),
+            "title_settings": self._copy_title_settings(self._title_settings),
+            "bounds": {name: getattr(self, f"{name}_spin").value() for name in bounds},
+            "locks": {name: getattr(self, f"{name}_lock").isChecked() for name in bounds},
+            "x_limits": list(map(float, self._heat_ax.get_xlim())),
+            "y_limits": list(map(float, self._heat_ax.get_ylim())),
+            "color_limits": list(map(float, self._heat_mesh.get_clim())),
+            "gate": float(self.current_gate),
+        }
+        try:
+            # Keep the fingerprint of the loaded data, even if its disk file changed.
+            self._plot_state_store.save(self.current_dat_path, self._loaded_source_fingerprint, plot)
+        except (OSError, ValueError, TypeError) as exc:
+            return f"Could not save plot settings: {exc}"
+        return ""
+
+    def _restore_plot_controls(self, plot: dict) -> None:
+        self._title_settings = self._copy_title_settings(plot["title_settings"])
+        self._title_source = self.current_cube.source_path or id(self.current_cube)
+        self._show_title_settings()
+        controls = [(self.x_axis_override_combo, "index", self.x_axis_override_combo.findData(plot["axis_override"])),
+                    (self.cmap_combo, "text", plot["colormap"]),
+                    (self.signal_title_combo, "text", plot["annotations"]["signal_title"]),
+                    (self.fix_annotations_chk, "checked", plot["fix_annotations"])]
+        controls.extend((edit, "edit", plot["annotations"][name])
+                        for name, edit in self._annotation_edits.items())
+        controls.extend((getattr(self, f"{name}_spin"), "value", value)
+                        for name, value in plot["bounds"].items())
+        controls.extend((getattr(self, f"{name}_lock"), "checked", value)
+                        for name, value in plot["locks"].items())
+        setters = {"index": "setCurrentIndex", "text": "setCurrentText", "edit": "setText",
+                   "checked": "setChecked", "value": "setValue"}
+        for widget, kind, value in controls:
+            with QSignalBlocker(widget):
+                getattr(widget, setters[kind])(value)
+        self._annotation_source = self.current_cube.source_path or id(self.current_cube)
+        gate_idx = int(np.argmin(np.abs(self.current_cube.gate - plot["gate"])))
+        self.current_gate = float(self.current_cube.gate[gate_idx])
+        self._sync_gate_controls()
+
+    def _restore_effective_plot_limits(self, plot: dict) -> None:
+        # The spin boxes round to four decimals; preserve the actual displayed view.
+        previous_syncing = self._view_syncing
+        self._view_syncing = True
+        try:
+            self._heat_ax.set_xlim(plot["x_limits"])
+            self._heat_ax.set_ylim(plot["y_limits"])
+            self._heat_mesh.set_clim(*plot["color_limits"])
+            self._last_valid_color_limits = tuple(plot["color_limits"])
+            style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
+            self._layout_live_plots()
+        finally:
+            self._view_syncing = previous_syncing
+        self.canvas.draw_idle()
+
+    def closeEvent(self, event) -> None:
+        notice = self._save_current_plot_state()
+        if notice:
+            self.statusBar().showMessage(notice)
+        super().closeEvent(event)
 
     def _on_x_axis_override_changed(self) -> None:
         if self.current_dat_path is None:
@@ -1925,11 +2226,21 @@ class MainWindow(QMainWindow):
             return
         gate = self.current_gate
         try:
+            fingerprint = (source_fingerprint(self.current_dat_path)
+                           if self._loaded_source_fingerprint is not None else None)
             cube = load_dat_cube(self.current_dat_path, x_axis_override=self._selected_x_axis_override())
+            if fingerprint is not None and source_fingerprint(self.current_dat_path) != fingerprint:
+                raise ValueError("DAT content changed while loading. Please load it again.")
         except Exception as exc:
+            with QSignalBlocker(self.x_axis_override_combo):
+                self.x_axis_override_combo.setCurrentIndex(
+                    self.x_axis_override_combo.findData(self.current_cube.x_override))
             self._show_error(str(exc))
             return
         self.current_cube = cube
+        self._loaded_source_fingerprint = fingerprint
+        self._annotation_source = None
+        self._last_valid_color_limits = None
         self.peak_indices = np.asarray([], dtype=int)
         self._peak_gate_idx = None
         self.peak_label_lookup = {}
@@ -1943,6 +2254,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_result_map = {}
         self._batch_fit_export_rows = []
         self._has_batch_fit_results = False
+        self._reset_csv_seed_source()
         self._cached_d2 = None
         self._lasso_selected_peak_ids = []
         self._clear_lasso_selection_visual()
@@ -1955,6 +2267,8 @@ class MainWindow(QMainWindow):
         self._set_view_limits_to_auto()
         self._set_fit_range_to_full()
         self._refresh_axis_status()
+        self._refresh_fit_range_summary()
+        self._refresh_fit_readiness()
         self._update_fit_param_unit_labels()
         self._plot_cube()
 
@@ -1962,25 +2276,166 @@ class MainWindow(QMainWindow):
     #  View / cursor controls
     # =========================================================================
 
-    def _on_apply_gate(self) -> None:
-        if self.current_cube is None:
-            return
-        self._set_current_gate_from_value(float(self.gate_spin.value()), update_plot=True)
-
     def _on_auto_view(self) -> None:
         self._set_view_limits_to_auto()
         self._plot_cube()
 
-    def _on_gate_spin_changed(self, value: float) -> None:
-        self.current_gate = float(value)
-        if self.batch_peak_map:
-            gate_idx = self._current_gate_index()
-            self.peak_indices = np.asarray(self.batch_peak_map.get(gate_idx, []), dtype=int)
-            self._peak_gate_idx = gate_idx
-            self._refresh_peak_delete_controls()
+    def _on_view_limit_changed(self, spin: QDoubleSpinBox) -> None:
+        if self._view_syncing:
+            return
+        xy_spins = {
+            self.xmin_spin, self.xmax_spin, self.ymin_spin, self.ymax_spin,
+        }
+        if spin in xy_spins:
+            self._update_auto_color_limits_from_visible_view(use_spin_values=True)
+        else:
+            self._last_valid_color_limits = self._ordered_pair(
+                float(self.vmin_spin.value()), float(self.vmax_spin.value())
+            )
+        self._plot_cube()
+
+    def _on_view_lock_toggled(self, lock_box: QCheckBox, checked: bool) -> None:
+        if checked or self.current_cube is None:
+            return
+        color_spins = (self.vmin_spin, self.vmax_spin)
+        unlocked_spin = next(
+            (spin for spin, current_lock in self._view_lock_controls.items() if current_lock is lock_box),
+            None,
+        )
+        if unlocked_spin in color_spins:
+            self._update_auto_color_limits_from_visible_view()
+
+    def _on_plot_x_limits_changed(self, axes: Any) -> None:
+        if not self._view_callbacks_ready or self._view_syncing or self.current_cube is None:
+            return
+        self._view_syncing = True
+        try:
+            xmin, xmax = self._ordered_pair(*axes.get_xlim())
+            for spin, value in ((self.xmin_spin, xmin), (self.xmax_spin, xmax)):
+                spin.blockSignals(True)
+                spin.setValue(float(value))
+                spin.blockSignals(False)
+            self._update_auto_color_limits_from_visible_view(xlim=(xmin, xmax))
+            self._refresh_fit_range_summary()
+            self._refresh_fit_readiness()
+        finally:
+            self._view_syncing = False
+
+    def _on_plot_y_limits_changed(self, axes: Any) -> None:
+        if not self._view_callbacks_ready or self._view_syncing or self.current_cube is None:
+            return
+        self._view_syncing = True
+        try:
+            ymin, ymax = self._ordered_pair(*self._heat_ax.get_ylim())
+            for spin, value in ((self.ymin_spin, ymin), (self.ymax_spin, ymax)):
+                spin.blockSignals(True)
+                spin.setValue(float(value))
+                spin.blockSignals(False)
+            self._update_auto_color_limits_from_visible_view(ylim=(ymin, ymax))
+            self._layout_live_plots()
+        finally:
+            self._view_syncing = False
+
+    def _visible_color_values(
+        self,
+        *,
+        use_spin_values: bool = False,
+        xlim: tuple[float, float] | None = None,
+        ylim: tuple[float, float] | None = None,
+    ) -> np.ndarray:
+        if self.current_cube is None:
+            return np.asarray([], dtype=float)
+        cube = self.current_cube
+        if xlim is None and (use_spin_values or self._heat_ax is None):
+            xlim = (float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+        elif xlim is None:
+            xlim = self._heat_ax.get_xlim()
+        if ylim is None and (use_spin_values or self._heat_ax is None):
+            ylim = (float(self.ymin_spin.value()), float(self.ymax_spin.value()))
+        elif ylim is None:
+            ylim = self._heat_ax.get_ylim()
+        xmin, xmax = self._ordered_pair(*xlim)
+        ymin, ymax = self._ordered_pair(*ylim)
+        xmask = np.isfinite(cube.energy) & (cube.energy >= xmin) & (cube.energy <= xmax)
+        ymask = np.isfinite(cube.gate) & (cube.gate >= ymin) & (cube.gate <= ymax)
+        if not np.any(xmask) or not np.any(ymask):
+            return np.asarray([], dtype=float)
+        values = np.asarray(cube.z[np.ix_(ymask, xmask)], dtype=float)
+        return values[np.isfinite(values)]
+
+    @staticmethod
+    def _color_gap(value: float) -> float:
+        return max(abs(float(value)) * 1e-6, 1e-3)
+
+    def _update_auto_color_limits_from_visible_view(
+        self,
+        *,
+        use_spin_values: bool = False,
+        xlim: tuple[float, float] | None = None,
+        ylim: tuple[float, float] | None = None,
+    ) -> None:
+        values = self._visible_color_values(use_spin_values=use_spin_values, xlim=xlim, ylim=ylim)
+        low_locked = self._view_lock_controls.get(self.vmin_spin)
+        high_locked = self._view_lock_controls.get(self.vmax_spin)
+        is_low_locked = bool(low_locked is not None and low_locked.isChecked())
+        is_high_locked = bool(high_locked is not None and high_locked.isChecked())
+
+        if values.size:
+            candidate_low, candidate_high = np.nanpercentile(values, [0.5, 99.5])
+            candidate = (float(candidate_low), float(candidate_high))
+        elif self._last_valid_color_limits is not None:
+            candidate = self._last_valid_color_limits
+        else:
+            candidate = (
+                float(self.vmin_spin.value()), float(self.vmax_spin.value())
+            )
+
+        low = float(self.vmin_spin.value()) if is_low_locked else float(candidate[0])
+        high = float(self.vmax_spin.value()) if is_high_locked else float(candidate[1])
+        if not is_low_locked and not is_high_locked:
+            if low == high:
+                pad = self._color_gap(low)
+                low, high = low - pad, high + pad
+        elif is_low_locked and not is_high_locked:
+            if high <= low:
+                high = low + self._color_gap(low)
+        elif not is_low_locked and is_high_locked:
+            if low >= high:
+                low = high - self._color_gap(high)
+
+        for spin, value, locked in (
+            (self.vmin_spin, low, is_low_locked),
+            (self.vmax_spin, high, is_high_locked),
+        ):
+            if locked:
+                continue
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+
+        self._last_valid_color_limits = self._ordered_pair(
+            float(self.vmin_spin.value()), float(self.vmax_spin.value())
+        )
+        self._apply_color_limits_to_mesh()
+
+    def _apply_color_limits_to_mesh(self) -> None:
+        if self._heat_mesh is None:
+            return
+        vmin, vmax = self._ordered_pair(
+            float(self.vmin_spin.value()), float(self.vmax_spin.value())
+        )
+        self._heat_mesh.set_clim(vmin=float(vmin), vmax=float(vmax))
+        if self._heat_colorbar is not None:
+            self._heat_colorbar.update_normal(self._heat_mesh)
+            style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
+            position_heatmap_title(self._heat_ax, self._heat_colorbar.ax, self._heat_ax.title)
+        self.canvas.draw_idle()
 
     def _on_plot_gate_spin_changed(self, value: float) -> None:
         self._set_current_gate_from_value(float(value), update_plot=True)
+
+    def _on_plot_gate_spin_edit_finished(self) -> None:
+        self._set_current_gate_from_value(float(self.plot_gate_spin.value()), update_plot=True)
 
     def _on_plot_gate_index_changed(self, value: int) -> None:
         if self.current_cube is None:
@@ -2001,6 +2456,37 @@ class MainWindow(QMainWindow):
         self._set_fit_range_to_full()
         self._update_spectrum_only()
 
+    def _on_fit_range_changed(self, _value: float) -> None:
+        self._refresh_fit_range_summary()
+        self._refresh_fit_readiness()
+        self._update_spectrum_only()
+
+    def _on_use_current_x_range(self) -> None:
+        if self.current_cube is None:
+            return
+        xmin, xmax = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+        for spin, value in ((self.fit_xmin_spin, xmin), (self.fit_xmax_spin, xmax)):
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+        self._refresh_fit_range_summary()
+        self._refresh_fit_readiness()
+        self._update_spectrum_only()
+
+    def _refresh_fit_range_summary(self) -> None:
+        if not hasattr(self, "fit_range_summary_label"):
+            return
+        if self.current_cube is None:
+            self.fit_range_summary_label.setText("Detection range: —\nFit range: —")
+            return
+        detection = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+        fitting = self._fit_range_bounds()
+        unit = self.current_cube.energy_label
+        self.fit_range_summary_label.setText(
+            f"Detection range (visible X): {detection[0]:.6g}–{detection[1]:.6g} {unit}\n"
+            f"Fit range (independent): {fitting[0]:.6g}–{fitting[1]:.6g} {unit}"
+        )
+
     def _set_fit_range_to_full(self) -> None:
         if self.current_cube is None:
             return
@@ -2013,13 +2499,12 @@ class MainWindow(QMainWindow):
             spin.blockSignals(True)
             spin.setValue(val)
             spin.blockSignals(False)
+        self._refresh_fit_range_summary()
 
     def _set_view_limits_to_auto(self) -> None:
         if self.current_cube is None:
             return
         cube = self.current_cube
-        finite = cube.z[np.isfinite(cube.z)]
-        vmin, vmax = (np.nanpercentile(finite, [0.5, 99.5]) if finite.size else (0.0, 1.0))
         xmin = float(np.nanmin(cube.energy))
         xmax = float(np.nanmax(cube.energy))
         ymin = float(np.nanmin(cube.gate))
@@ -2027,7 +2512,6 @@ class MainWindow(QMainWindow):
         for spin, val in (
             (self.xmin_spin, xmin), (self.xmax_spin, xmax),
             (self.ymin_spin, ymin), (self.ymax_spin, ymax),
-            (self.vmin_spin, float(vmin)), (self.vmax_spin, float(vmax)),
         ):
             lock_box = self._view_lock_controls.get(spin)
             if lock_box is not None and lock_box.isChecked():
@@ -2035,6 +2519,7 @@ class MainWindow(QMainWindow):
             spin.blockSignals(True)
             spin.setValue(float(val))
             spin.blockSignals(False)
+        self._update_auto_color_limits_from_visible_view(use_spin_values=True)
 
     # =========================================================================
     #  Find Peak logic
@@ -2143,7 +2628,7 @@ class MainWindow(QMainWindow):
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
             return
-        gate_used, y = self._nearest_spectrum(self.gate_spin.value())
+        gate_used, y = self._nearest_spectrum(self.current_gate)
         x = self.current_cube.energy
         mask = self._peak_search_mask(x)
         xr = np.asarray(x[mask], dtype=float)
@@ -2209,10 +2694,8 @@ class MainWindow(QMainWindow):
         self._sync_batch_peak_coords()
         self.fit_result = None
         self._refresh_peak_delete_controls()
-        self.gate_spin.blockSignals(True)
-        self.gate_spin.setValue(gate_used)
-        self.gate_spin.blockSignals(False)
         self.current_gate = gate_used
+        self._sync_gate_controls()
         self._update_spectrum_only()
         self._update_peak_text(gate_used, x, y, title_prefix="Auto-detected")
 
@@ -2524,7 +3007,7 @@ class MainWindow(QMainWindow):
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
             return
-        gate_used, y = self._nearest_spectrum(self.gate_spin.value())
+        gate_used, y = self._nearest_spectrum(self.current_gate)
         x = self.current_cube.energy
         try:
             xr, yr, mask = self._analysis_xy(
@@ -2540,11 +3023,9 @@ class MainWindow(QMainWindow):
         xlo, xhi = self._fit_range_bounds()
         centers_in = centers[(centers >= xlo) & (centers <= xhi)] if centers.size else centers
         if centers_in.size == 0:
-            self._show_error(
-                "No peak seeds in fit range.\n"
-                "Run 'Find Peaks' in the Find Peaks tab first,\n"
-                "or load a seeds CSV in the Lorentz Fit tab."
-            )
+            _seeds, _in_range, message, can_detect = self._fit_seed_status()
+            action = "Use 'Detect Then Fit Current Gate' first." if can_detect else "Adjust the source or fit range."
+            self._show_error(f"{message}\n{action}")
             return
 
         lw_min = float(self._pts_to_axis_units(int(self.lw_min_spin.value())) or 0.0)
@@ -2584,10 +3065,8 @@ class MainWindow(QMainWindow):
         fit_row = self._fit_result_to_export_row(
             float(gate_used), res.model, self.current_cube.energy_label, res, status="ok"
         )
-        if self._has_batch_fit_results:
-            self._upsert_fit_export_row(fit_row)
-        else:
-            self._batch_fit_export_rows = [fit_row]
+        self._upsert_fit_export_row(fit_row)
+        self._refresh_export_actions()
         self._sync_batch_fit_coords()
         self.current_gate = gate_used
         self._update_spectrum_only()
@@ -2609,6 +3088,7 @@ class MainWindow(QMainWindow):
         self.batch_fit_result_map = {}
         self._batch_fit_export_rows = []
         self._has_batch_fit_results = False
+        self._refresh_export_actions()
         self._update_spectrum_only()
 
     def _on_batch_fit_all_gates(self) -> None:
@@ -2616,7 +3096,10 @@ class MainWindow(QMainWindow):
             self._show_error("Load a DAT file first.")
             return
         cube = self.current_cube
-        use_csv = self._seeds_from_csv_radio.isChecked() and self._csv_seeds_map is not None
+        if self._seeds_from_csv_radio.isChecked() and self._csv_seeds_map is None:
+            self._show_error("CSV seed source is selected, but no seeds CSV is loaded.")
+            return
+        use_csv = self._seeds_from_csv_radio.isChecked()
         if not use_csv and not self.batch_peak_map:
             self._show_error(
                 "No seeds available for batch fit.\n"
@@ -2711,13 +3194,15 @@ class MainWindow(QMainWindow):
         self._batch_fit_export_rows = [dict(row) for row in rows]
         self._has_batch_fit_results = True
         self._sync_batch_fit_coords()
+        self._refresh_export_actions()
         if self.current_cube.gate.size:
             current_gate_idx = self._current_gate_index()
             self.fit_result = self.batch_fit_result_map.get(current_gate_idx)
             self._fit_gate_idx = current_gate_idx if self.fit_result is not None else None
         self.statusBar().showMessage(f"Batch fit done: OK={ok_count}, fail={fail_count}")
         self.analysis_text.setPlainText(
-            f"Batch fit done.\nGates: {cube.gate.size}  OK: {ok_count}  Failed: {fail_count}\nUse 'Export Fit CSV' to save the results."
+            f"Batch fit done.\nGates: {cube.gate.size}  OK: {ok_count}  Failed: {fail_count}\n"
+            "Use 'Export All Results CSV' to save the results."
         )
         self._update_spectrum_only()
 
@@ -2772,6 +3257,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Loaded seeds CSV: {path.name}  ({len(seeds_map)} gates, {total} seeds)"
             )
+            self._refresh_fit_readiness()
         except Exception as exc:
             self._show_error(f"Failed to load seeds CSV: {exc}")
 
@@ -2779,45 +3265,443 @@ class MainWindow(QMainWindow):
     #  CSV export
     # =========================================================================
 
-    def _on_export_fit_csv(self) -> None:
+    def _all_fit_export_rows(self) -> list[dict[str, str]]:
+        if self.current_cube is None:
+            return []
+        rows = [dict(row) for row in self._batch_fit_export_rows]
+        for gi, result in sorted(self.batch_fit_result_map.items()):
+            if gi < 0 or gi >= self.current_cube.gate.size:
+                continue
+            self._upsert_row_in(rows, self._fit_result_to_export_row(
+                float(self.current_cube.gate[gi]), result.model,
+                self.current_cube.energy_label, result, status="ok"
+            ))
+        return rows
+
+    @staticmethod
+    def _upsert_row_in(rows: list[dict[str, str]], row: dict[str, str]) -> None:
+        gate_key = row.get("gate")
+        for idx, existing in enumerate(rows):
+            if gate_key is not None and existing.get("gate") == gate_key:
+                rows[idx] = dict(row)
+                return
+        rows.append(dict(row))
+
+    def _refresh_export_actions(self) -> None:
+        if not hasattr(self, "export_current_fit_btn"):
+            return
+        current_available = self._active_fit_result() is not None if self.current_cube is not None else False
+        self.export_current_fit_btn.setEnabled(current_available)
+        # Keep refreshes cheap during axis navigation; serialize rows only when
+        # the user invokes the all-results export action.
+        self.export_all_fit_btn.setEnabled(bool(
+            self._batch_fit_export_rows or self.batch_fit_result_map or self.fit_result
+        ))
+        if hasattr(self, "export_png_btn"):
+            self.export_png_btn.setEnabled(
+                self.current_cube is not None
+                and self._heat_ax is not None
+                and self._heat_colorbar is not None
+            )
+
+    def _heatmap_export_metadata(self) -> dict[str, Any]:
+        """Preserve full source provenance and the settings represented by the image."""
+        cube = self.current_cube
+        source_path = cube.source_path or (
+            str(self.current_dat_path) if self.current_dat_path else ""
+        )
+        return {
+            "source_path": source_path,
+            "source_stem": Path(source_path).stem if source_path else "heatmap",
+            "x_limits": [float(value) for value in self._heat_ax.get_xlim()],
+            "y_limits": [float(value) for value in self._heat_ax.get_ylim()],
+            "color_limits": [float(value) for value in self._heat_mesh.get_clim()],
+            "x_label": self._heat_ax.get_xlabel(),
+            "y_label": self._heat_ax.get_ylabel(),
+            "signal_label": self._heat_colorbar.ax.get_xlabel(),
+            "colormap": self._heat_mesh.get_cmap().name,
+            "axis_original_type": cube.x_original_type,
+            "axis_original_label": cube.x_original_label,
+            "axis_override": cube.x_override,
+            "axis_detection_source": cube.x_detection_source,
+            "axis_detection_note": cube.x_detection_note,
+            "axis_is_ambiguous": cube.x_is_ambiguous,
+            "photon_energy_note": cube.photon_energy_note,
+            "processing": "raw",
+            "plot_title": self._heat_ax.get_title(),
+        }
+
+    def _heatmap_export_filename(self) -> str:
+        """Keep source conditions readable and number exports in the target folder."""
+        metadata = self._heatmap_export_metadata()
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", metadata["source_stem"]).rstrip(" .") or "heatmap"
+        folder = self.current_dat_path.parent if self.current_dat_path else Path(self.current_folder)
+        index = 1
+        while (folder / f"{stem}_export{index:02d}.png").exists():
+            index += 1
+        filename = f"{stem}_export{index:02d}.png"
+        if len(filename.encode("utf-16-le")) // 2 > 255:
+            raise ValueError("The source filename is too long to append an export number. Shorten the source filename before exporting.")
+        return filename
+
+    @staticmethod
+    def _copy_title_settings(settings: dict) -> dict:
+        return json.loads(json.dumps(settings))
+
+    def _load_title_preferences(self) -> tuple[dict, dict]:
+        presets = {}
+        try:
+            stored = json.loads(self._annotation_settings.value("plot_titles/presets", "{}", type=str))
+            if isinstance(stored, dict):
+                for name, preset in stored.items():
+                    try:
+                        validate_preset(preset)
+                        if name == preset["name"] and name not in ("Manual", "Current group"):
+                            presets[name] = preset
+                    except (ValueError, TypeError):
+                        continue
+        except (ValueError, TypeError):
+            pass
+        try:
+            default = json.loads(self._annotation_settings.value("plot_titles/selection", "null", type=str))
+            validate_title_settings(default)
+            default["manual_override"] = None
+        except (ValueError, TypeError):
+            default = manual_settings()
+        return presets, default
+
+    def _build_title_controls(self, form: QFormLayout) -> None:
+        self.title_preset_combo = QComboBox()
+        form.addRow("Title preset:", self.title_preset_combo)
+        self.title_template_panel = QWidget()
+        editor = QFormLayout(self.title_template_panel)
+        editor.setContentsMargins(0, 0, 0, 0)
+        editor.setSpacing(3)
+        self.title_pattern_edit = QLineEdit()
+        self.title_pattern_edit.setToolTip(
+            "Arrange any fields: {voltage}, {field}, {angle}, {valley}, {temperature}, {sample}. "
+            "Add units as text. Use {{ and }} for literal braces. No expressions or formatting codes.")
+        editor.addRow("Format:", self.title_pattern_edit)
+        fields = QHBoxLayout()
+        self.title_field_combo = QComboBox()
+        self.title_field_combo.addItems(FIELDS)
+        insert = QPushButton("Insert field")
+        insert.clicked.connect(lambda: self.title_pattern_edit.insert("{" + self.title_field_combo.currentText() + "}"))
+        fields.addWidget(self.title_field_combo)
+        fields.addWidget(insert)
+        editor.addRow("Fields:", fields)
+        self.title_angle_map_edit = QLineEdit()
+        self.title_angle_map_edit.setPlaceholderText("85=K;175=Kp (optional)")
+        self.title_angle_map_edit.setToolTip("Map filename angles to valley labels for this preset only. Separate entries with semicolons.")
+        editor.addRow("Angle map:", self.title_angle_map_edit)
+        actions = QHBoxLayout()
+        self.title_preset_name_edit = QLineEdit()
+        self.title_preset_name_edit.setPlaceholderText("Preset name")
+        self.title_save_button = QPushButton("Save preset")
+        self.title_save_button.clicked.connect(self._save_title_preset)
+        self.title_apply_button = QPushButton("Apply template")
+        self.title_apply_button.clicked.connect(self._apply_current_title_template)
+        actions.addWidget(self.title_preset_name_edit)
+        actions.addWidget(self.title_save_button)
+        actions.addWidget(self.title_apply_button)
+        editor.addRow(actions)
+        form.addRow(self.title_template_panel)
+        self.title_template_status = QLabel()
+        self.title_template_status.setWordWrap(True)
+        form.addRow(self.title_template_status)
+        self._show_title_settings()
+        self.title_preset_combo.currentIndexChanged.connect(self._on_title_preset_selected)
+        self.title_pattern_edit.textChanged.connect(self._on_title_template_edited)
+        self.title_angle_map_edit.textChanged.connect(self._on_title_template_edited)
+
+    def _show_title_settings(self) -> None:
+        settings = self._title_settings
+        preset = settings["preset"] if settings["mode"] == "template" else BUILTIN_PRESET
+        selected = preset["name"] if settings["mode"] == "template" else "Manual"
+        with QSignalBlocker(self.title_preset_combo):
+            self.title_preset_combo.clear()
+            self.title_preset_combo.addItem("Manual", None)
+            self.title_preset_combo.addItem("Current group", BUILTIN_PRESET)
+            for name, saved in self._title_presets.items():
+                self.title_preset_combo.addItem(name, saved)
+            index = self.title_preset_combo.findText(selected)
+            if index < 0:
+                self.title_preset_combo.addItem(selected, preset)
+                index = self.title_preset_combo.count() - 1
+            self.title_preset_combo.setCurrentIndex(index)
+        with QSignalBlocker(self.title_pattern_edit), QSignalBlocker(self.title_angle_map_edit):
+            self.title_pattern_edit.setText(preset["pattern"])
+            self.title_angle_map_edit.setText(";".join(f"{angle}={label}" for angle, label in preset["angle_map"].items()))
+        self.title_preset_name_edit.setText("" if selected in ("Manual", "Current group") else selected)
+        active = settings["mode"] == "template"
+        self.title_template_panel.setVisible(active)
+        self.title_template_status.setVisible(active)
+        notice = "Load a DAT to preview this template."
+        if settings["manual_override"] is not None:
+            notice = "Manual override for this DAT; Apply template to regenerate."
+        elif active and self.current_cube is not None:
+            try:
+                notice = "Preview: " + render_title(self.current_cube.source_path or "", preset)
+            except ValueError as exc:
+                notice = str(exc)
+        self.title_template_status.setText(notice)
+
+    def _remember_title_selection(self) -> None:
+        self._default_title_settings = self._copy_title_settings(self._title_settings)
+        self._default_title_settings["manual_override"] = None
+        self._annotation_settings.setValue("plot_titles/selection", json.dumps(self._default_title_settings))
+        self._sync_annotation_settings()
+
+    def _on_title_preset_selected(self, _index: int) -> None:
+        preset = self.title_preset_combo.currentData()
+        self._title_settings = (manual_settings(self.plot_title_edit.text()) if preset is None else
+                                {"mode": "template", "preset": self._copy_title_settings(preset), "manual_override": None})
+        self._show_title_settings()
+        self._remember_title_selection()
+        if preset is not None:
+            self._apply_title_template()
+
+    def _edited_title_preset(self, name: str | None = None) -> dict:
+        preset = {"name": name or self._title_settings["preset"]["name"],
+                  "pattern": self.title_pattern_edit.text(),
+                  "angle_map": parse_angle_map(self.title_angle_map_edit.text())}
+        return validate_preset(preset)
+
+    def _on_title_template_edited(self, *_args) -> None:
+        if self._title_settings["mode"] != "template":
+            return
+        try:
+            preset = self._edited_title_preset()
+        except ValueError as exc:
+            self._title_settings["manual_override"] = ""
+            self._set_title_text("")
+            self.title_template_status.setText(str(exc))
+            return
+        self._title_settings = {"mode": "template", "preset": preset, "manual_override": None}
+        self._remember_title_selection()
+        self._apply_title_template()
+
+    def _apply_current_title_template(self) -> None:
+        try:
+            preset = self._edited_title_preset()
+        except ValueError as exc:
+            self.title_template_status.setText(str(exc))
+            return
+        self._title_settings = {"mode": "template", "preset": preset, "manual_override": None}
+        self._apply_title_template()
+
+    def _save_title_preset(self) -> None:
+        name = self.title_preset_name_edit.text().strip()
+        try:
+            if not name or name in ("Manual", "Current group"):
+                raise ValueError("Choose a name other than Manual or Current group.")
+            preset = self._edited_title_preset(name)
+        except ValueError as exc:
+            self.title_template_status.setText(str(exc))
+            return
+        self._title_presets[name] = preset
+        self._annotation_settings.setValue("plot_titles/presets", json.dumps(self._title_presets))
+        self._title_settings = {"mode": "template", "preset": preset, "manual_override": None}
+        self._show_title_settings()
+        self._remember_title_selection()
+        self._apply_title_template()
+
+    def _set_title_text(self, text: str) -> None:
+        with QSignalBlocker(self.plot_title_edit):
+            self.plot_title_edit.setText(text)
+        self._update_plot_annotations()
+
+    def _apply_title_template(self) -> None:
+        self._title_settings["manual_override"] = None
+        if self.current_cube is None:
+            self._set_title_text("")
+            self.title_template_status.setText("Load a DAT to preview this template.")
+            return
+        try:
+            title = render_title(self.current_cube.source_path or "", self._title_settings["preset"])
+            notice = "Preview: " + title
+        except ValueError as exc:
+            title, notice = "", str(exc)
+        self._set_title_text(title)
+        self.title_template_status.setText(notice)
+
+    def _initialize_plot_annotations(self) -> None:
+        cube = self.current_cube
+        source = cube.source_path or id(cube)
+        if source != self._title_source:
+            self._title_source = source
+            self._title_settings = self._copy_title_settings(self._default_title_settings)
+            self._show_title_settings()
+            if self._title_settings["mode"] == "template":
+                self._apply_title_template()
+            else:
+                text = (self._annotation_settings.value("plot_annotations/plot_title", "", type=str)
+                        if self.fix_annotations_chk.isChecked() else "")
+                self._set_title_text(text)
+        if source == self._annotation_source:
+            return
+        self._annotation_source = source
+        match = re.fullmatch(r"(.*?)\s*\(([^()]*)\)\s*", cube.gate_label)
+        name, unit = match.groups() if match else (cube.gate_label, "")
+        for field, text in (("y_axis_name", name), ("y_axis_unit", unit)):
+            # Key presence distinguishes an intentional blank from a source default.
+            if (self.fix_annotations_chk.isChecked()
+                    and self._annotation_settings.contains(f"plot_annotations/{field}")):
+                text = self._annotation_settings.value(f"plot_annotations/{field}", "", type=str)
+            edit = self._annotation_edits[field]
+            edit.blockSignals(True)
+            edit.setText(text)
+            edit.blockSignals(False)
+        with QSignalBlocker(self.signal_title_combo):
+            self.signal_title_combo.setCurrentText(
+                self._annotation_settings.value("plot_annotations/signal_title", "ΔR/R (a. u.)", type=str)
+                if self.fix_annotations_chk.isChecked() else "ΔR/R (a. u.)")
+
+    def _save_plot_annotation(self, field: str, text: str) -> None:
+        if field == "plot_title":
+            self._title_settings["manual_override"] = text
+            if self._title_settings["mode"] == "template":
+                self.title_template_status.setText("Manual override for this DAT; Apply template to regenerate.")
+                self._update_plot_annotations()
+                return
+        if self.fix_annotations_chk.isChecked():
+            self._annotation_settings.setValue(f"plot_annotations/{field}", text)
+            self._sync_annotation_settings()
+        self._update_plot_annotations()
+
+    def _on_fix_annotations_toggled(self, checked: bool) -> None:
+        self._annotation_settings.setValue("plot_annotations/fixed", checked)
+        if checked:
+            for field, edit in self._annotation_edits.items():
+                if field == "plot_title" and self._title_settings["mode"] == "template":
+                    continue
+                self._annotation_settings.setValue(f"plot_annotations/{field}", edit.text())
+            self._annotation_settings.setValue(
+                "plot_annotations/signal_title", self.signal_title_combo.currentText())
+        self._sync_annotation_settings()
+
+    def _sync_annotation_settings(self) -> None:
+        self._annotation_settings.sync()
+        if self._annotation_settings.status() != QSettings.NoError:
+            self.statusBar().showMessage("Could not save plot annotations for the next session.")
+
+    def _update_plot_annotations(self) -> None:
+        if self._heat_ax is None:
+            return
+        self._heat_ax.set_title(self.plot_title_edit.text(), fontsize=PLOT_FONT_SIZE, parse_math=False)
+        name, unit = self.y_axis_name_edit.text(), self.y_axis_unit_edit.text()
+        self._heat_ax.set_ylabel(f"{name} ({unit})" if unit else name, fontsize=PLOT_FONT_SIZE, parse_math=False)
+        if self._heat_colorbar is not None:
+            style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
+        self._layout_live_plots()
+        self.canvas.draw_idle()
+
+    def _layout_live_plots(self, _event=None) -> None:
+        if self._heat_ax is None or self._heat_colorbar is None:
+            return
+        width, height = self.figure.get_size_inches()
+        plot_height = min((width - 1.35) * 3 / 4, height * 0.51, height * 0.64 - 0.9)
+        plot_width = plot_height * 4 / 3
+        left = (width - plot_width) / 2
+        bottom = height * 0.36
+        self._heat_ax.set_position([left / width, bottom / height, plot_width / width, plot_height / height])
+        bar_width = min(1.1, plot_width * 0.48)
+        self._heat_colorbar.ax.set_position([
+            (left + plot_width - bar_width) / width, (bottom + plot_height + 0.04) / height,
+            bar_width / width, 0.07 / height,
+        ])
+        self._heat_ax.set_title(self.plot_title_edit.text(), fontsize=PLOT_FONT_SIZE,
+                                parse_math=False, y=1, pad=0)
+        position_heatmap_title(self._heat_ax, self._heat_colorbar.ax, self._heat_ax.title)
+        # Reserve space for the heatmap X label and the 12 pt spectrum title.
+        spectrum_height = min(height * 0.17, bottom - 0.55 - 0.80)
+        self._spec_ax.set_position([
+            0.75 / width, 0.55 / height, (width - 1.05) / width, spectrum_height / height,
+        ])
+
+    def _on_export_png(self) -> None:
+        if self.current_cube is None or self._heat_ax is None or self._heat_colorbar is None:
+            self._show_error("Load a DAT file first.")
+            return
+        try:
+            folder = self.current_dat_path.parent if self.current_dat_path else Path(self.current_folder)
+            out_path = folder / self._heatmap_export_filename()
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        try:
+            saved_path = export_figure_png(
+                self.figure,
+                out_path,
+                selected_axes=(self._heat_ax, self._heat_colorbar.ax),
+                metadata={"SpectraAnalyzer": json.dumps(self._heatmap_export_metadata(), ensure_ascii=False, sort_keys=True)},
+            )
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        except OSError as exc:
+            self._show_error(f"Failed to export PNG: {exc}")
+            return
+        except Exception as exc:
+            self._show_error(f"Failed to export PNG: {exc}")
+            return
+        finally:
+            self.canvas.draw_idle()
+        notice = self._save_current_plot_state()
+        suffix = f" — {notice}" if notice else ""
+        self.statusBar().showMessage(f"Exported PNG: {saved_path}{suffix}")
+
+    def _on_export_current_fit_csv(self) -> None:
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
             return
         active_fit = self._active_fit_result()
-        has_batch = self._has_batch_fit_results and bool(self._batch_fit_export_rows)
-        if not has_batch and active_fit is None:
-            self._show_error("Run a fit first.")
+        if active_fit is None:
+            self._show_error("Run a fit for the current gate first.")
             return
         cube = self.current_cube
         gate_used, _ = self._nearest_spectrum(self.current_gate)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if has_batch:
-            default = Path(self.current_folder) / f"{cube.title}_batch_fit_{stamp}.csv"
-        else:
-            default = Path(self.current_folder) / f"{cube.title}_gate_{gate_used:.6g}_{active_fit.model}_fit_{stamp}.csv"
-        out_path, _ = QFileDialog.getSaveFileName(self, "Export Fit CSV", str(default), "CSV Files (*.csv)")
+        default = Path(self.current_folder) / f"{cube.title}_gate_{gate_used:.6g}_{active_fit.model}_fit_{stamp}.csv"
+        out_path, _ = QFileDialog.getSaveFileName(self, "Export Current Gate CSV", str(default), "CSV Files (*.csv)")
+        if not out_path:
+            return
+        rows = [self._fit_result_to_export_row(
+            float(gate_used), active_fit.model, cube.energy_label, active_fit, status="ok"
+        )]
+        try:
+            with Path(out_path).open("w", newline="", encoding="utf-8") as fh:
+                wr = csv.DictWriter(fh, fieldnames=self._export_fieldnames(rows))
+                wr.writeheader()
+                wr.writerows(rows)
+        except Exception as exc:
+            self._show_error(f"Failed to export current-gate fit: {exc}")
+            return
+        self.statusBar().showMessage(f"Exported current-gate fit CSV: {out_path}")
+
+    def _on_export_all_fit_csv(self) -> None:
+        if self.current_cube is None:
+            self._show_error("Load a DAT file first.")
+            return
+        rows = self._all_fit_export_rows()
+        if not rows:
+            self._show_error("Run at least one fit first.")
+            return
+        cube = self.current_cube
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default = Path(self.current_folder) / f"{cube.title}_all_fit_{stamp}.csv"
+        out_path, _ = QFileDialog.getSaveFileName(self, "Export All Results CSV", str(default), "CSV Files (*.csv)")
         if not out_path:
             return
         try:
             with Path(out_path).open("w", newline="", encoding="utf-8") as fh:
-                if has_batch:
-                    rows = [dict(row) for row in self._batch_fit_export_rows]
-                else:
-                    rows = [
-                        self._fit_result_to_export_row(
-                            float(gate_used), active_fit.model, cube.energy_label, active_fit, status="ok"
-                        )
-                    ]
                 wr = csv.DictWriter(fh, fieldnames=self._export_fieldnames(rows))
                 wr.writeheader()
-                if has_batch:
-                    wr.writerows(rows)
-                else:
-                    wr.writerows(rows)
+                wr.writerows(rows)
         except Exception as exc:
-            self._show_error(f"Failed to export fit CSV: {exc}")
+            self._show_error(f"Failed to export all fit results: {exc}")
             return
-        self.statusBar().showMessage(f"Exported fit CSV: {out_path}")
+        self.statusBar().showMessage(f"Exported all fit results CSV: {out_path}")
 
     def _on_export_spectrum_csv(self) -> None:
         if self.current_cube is None:
@@ -2921,6 +3805,9 @@ class MainWindow(QMainWindow):
         if self.current_cube is None:
             return
         cube = self.current_cube
+        self._view_callbacks_ready = False
+        self._heat_mesh = None
+        self._heat_colorbar = None
 
         # Disconnect lasso before clearing axes
         self._disconnect_lasso_selector()
@@ -2941,15 +3828,10 @@ class MainWindow(QMainWindow):
         self._drag_scatter = None
 
         self.figure.clear()
-        gs = self.figure.add_gridspec(
-            nrows=2, ncols=2,
-            width_ratios=[1.0, 0.04],
-            height_ratios=[1.0, 1.0],
-            wspace=0.12, hspace=0.28,
-        )
-        self._heat_ax = self.figure.add_subplot(gs[0, 0])
-        cax = self.figure.add_subplot(gs[0, 1])
-        self._spec_ax = self.figure.add_subplot(gs[1, 0], sharex=self._heat_ax)
+        self._initialize_plot_annotations()
+        self._heat_ax = self.figure.add_axes([0.15, 0.4, 0.65, 0.45])
+        cax = self.figure.add_axes([0.65, 0.88, 0.15, 0.01])
+        self._spec_ax = self.figure.add_axes([0.15, 0.1, 0.75, 0.17], sharex=self._heat_ax)
         self._heat_peak_artists = []
         self._heat_peak_texts = []
         self._heat_batch_peak_artists = []
@@ -2961,17 +3843,21 @@ class MainWindow(QMainWindow):
         im = self._heat_ax.pcolormesh(
             self._axis_edges(e), self._axis_edges(g), z,
             shading="flat",
-            cmap=self.cmap_combo.currentText(),
+            cmap=resolve_colormap(self.cmap_combo.currentText()),
             norm=Normalize(vmin=float(vmin), vmax=float(vmax)),
         )
-        self.figure.colorbar(im, cax=cax, label="Intensity (a.u.)")
-        self._heat_ax.set_title(cube.title)
+        self._heat_mesh = im
+        self._heat_colorbar = self.figure.colorbar(im, cax=cax, orientation="horizontal")
+        style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
+        self._last_valid_color_limits = (float(vmin), float(vmax))
+        self._update_plot_annotations()
         self._heat_ax.set_xlabel(cube.energy_label)
-        self._heat_ax.set_ylabel(cube.gate_label)
+        style_plot_axis(self._heat_ax)
         xmin, xmax = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
         ymin, ymax = self._ordered_pair(float(self.ymin_spin.value()), float(self.ymax_spin.value()))
         self._heat_ax.set_xlim((xmin, xmax))
         self._heat_ax.set_ylim((ymin, ymax))
+        self._layout_live_plots()
         self._heat_ax.grid(alpha=0.15)
 
         self._update_spectrum_only()
@@ -2985,8 +3871,20 @@ class MainWindow(QMainWindow):
         # Reconnect lasso if mode is active
         self._connect_lasso_selector()
         self._set_canvas_cursor_for_event(None)
+        self._heat_ax.callbacks.connect("xlim_changed", self._on_plot_x_limits_changed)
+        self._heat_ax.callbacks.connect("ylim_changed", self._on_plot_y_limits_changed)
+        self._view_callbacks_ready = True
+        self._refresh_export_actions()
 
     def _update_spectrum_only(self) -> None:
+        previous_view_syncing = self._view_syncing
+        self._view_syncing = True
+        try:
+            self._update_spectrum_only_impl()
+        finally:
+            self._view_syncing = previous_view_syncing
+
+    def _update_spectrum_only_impl(self) -> None:
         if self.current_cube is None or self._spec_ax is None or self._heat_ax is None:
             return
         gate_used, y = self._nearest_spectrum(self.current_gate)
@@ -2996,7 +3894,7 @@ class MainWindow(QMainWindow):
         active_fit = self._active_fit_result()
         self._spec_ax.clear()
         self._spec_ax.plot(x, y, color="#1f77b4", lw=1.4, label="Spectrum")
-        self._spec_ax.set_title(f"Spectrum @ {gate_used:.6g}")
+        self._spec_ax.set_title(f"Spectrum @ {gate_used:.6g}", fontsize=PLOT_FONT_SIZE)
         self._spec_ax.set_xlabel(self.current_cube.energy_label)
         self._spec_ax.set_ylabel("Intensity (a.u.)")
         self._spec_ax.grid(alpha=0.25)
@@ -3109,22 +4007,26 @@ class MainWindow(QMainWindow):
                 0.015, 0.98,
                 f"R^2={active_fit.r_squared:.4f}\nRMSE={active_fit.rmse:.4g}",
                 transform=self._spec_ax.transAxes,
-                ha="left", va="top", fontsize=8, color="#111111",
+                ha="left", va="top", fontsize=PLOT_FONT_SIZE, color="#111111",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#444444", alpha=0.82),
                 zorder=10,
             )
 
         handles, labels = self._spec_ax.get_legend_handles_labels()
         if handles:
-            self._spec_ax.legend(loc="upper right", fontsize=7)
+            self._spec_ax.legend(loc="upper right", fontsize=PLOT_FONT_SIZE)
 
+        style_plot_axis(self._spec_ax)
         self._spec_ax.set_xlim((view_xmin, view_xmax))
         self._spec_ax.set_ylim((y0, y1))
 
         self.current_gate = gate_used
         self._sync_gate_controls()
+        self._refresh_fit_range_summary()
+        self._refresh_fit_readiness()
         self._update_gate_line(gate_used)
         self._update_heatmap_peak_labels(gate_used, x)
+        self._spec_ax.callbacks.connect("xlim_changed", self._on_plot_x_limits_changed)
         self.canvas.draw_idle()
 
     def _update_gate_line(self, gate: float) -> None:
@@ -3268,7 +4170,7 @@ class MainWindow(QMainWindow):
             is_sel = (sel_idx is not None) and (i == sel_idx)
             txt = self._heat_ax.text(
                 float(xv), float(gate_used + yoff), str(lbl),
-                fontsize=(9 if is_sel else 8),
+                fontsize=PLOT_FONT_SIZE,
                 color="#111111",
                 ha="center", va="bottom", zorder=31,
                 bbox=dict(
@@ -3351,11 +4253,7 @@ class MainWindow(QMainWindow):
             return  # already handled above
         g = self.current_cube.gate
         idx = int(np.argmin(np.abs(g - float(event.ydata))))
-        self.current_gate = float(g[idx])
-        if self.batch_peak_map:
-            self.peak_indices = np.asarray(self.batch_peak_map.get(idx, []), dtype=int)
-            self._peak_gate_idx = idx
-            self._refresh_peak_delete_controls()
+        self._set_current_gate_from_index(idx, update_plot=False)
         self.fit_result = None
         self._update_spectrum_only()
 

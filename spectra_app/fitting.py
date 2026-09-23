@@ -245,7 +245,6 @@ def fit_multi_peak(
     fn = _lorentz if model == "Lorentzian" else _gauss
     n = int(centers.size)
     xrange = float(np.nanmax(xv) - np.nanmin(xv))
-    width0 = max(xrange / max(8.0 * n, 20.0), 1e-6)
     baseline0 = float(np.nanmedian(yv))
 
     # Global sign for non-Both modes; per-component sign computed below for Both.
@@ -254,6 +253,11 @@ def fit_multi_peak(
     lw_min = max(float(linewidth_min), 1e-9)
     lw_max_v = float(linewidth_max)
     lw_max = lw_max_v if lw_max_v > lw_min else (xrange * 2.0 + 1e-9)
+    lw_max = max(lw_max, lw_min)
+    # Keep the optimizer's initial width inside the configured bounds.  This
+    # matters when a cropped range makes the heuristic width narrower than the
+    # GUI's point-based minimum.
+    width0 = float(np.clip(xrange / max(8.0 * n, 20.0), lw_min, lw_max))
 
     p0: list[float] = [baseline0]
     lower: list[float] = [float(np.nanmin(yv) - abs(np.nanmax(yv - baseline0)) * 2.0)]
