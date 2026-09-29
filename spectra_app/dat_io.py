@@ -7,6 +7,8 @@ from typing import Iterable
 
 import numpy as np
 
+from .signal_titles import infer_signal_kind
+
 
 AXIS_TYPE_EV = "ev"
 AXIS_TYPE_MEV = "mev"
@@ -67,6 +69,7 @@ class DataCube:
     photon_energy: np.ndarray | None
     photon_energy_note: str
     energy_label: str
+    signal_kind: str = "unknown"
 
     @property
     def has_photon_energy(self) -> bool:
@@ -290,8 +293,31 @@ def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> Da
     header_gates = _parse_header_gates(header_tokens) if header_tokens is not None else np.asarray([], dtype=float)
     x_label_hint = header_tokens[0] if header_tokens is not None else ""
 
-    numeric_header_layout = False
-    if header_tokens is None and arr.shape[0] >= 3 and arr.shape[1] >= 3:
+    # Some exports prefix the numeric gate header with a zero-padded title
+    # and an all-zero separator. Require the complete layout before removing
+    # either row so ordinary zero-valued measurements remain intact.
+    padded_title_layout = (
+        header_tokens is not None
+        and len(header_tokens) == arr.shape[1]
+        and header_gates.size == arr.shape[1] - 1
+        and np.all(header_gates == 0.0)
+        and arr.shape[0] >= 4
+        and arr.shape[1] >= 3
+        and np.all(arr[0] == 0.0)
+        and arr[1, 0] == 0.0
+        and np.all(np.isfinite(arr[1:, 0]))
+        and np.all(np.isfinite(arr[1, 1:]))
+        and _is_monotonic(arr[1, 1:])
+        and _is_monotonic(arr[2:, 0])
+    )
+    if padded_title_layout:
+        metadata_lines.append(" ".join(header_tokens))
+        header_gates = np.asarray([], dtype=float)
+        x_label_hint = ""
+        arr = arr[1:]
+
+    numeric_header_layout = padded_title_layout
+    if not numeric_header_layout and header_tokens is None and arr.shape[0] >= 3 and arr.shape[1] >= 3:
         numeric_header_layout = (
             _is_monotonic(arr[0, 1:])
             and _is_monotonic(arr[1:, 0])
@@ -361,4 +387,5 @@ def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> Da
         photon_energy=photon_energy,
         photon_energy_note=x_info.photon_energy_note,
         energy_label=energy_label,
+        signal_kind=infer_signal_kind(str(p), metadata_lines),
     )

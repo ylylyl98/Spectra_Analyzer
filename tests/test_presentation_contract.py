@@ -11,7 +11,7 @@ from PIL import Image
 from matplotlib import rc_context
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
-from PySide6.QtWidgets import QApplication, QDialog, QSlider, QSpinBox, QScrollArea
+from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QSlider, QSpinBox, QScrollArea
 from tests.test_image_export import _cube
 from tests.test_workflow import _fit_result
 from spectra_app.main_window import MainWindow
@@ -143,6 +143,67 @@ class PresentationContractTests(unittest.TestCase):
                         offset = heat.yaxis.get_offset_text()
                         if offset.get_text():
                             self.assertFalse(offset.get_window_extent(renderer).overlaps(quantity))
+
+    def test_regional_colorbars_are_compact_and_share_one_signal_label(self):
+        w = self.window
+        w.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
+        w.plot_title_edit.setText("Regional title")
+        for mode, names in (("2", ("Left", "Right")), ("3", ("Left", "Middle", "Right"))):
+            with self.subTest(mode=mode):
+                w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData(mode))
+                w.canvas.draw()
+                self.assertEqual([bar.ax.get_xlabel() for bar in w._heat_colorbars], [""] * len(names))
+                self.assertTrue(all(
+                    abs(bar.ax.get_position().width * w.figure.get_size_inches()[0] - 0.6) < 1e-6
+                    and abs(bar.ax.get_position().height * w.figure.get_size_inches()[1] - 0.045) < 1e-6
+                    for bar in w._heat_colorbars
+                ))
+                self.assertTrue(all(
+                    6.5 <= text.get_fontsize() <= 8.0
+                    for bar in w._heat_colorbars
+                    for text in [bar.ax.xaxis.label, *bar.ax.get_xticklabels()]
+                ))
+                self.assertEqual(
+                    [text.get_text() for text in w.figure.texts if text.get_gid() == "heatmap_signal_label"],
+                    ["d²(ΔR/R)/dE² (a. u.)"],
+                )
+                renderer = w.canvas.get_renderer()
+                title = w._heat_ax.title.get_window_extent(renderer)
+                self.assertTrue(all(
+                    not title.overlaps(tick.get_window_extent(renderer))
+                    for bar in w._heat_colorbars
+                    for tick in bar.ax.get_xticklabels()
+                ))
+
+    def test_regional_title_has_priority_over_compact_colorbar_row(self):
+        w = self.window
+        w.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
+        w.plot_title_edit.setText("A long regional heatmap title")
+        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData("3"))
+        w.canvas.draw()
+        renderer = w.canvas.get_renderer()
+        title = w._heat_ax.title.get_window_extent(renderer)
+        page = w.figure.bbox
+        self.assertGreaterEqual(title.x0, 0)
+        self.assertLessEqual(title.x1, page.x1)
+        self.assertLessEqual(title.y1, page.y1)
+        self.assertTrue(all(
+            not title.overlaps(tick.get_window_extent(renderer))
+            for bar in w._heat_colorbars
+            for tick in bar.ax.get_xticklabels()
+            if tick.get_text()
+        ))
+        label = next(text for text in w.figure.texts if text.get_gid() == "heatmap_signal_label")
+        label_box = label.get_window_extent(renderer)
+        self.assertGreaterEqual(label_box.x0, 0)
+        self.assertLessEqual(label_box.x1, page.x1)
+
+    def test_view_settings_group_follows_control_workflows(self):
+        w = self.window
+        groups = [box.title() for box in w.findChildren(QGroupBox)]
+        self.assertLess(groups.index("Color Scale"), groups.index("View Range"))
+        self.assertLess(groups.index("View Range"), groups.index("Annotations"))
+        self.assertTrue(w._region_edges_row.isHidden())
 
     def test_compact_export_labels_fit_without_overlap_for_signed_scientific_axes(self):
         w = self.window

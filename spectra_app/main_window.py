@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from .signal_titles import infer_signal_kind, RAW_LABEL, DERIVATIVE_LABEL
+
 import csv
 import json
 import re
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,11 +14,12 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.colors import Normalize
+from matplotlib.ticker import FuncFormatter
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.widgets import LassoSelector
 from scipy.signal import savgol_filter
-from PySide6.QtCore import Qt, QObject, QEvent, QPointF, QSettings, QSignalBlocker
+from PySide6.QtCore import Qt, QObject, QEvent, QPointF, QSettings, QSignalBlocker, QTimer
 from PySide6.QtGui import QCursor, QDragEnterEvent, QDropEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -54,12 +58,26 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
-from .dat_io import AXIS_OVERRIDE_ITEMS, DataCube, list_dat_files, list_dat_folders, load_dat_cube
+from .dat_io import AXIS_OVERRIDE_ITEMS, DataCube, load_dat_cube
+from .background_jobs import CancelledError, BackgroundJobs, LoadRequest, prepare_dat, discover_folders, discover_files
 from .custom_colormaps import resolve_colormap
 from .plot_state import PlotStateStore, source_fingerprint
 from .title_templates import (BUILTIN_PRESET, FIELDS, manual_settings, parse_angle_map,
                               render_title, validate_preset, validate_title_settings)
-from .image_export import PLOT_FONT_SIZE, export_figure_png, style_plot_axis, style_heatmap_colorbar, position_heatmap_title
+from .image_export import (
+    PLOT_FONT_SIZE,
+    _cb_fmt_regional,
+    _fit_regional_tick_labels,
+    REGIONAL_COLORBAR_FONT_SIZE,
+    REGIONAL_COLORBAR_GAP,
+    REGIONAL_COLORBAR_HEIGHT,
+    REGIONAL_COLORBAR_WIDTH,
+    export_figure_png,
+    style_plot_axis,
+    style_heatmap_colorbar,
+    position_heatmap_title,
+    position_regional_header,
+)
 from .fitting import (
     FitResult,
     find_peak_indices,
@@ -67,6 +85,7 @@ from .fitting import (
     fit_multi_peak,
     _clamp_sg_window,
 )
+from .processing import energy_second_derivative
 
 
 # ── Matplotlib tab10 palette (used for peak labels) ──────────────────────────
@@ -175,6 +194,11 @@ class MainWindow(QMainWindow):
         self.current_root = ""
         self.current_folder = ""
         self.current_cube: DataCube | None = None
+        self._base_cube: DataCube | None = None
+        self._processing_mode = "original"
+        self._processing_smooth = True
+        self._processing_window_length = 21
+        self._processing_original_signal_title: str | None = None
         self.current_dat_path: Path | None = None
         self.current_gate = 0.0
         self.peak_indices: np.ndarray = np.asarray([], dtype=int)
@@ -200,7 +224,13 @@ class MainWindow(QMainWindow):
         self._view_syncing = False
         self._heat_mesh = None
         self._heat_colorbar = None
+        self._heat_meshes: list[Any] = []
+        self._heat_colorbars: list[Any] = []
+        self._heat_signal_label = None
         self._last_valid_color_limits: tuple[float, float] | None = None
+        self._last_valid_region_color_limits: list[tuple[float, float]] = []
+        self._color_scale_mode = "global"
+        self._color_region_boundaries: list[float] = []
 
         # ── matplotlib axes/artists ──────────────────────────────────────────
         self._heat_ax = None
@@ -240,12 +270,33 @@ class MainWindow(QMainWindow):
 
         self._annotation_source = None
         self._annotation_settings = QSettings("SpectraAnalyzer", "SpectraAnalyzer")
+        self._annotation_edit_timer = QTimer(self)
+        self._annotation_edit_timer.setSingleShot(True)
+        self._annotation_edit_timer.setInterval(250)
+        self._annotation_edit_timer.timeout.connect(self._finish_annotation_edit)
         self._title_source = None
         self._title_presets, self._default_title_settings = self._load_title_preferences()
         self._title_settings = self._copy_title_settings(self._default_title_settings)
         self._plot_state_store = PlotStateStore()
         self._loaded_source_fingerprint: str | None = None
+        self._background_jobs = BackgroundJobs(self)
+        self._background_jobs.idle.connect(self._on_background_idle)
+        self._close_pending = False
+        self._job_cancel_requested = False
+        self._data_generation = 0
         self._build_ui()
+        self._job_cancel_button = QPushButton("Cancel operation")
+        self._job_cancel_button.clicked.connect(self._cancel_background_job)
+        self.statusBar().addPermanentWidget(self._job_cancel_button)
+        self._job_cancel_button.hide()
+        if self.fix_processing_chk.isChecked():
+            self._set_processing_controls(self._fixed_recipe("processing"))
+        if self.fix_regions_chk.isChecked():
+            regions = self._fixed_recipe("regions")
+            self._color_scale_mode = regions.get("mode", "global")
+            with QSignalBlocker(self.color_scale_combo):
+                self.color_scale_combo.setCurrentIndex(
+                    self.color_scale_combo.findData(self._color_scale_mode))
         app = QApplication.instance()
         if not hasattr(app, "_page_wheel_filter"):
             app._page_wheel_filter = _PageWheelFilter(app)
@@ -475,6 +526,10 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(self._make_expander("Data Source", src_content, expanded=True))
 
+        # ── Data Processing (expander, default expanded) ─────────────────────
+        processing_content = self._build_data_processing()
+        lay.addWidget(self._make_expander("Data Processing", processing_content, expanded=True))
+
         # ── View Settings (expander, default expanded) ────────────────────────
         view_content = self._build_view_settings()
         lay.addWidget(self._make_expander("View Settings", view_content, expanded=True))
@@ -515,7 +570,9 @@ class MainWindow(QMainWindow):
         self.folder_combo.currentIndexChanged.connect(self._on_folder_changed)
         self.load_btn.clicked.connect(self._on_load_selected_file)
         self.file_list.itemDoubleClicked.connect(lambda _: self._on_load_selected_file())
-        self.x_axis_override_combo.currentIndexChanged.connect(self._on_x_axis_override_changed)
+        self.x_axis_override_combo.currentIndexChanged.connect(self._on_x_axis_override_async)
+        self.processing_mode_combo.currentIndexChanged.connect(self._on_processing_mode_changed)
+        self.generate_heatmap_btn.clicked.connect(self._on_generate_heatmap)
         self.cmap_combo.currentTextChanged.connect(lambda _: self._plot_cube())
         self.lw_min_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
         self.lw_max_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
@@ -533,6 +590,65 @@ class MainWindow(QMainWindow):
 
     # ── view settings content (used inside expander) ──────────────────────────
 
+    def _build_data_processing(self) -> QWidget:
+        """Build the current-data transform controls for the heatmap."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(2, 2, 2, 4)
+        lay.setSpacing(4)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+        form.setHorizontalSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.processing_mode_combo = QComboBox()
+        self.processing_mode_combo.addItem("Original", "original")
+        self.processing_mode_combo.addItem("Energy 2nd derivative", "energy_second_derivative")
+        self.processing_mode_combo.setToolTip(
+            "Choose the data represented by the heatmap and accompanying spectrum."
+        )
+        self.fix_processing_chk = QCheckBox("Fix")
+        self.fix_processing_chk.setChecked(self._annotation_settings.value(
+            "fixed_processing/enabled", False, type=bool))
+        self.fix_processing_chk.setToolTip("Carry mode and smoothing settings across files and restarts.")
+        mode_row = QWidget()
+        mode_layout = QHBoxLayout(mode_row)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.addWidget(self.processing_mode_combo, 1)
+        mode_layout.addWidget(self.fix_processing_chk)
+        form.addRow("Mode:", mode_row)
+
+        self.processing_smooth_chk = QCheckBox("SG smoothing")
+        self.processing_smooth_chk.setChecked(True)
+        self.processing_smooth_chk.setToolTip(
+            "Compute the second derivative directly from a local polynomial fit (SG). "
+            "When disabled, use ordinary finite differences."
+        )
+        form.addRow("", self.processing_smooth_chk)
+
+        self.processing_window_spin = QSpinBox()
+        self.processing_window_spin.setRange(5, 1001)
+        self.processing_window_spin.setSingleStep(2)
+        self.processing_window_spin.setValue(21)
+        self.processing_window_spin.setToolTip("Odd smoothing window length in energy points.")
+        form.addRow("Window points:", self.processing_window_spin)
+        self.fix_processing_chk.toggled.connect(self._remember_fixed_processing)
+        self.processing_mode_combo.currentIndexChanged.connect(self._remember_fixed_processing)
+        self.processing_smooth_chk.toggled.connect(self._remember_fixed_processing)
+        self.processing_window_spin.valueChanged.connect(self._remember_fixed_processing)
+        lay.addLayout(form)
+
+        self.generate_heatmap_btn = QPushButton("Generate Heatmap")
+        self.generate_heatmap_btn.setStyleSheet(_STYLE_PRIMARY)
+        self.generate_heatmap_btn.setToolTip(
+            "Apply the selected transform to the current loaded data."
+        )
+        lay.addWidget(self.generate_heatmap_btn)
+        return w
+
     def _build_view_settings(self) -> QWidget:
         """Build the View Settings panel content (X-axis, colormap, bounds, gate)."""
         w = QWidget()
@@ -540,7 +656,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(2, 2, 2, 4)
         lay.setSpacing(6)
 
-        # ── X-axis override + colormap (2-column form) ────────────────────────
+        # ── Frequently used view and annotation controls ─────────────────────
         self.x_axis_override_combo = QComboBox()
         for value, label in AXIS_OVERRIDE_ITEMS:
             self.x_axis_override_combo.addItem(label, value)
@@ -556,14 +672,20 @@ class MainWindow(QMainWindow):
         self.cmap_combo.setCurrentText("RdBu_r")
         self.cmap_combo.setToolTip("Colormap used for the intensity heatmap")
 
+        self.color_scale_combo = QComboBox()
+        self.color_scale_combo.addItem("Global", "global")
+        self.color_scale_combo.addItem("2 regions", "2")
+        self.color_scale_combo.addItem("3 regions", "3")
+        self.color_scale_combo.setToolTip(
+            "Use one color scale or independent scales across contiguous photon-energy regions."
+        )
+
         top_form = QFormLayout()
         top_form.setContentsMargins(0, 0, 0, 0)
         top_form.setSpacing(4)
         top_form.setHorizontalSpacing(8)
         top_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         top_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        top_form.addRow("X-Axis:", self.x_axis_override_combo)
-        top_form.addRow("Colormap:", self.cmap_combo)
         self.fix_annotations_chk = QCheckBox("Fix annotations")
         self.fix_annotations_chk.setChecked(
             self._annotation_settings.value("plot_annotations/fixed", True, type=bool))
@@ -604,10 +726,17 @@ class MainWindow(QMainWindow):
                 "plot_annotations/signal_title", "ΔR/R (a. u.)", type=str))
         self.signal_title_combo.currentTextChanged.connect(
             lambda text: self._save_plot_annotation("signal_title", text))
-        top_form.addRow("Z signal title:", self.signal_title_combo)
+        self.signal_title_auto_chk = QCheckBox("Auto")
+        self.signal_title_auto_chk.setChecked(self._annotation_settings.value(
+            "plot_annotations/signal_auto",
+            not self._annotation_settings.contains("plot_annotations/signal_title"), type=bool)
+            if self.fix_annotations_chk.isChecked() else True)
+        self.signal_title_auto_chk.toggled.connect(self._on_signal_auto_toggled)
+        signal_row = QHBoxLayout()
+        signal_row.addWidget(self.signal_title_combo, 1)
+        signal_row.addWidget(self.signal_title_auto_chk)
+        top_form.addRow("Z signal title:", signal_row)
         self.fix_annotations_chk.toggled.connect(self._on_fix_annotations_toggled)
-        lay.addLayout(top_form)
-
         # Axis status label
         self.axis_status_label = QLabel("X-axis: no file loaded.")
         self.axis_status_label.setWordWrap(True)
@@ -615,14 +744,6 @@ class MainWindow(QMainWindow):
             "color: #607d8b; font-size: 10px;"
             "background: #f0f4f8; border-radius: 3px; padding: 3px 5px;"
         )
-        lay.addWidget(self.axis_status_label)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFrameShadow(QFrame.Sunken)
-        sep.setStyleSheet("color: #e0e0e0;")
-        lay.addWidget(sep)
-
         # ── View bounds grid (Min / Max per axis) ─────────────────────────────
         self.xmin_spin = QDoubleSpinBox()
         self.xmax_spin = QDoubleSpinBox()
@@ -633,6 +754,7 @@ class MainWindow(QMainWindow):
         for sp in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
                    self.ymax_spin, self.vmin_spin, self.vmax_spin):
             sp.setDecimals(4)
+            sp.setKeyboardTracking(False)
             sp.setRange(-1e12, 1e12)
             sp.setSingleStep(0.01)
             sp.setMinimumWidth(90)
@@ -676,7 +798,6 @@ class MainWindow(QMainWindow):
         for row_idx, txt, tip in (
             (1, "Energy (X)", "Horizontal axis range shown on the heatmap"),
             (2, "Gate (Y)", "Vertical axis range shown on the heatmap"),
-            (3, "Intensity", "Color (value) range for the heatmap colormap"),
         ):
             lbl = QLabel(txt)
             lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
@@ -694,10 +815,49 @@ class MainWindow(QMainWindow):
         bounds_grid.addWidget(self.ymax_spin, 2, 3)
         bounds_grid.addWidget(self.ymax_lock, 2, 4)
 
-        bounds_grid.addWidget(self.vmin_spin, 3, 1)
-        bounds_grid.addWidget(self.vmin_lock, 3, 2)
-        bounds_grid.addWidget(self.vmax_spin, 3, 3)
-        bounds_grid.addWidget(self.vmax_lock, 3, 4)
+        region_edges_label = QLabel("Region edges")
+        region_edges_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        region_edges_label.setStyleSheet("font-size: 10px; color: #444;")
+        region_edges_label.setToolTip("Internal photon-energy boundaries, snapped to heatmap cell edges")
+        self.region_boundary_spins: list[QDoubleSpinBox] = []
+        boundary_row = QWidget()
+        boundary_lay = QHBoxLayout(boundary_row)
+        boundary_lay.setContentsMargins(0, 0, 0, 0)
+        boundary_lay.setSpacing(4)
+        for idx in range(2):
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setRange(-1e12, 1e12)
+            spin.setSingleStep(0.01)
+            spin.setMinimumWidth(90)
+            spin.setKeyboardTracking(False)
+            spin.setToolTip("Boundary is snapped to a valid photon-energy cell edge")
+            spin.valueChanged.connect(
+                lambda value, boundary_idx=idx: self._on_color_region_boundary_changed(boundary_idx, value)
+            )
+            self.region_boundary_spins.append(spin)
+            boundary_lay.addWidget(spin, 1)
+        self._region_edges_row = QWidget()
+        region_row_lay = QHBoxLayout(self._region_edges_row)
+        region_row_lay.setContentsMargins(0, 0, 0, 0)
+        region_row_lay.setSpacing(5)
+        region_row_lay.addWidget(region_edges_label)
+        region_row_lay.addWidget(boundary_row, 1)
+        self.fix_region_edges_chk = QCheckBox("Fix")
+        settings = self._annotation_settings
+        if not settings.contains("fixed_region_edges/enabled"):
+            settings.setValue("fixed_region_edges/enabled", settings.value(
+                "fixed_regions/enabled", False, type=bool))
+            settings.setValue("fixed_region_edges/recipe", json.dumps({
+                "boundaries": self._fixed_recipe("regions").get("boundaries", []),
+            }))
+        self.fix_region_edges_chk.setChecked(settings.value(
+            "fixed_region_edges/enabled", False, type=bool))
+        self.fix_region_edges_chk.setToolTip(
+            "Carry energy boundaries across files with the same region count; intensity ranges remain automatic.")
+        self.fix_region_edges_chk.toggled.connect(self._remember_fixed_region_edges)
+        region_row_lay.addWidget(self.fix_region_edges_chk)
+        self._region_edges_row.setVisible(False)
 
         bounds_grid.setColumnStretch(1, 1)
         bounds_grid.setColumnStretch(3, 1)
@@ -716,8 +876,88 @@ class MainWindow(QMainWindow):
         self.auto_view_btn.setStyleSheet(_STYLE_MUTED)
         btn_row.addWidget(self.apply_view_btn, 1)
         btn_row.addWidget(self.auto_view_btn, 1)
-        bounds_grid.addLayout(btn_row, 4, 0, 1, 5)
-        lay.addWidget(bounds_box)
+        bounds_grid.addLayout(btn_row, 3, 0, 1, 5)
+
+        # Keep the most frequently adjusted color controls together.
+        color_box = QGroupBox("Color Scale")
+        color_lay = QVBoxLayout(color_box)
+        color_lay.setContentsMargins(8, 14, 8, 6)
+        color_lay.setSpacing(4)
+        color_form = QFormLayout()
+        color_form.setContentsMargins(0, 0, 0, 0)
+        color_form.setSpacing(4)
+        color_form.setHorizontalSpacing(8)
+        color_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        color_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        color_form.addRow("Colormap:", self.cmap_combo)
+        self.fix_regions_chk = QCheckBox("Fix")
+        self.fix_regions_chk.setChecked(self._annotation_settings.value(
+            "fixed_regions/enabled", False, type=bool))
+        self.fix_regions_chk.setToolTip(
+            "Carry region count across files; intensity ranges remain automatic.")
+        self.fix_regions_chk.toggled.connect(self._remember_fixed_regions)
+        scale_row = QWidget()
+        scale_layout = QHBoxLayout(scale_row)
+        scale_layout.setContentsMargins(0, 0, 0, 0)
+        scale_layout.addWidget(self.color_scale_combo, 1)
+        scale_layout.addWidget(self.fix_regions_chk)
+        color_form.addRow("Color scale:", scale_row)
+        color_lay.addLayout(color_form)
+
+        color_grid = QGridLayout()
+        color_grid.setContentsMargins(0, 0, 0, 0)
+        color_grid.setSpacing(4)
+        color_grid.setHorizontalSpacing(5)
+        color_hdr_min = QLabel("Min")
+        color_hdr_max = QLabel("Max")
+        for label in (color_hdr_min, color_hdr_max):
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("font-weight: 600; color: #666; font-size: 10px;")
+        color_grid.addWidget(color_hdr_min, 0, 1, 1, 2, Qt.AlignCenter)
+        color_grid.addWidget(color_hdr_max, 0, 3, 1, 2, Qt.AlignCenter)
+        intensity_label = QLabel("Intensity")
+        intensity_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        intensity_label.setToolTip("Color (value) range for the heatmap colormap")
+        intensity_label.setStyleSheet("font-size: 10px; color: #444;")
+        color_grid.addWidget(intensity_label, 1, 0)
+        color_grid.addWidget(self.vmin_spin, 1, 1)
+        color_grid.addWidget(self.vmin_lock, 1, 2)
+        color_grid.addWidget(self.vmax_spin, 1, 3)
+        color_grid.addWidget(self.vmax_lock, 1, 4)
+        color_grid.addWidget(self._region_edges_row, 2, 0, 1, 5)
+        color_grid.setColumnStretch(1, 1)
+        color_grid.setColumnStretch(3, 1)
+        color_grid.setColumnMinimumWidth(0, 62)
+        color_lay.addLayout(color_grid)
+
+        # X interpretation, bounds and actions form one view-range task.
+        view_box = QGroupBox("View Range")
+        view_lay = QVBoxLayout(view_box)
+        view_lay.setContentsMargins(8, 14, 8, 6)
+        view_lay.setSpacing(4)
+        axis_form = QFormLayout()
+        axis_form.setContentsMargins(0, 0, 0, 0)
+        axis_form.setSpacing(4)
+        axis_form.setHorizontalSpacing(8)
+        axis_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        axis_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        axis_form.addRow("X-axis:", self.x_axis_override_combo)
+        view_lay.addLayout(axis_form)
+        view_lay.addWidget(self.axis_status_label)
+        view_lay.addWidget(bounds_box)
+
+        annotation_box = QGroupBox("Annotations")
+        annotation_lay = QVBoxLayout(annotation_box)
+        annotation_lay.setContentsMargins(8, 14, 8, 6)
+        annotation_lay.setSpacing(4)
+        annotation_lay.addLayout(top_form)
+
+        lay.addWidget(color_box)
+        lay.addWidget(view_box)
+        lay.addWidget(annotation_box)
+
+        self.color_scale_combo.currentIndexChanged.connect(self._on_color_scale_changed)
+        self._sync_region_controls()
 
         return w
 
@@ -2039,7 +2279,15 @@ class MainWindow(QMainWindow):
             return
         self.current_root = folder
         self.root_edit.setText(folder)
-        folders = list_dat_folders(folder)
+        self.file_list.clear()
+        self.folder_combo.clear()
+        self.current_folder = ""
+        root = Path(folder)
+        self._start_background_job(
+            lambda context: discover_folders(root, context),
+            lambda folders: self._apply_dat_folders(folder, folders), "Finding DAT folders…")
+
+    def _apply_dat_folders(self, folder: str, folders: list[Path]) -> None:
         self.folder_combo.blockSignals(True)
         self.folder_combo.clear()
         for p in folders:
@@ -2059,7 +2307,12 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self.current_folder = str(folder)
-        files = list_dat_files(folder)
+        self.file_list.clear()
+        path = Path(folder)
+        self._start_background_job(
+            lambda context: discover_files(path, context), self._apply_dat_files, "Reading folder…")
+
+    def _apply_dat_files(self, files: list[str]) -> None:
         self.file_list.clear()
         self.file_list.addItems(files)
         if files:
@@ -2074,10 +2327,273 @@ class MainWindow(QMainWindow):
             self._show_error("Select one DAT file first.")
             return
         path = Path(self.current_folder) / item.text().strip()
-        self._load_dat_file_direct(path)
+        self._load_dat_file_async(path)
+
+    def _start_background_job(self, work, apply, description: str, *, on_error=None) -> None:
+        """Run work(context) off-thread; deliver only the newest result on the GUI thread."""
+        if self._close_pending:
+            return
+        self._job_cancel_requested = False
+        self._job_cancel_button.show()
+        self.statusBar().showMessage(description)
+        self._background_jobs.start(
+            work, apply, on_error=on_error or (lambda exc: self._show_error(str(exc))),
+            on_progress=self.statusBar().showMessage)
+
+    def _cancel_background_job(self) -> None:
+        self._background_jobs.cancel()
+        self._job_cancel_requested = self._background_jobs.busy
+        if self.current_cube is not None:
+            with QSignalBlocker(self.x_axis_override_combo):
+                self.x_axis_override_combo.setCurrentIndex(
+                    self.x_axis_override_combo.findData(self.current_cube.x_override))
+        self.statusBar().showMessage(
+            "Cancelling; waiting for the current operation…"
+            if self._job_cancel_requested else "Operation cancelled.")
+
+    def _on_background_idle(self) -> None:
+        self._job_cancel_button.hide()
+        if self._job_cancel_requested:
+            self._job_cancel_requested = False
+            self.statusBar().showMessage("Operation cancelled.")
+        if self._close_pending:
+            QTimer.singleShot(0, self.close)
+
+    def _load_dat_file_async(self, path: Path) -> None:
+        self._finish_annotation_edit(render=False)
+        save_notice = self._save_current_plot_state()
+        request = LoadRequest(Path(path), self._selected_x_axis_override(),
+                              tuple(self.cmap_combo.itemText(i) for i in range(self.cmap_combo.count())))
+        self._start_background_job(
+            lambda context: prepare_dat(request, context),
+            lambda prepared: self._accept_loaded_dat(path, prepared, save_notice),
+            f"Loading {path.name}…")
+
+    def _accept_loaded_dat(self, path: Path, prepared, save_notice: str) -> None:
+        # Controls remain editable while I/O runs. Commit the outgoing state at
+        # replacement time, rather than losing edits made after the request began.
+        self._finish_annotation_edit(render=False)
+        cube, fingerprint, saved_plot, recall_notice = prepared
+        if (self.current_dat_path == path
+                and self._loaded_source_fingerprint == fingerprint):
+            latest_plot = self._current_plot_state()
+            if latest_plot is not None:
+                saved_plot, recall_notice = latest_plot, ""
+        latest_notice = self._save_current_plot_state()
+        notices = " ".join(dict.fromkeys(part for part in (save_notice, latest_notice) if part))
+        self._apply_loaded_dat(path, cube, fingerprint, saved_plot, recall_notice, notices)
+
+    # =========================================================================
+    #  Current-data processing
+    # =========================================================================
+
+    def _remember_fixed_processing(self, *_args) -> None:
+        settings = self._annotation_settings
+        settings.setValue("fixed_processing/enabled", self.fix_processing_chk.isChecked())
+        if self.fix_processing_chk.isChecked():
+            settings.setValue("fixed_processing/recipe", json.dumps({
+                "mode": self.processing_mode_combo.currentData(),
+                "smooth": self.processing_smooth_chk.isChecked(),
+                "window_length": self.processing_window_spin.value(),
+            }))
+        self._sync_annotation_settings()
+
+    def _remember_fixed_regions(self, *_args) -> None:
+        settings = self._annotation_settings
+        settings.setValue("fixed_regions/enabled", self.fix_regions_chk.isChecked())
+        if self.fix_regions_chk.isChecked():
+            settings.setValue("fixed_regions/recipe", json.dumps({
+                "mode": self._color_scale_mode,
+            }))
+        self._sync_annotation_settings()
+
+    def _remember_fixed_region_edges(self, *_args) -> None:
+        settings = self._annotation_settings
+        settings.setValue("fixed_region_edges/enabled", self.fix_region_edges_chk.isChecked())
+        if self.fix_region_edges_chk.isChecked():
+            settings.setValue("fixed_region_edges/recipe", json.dumps({
+                "boundaries": self._color_region_boundaries,
+            }))
+        self._sync_annotation_settings()
+
+    def _apply_fixed_region_edges(self) -> None:
+        if self.fix_region_edges_chk.isChecked():
+            boundaries = self._fixed_recipe("region_edges").get("boundaries", [])
+            if len(boundaries) == self._requested_region_count() - 1:
+                self._color_region_boundaries = list(boundaries)
+
+    def _fixed_recipe(self, group: str) -> dict:
+        try:
+            recipe = json.loads(self._annotation_settings.value(
+                f"fixed_{group}/recipe", "{}", type=str))
+            if not isinstance(recipe, dict):
+                return {}
+            if group == "processing":
+                window = max(5, min(1001, int(recipe.get("window_length", 21))))
+                return {
+                    "mode": ("energy_second_derivative" if recipe.get("mode") ==
+                             "energy_second_derivative" else "original"),
+                    "smooth": bool(recipe.get("smooth", True)),
+                    "window_length": window if window % 2 else window + 1,
+                }
+            mode = str(recipe.get("mode", "global"))
+            boundaries = [float(value) for value in recipe.get("boundaries", [])]
+            if mode not in ("global", "2", "3") or not all(np.isfinite(boundaries)):
+                return {}
+            return {"mode": mode, "boundaries": boundaries}
+        except (ValueError, TypeError, OverflowError):
+            return {}
+
+    def _set_processing_controls(self, settings: dict | None = None) -> None:
+        settings = settings or {"mode": "original", "smooth": True, "window_length": 21,
+                                "original_signal_title": "ΔR/R (a. u.)"}
+        mode = settings.get("mode", "original")
+        index = self.processing_mode_combo.findData(mode)
+        if index < 0:
+            index = self.processing_mode_combo.findData("original")
+        with QSignalBlocker(self.processing_mode_combo):
+            self.processing_mode_combo.setCurrentIndex(index)
+        with QSignalBlocker(self.processing_smooth_chk):
+            self.processing_smooth_chk.setChecked(bool(settings.get("smooth", True)))
+        with QSignalBlocker(self.processing_window_spin):
+            self.processing_window_spin.setValue(int(settings.get("window_length", 21)))
+        self._processing_smooth = self.processing_smooth_chk.isChecked()
+        self._processing_window_length = int(self.processing_window_spin.value())
+        self._processing_original_signal_title = (
+            str(settings.get("original_signal_title", "ΔR/R (a. u.)"))
+            if mode == "energy_second_derivative" else None
+        )
+
+    def _clear_processing_analysis_state(self) -> None:
+        self._invalidate_analysis_jobs()
+        """Drop analyses whose coordinates or values refer to the prior data."""
+        self.peak_indices = np.asarray([], dtype=int)
+        self._peak_gate_idx = None
+        self.peak_kind_lookup = {}
+        self.peak_label_lookup = {}
+        self.batch_peak_map = {}
+        self.batch_peak_coords = None
+        self.batch_peak_records = []
+        self.batch_peak_kind_lookup = {}
+        self.fit_result = None
+        self._fit_gate_idx = None
+        self.batch_fit_map = {}
+        self.batch_fit_coords = None
+        self.batch_fit_result_map = {}
+        self._batch_fit_export_rows = []
+        self._has_batch_fit_results = False
+        self._cached_d2 = None
+        self._lasso_selected_peak_ids = []
+        self._clear_lasso_selection_visual()
+        self._update_lasso_actions()
+        self._refresh_peak_delete_controls()
+
+    def _on_processing_mode_changed(self) -> None:
+        if self.current_cube is None:
+            return
+        if self.processing_mode_combo.currentData() == "original":
+            self._restore_original_data()
+
+    def _on_generate_heatmap(self) -> None:
+        if self.current_cube is None:
+            self._show_error("Load a DAT file first.")
+            return
+        mode = str(self.processing_mode_combo.currentData() or "original")
+        if mode == "original":
+            self._restore_original_data()
+            return
+        self._apply_energy_second_derivative(
+            smooth=self.processing_smooth_chk.isChecked(),
+            window_length=int(self.processing_window_spin.value()),
+        )
+
+    def _apply_energy_second_derivative(self, *, smooth: bool, window_length: int) -> None:
+        base = self._base_cube or self.current_cube
+        if base is None:
+            self._show_error("Load a DAT file first.")
+            return
+        if base.photon_energy is None:
+            self._show_error(
+                "Energy 2nd derivative requires genuine photon energy. Set X-axis to energy."
+            )
+            return
+        if type(window_length) is not int or window_length < 5 or window_length % 2 == 0:
+            self._show_error("Smoothing window must be an odd integer of at least 5 points.")
+            return
+        try:
+            transformed = energy_second_derivative(
+                np.asarray(base.photon_energy, dtype=float),
+                np.asarray(base.z, dtype=float),
+                smooth=bool(smooth),
+                window_length=window_length,
+                polyorder=3,
+            )
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._show_error(str(exc))
+            return
+        self._replace_current_data(
+            replace(base, z=np.asarray(transformed, dtype=float)),
+            mode="energy_second_derivative",
+            smooth=bool(smooth),
+            window_length=window_length,
+        )
+
+    def _restore_original_data(self) -> None:
+        base = self._base_cube or self.current_cube
+        if base is None:
+            return
+        if self._processing_mode == "original" and self.current_cube is base:
+            return
+        self._replace_current_data(base, mode="original", smooth=self._processing_smooth,
+                                   window_length=self._processing_window_length)
+
+    def _replace_current_data(
+        self,
+        cube: DataCube,
+        *,
+        mode: str,
+        smooth: bool,
+        window_length: int,
+    ) -> None:
+        if self._base_cube is None:
+            self._base_cube = self.current_cube
+        if self._base_cube is None:
+            self._base_cube = cube
+        xlim = self._heat_ax.get_xlim() if self._heat_ax is not None else (
+            self.xmin_spin.value(), self.xmax_spin.value())
+        ylim = self._heat_ax.get_ylim() if self._heat_ax is not None else (
+            self.ymin_spin.value(), self.ymax_spin.value())
+        base_cube = self._base_cube or self.current_cube or cube
+        if float(xlim[0]) == float(xlim[1]):
+            xlim = (float(np.nanmin(base_cube.energy)), float(np.nanmax(base_cube.energy)))
+        if float(ylim[0]) == float(ylim[1]):
+            ylim = (float(np.nanmin(base_cube.gate)), float(np.nanmax(base_cube.gate)))
+        self.current_cube = cube
+        self._processing_mode = mode
+        self._processing_smooth = bool(smooth)
+        self._processing_window_length = int(window_length)
+        self._clear_processing_analysis_state()
+        self._refresh_auto_signal_title()
+        self._last_valid_color_limits = None
+        self._last_valid_region_color_limits = []
+        for spin, value in ((self.xmin_spin, xlim[0]), (self.xmax_spin, xlim[1]),
+                            (self.ymin_spin, ylim[0]), (self.ymax_spin, ylim[1])):
+            with QSignalBlocker(spin):
+                spin.setValue(float(value))
+        self._update_auto_color_limits_from_visible_view(use_spin_values=True)
+        self._plot_cube()
+        self._heat_ax.set_xlim(xlim)
+        self._heat_ax.set_ylim(ylim)
+        self._update_auto_color_limits_from_visible_view(xlim=xlim, ylim=ylim)
+        self._refresh_axis_status()
+        self.statusBar().showMessage(
+            "Heatmap restored to original data." if mode == "original"
+            else "Generated energy 2nd derivative heatmap."
+        )
 
     def _load_dat_file_direct(self, path: Path) -> None:
-        """Load a .dat file directly (called from file list or drag-and-drop)."""
+        """Synchronous internal entry point, sharing GUI application with async loading."""
+        self._background_jobs.cancel()
         try:
             fingerprint = source_fingerprint(path)
             save_notice = self._save_current_plot_state()
@@ -2092,31 +2608,40 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error(str(exc))
             return
+        self._apply_loaded_dat(path, cube, fingerprint, saved_plot, recall_notice, save_notice)
+
+    def _apply_loaded_dat(self, path, cube, fingerprint, saved_plot, recall_notice, save_notice) -> None:
+        self._data_generation += 1
+        self._base_cube = cube
         self.current_cube = cube
+        self._processing_original_signal_title = None
+        processing = (self._fixed_recipe("processing") if self.fix_processing_chk.isChecked()
+                      else saved_plot.get("processing", {}) if saved_plot else {})
+        self._set_processing_controls(processing)
+        self._processing_mode = "original"
+        self._processing_smooth = self.processing_smooth_chk.isChecked()
+        self._processing_window_length = int(self.processing_window_spin.value())
+        processing_notice = ""
+        if processing.get("mode") == "energy_second_derivative":
+            try:
+                if cube.photon_energy is None:
+                    raise ValueError("Energy 2nd derivative requires genuine photon energy.")
+                transformed = energy_second_derivative(
+                    cube.photon_energy, cube.z, smooth=self._processing_smooth,
+                    window_length=self._processing_window_length, polyorder=3)
+                self.current_cube = replace(cube, z=np.asarray(transformed, dtype=float))
+                self._processing_mode = "energy_second_derivative"
+            except (ValueError, TypeError, OverflowError) as exc:
+                processing_notice = f"Using Original for this file: {exc}"
+                self._set_processing_controls({**processing, "mode": "original"})
         self._loaded_source_fingerprint = fingerprint
         self._annotation_source = None
         self._title_source = None
         self._last_valid_color_limits = None
+        self._last_valid_region_color_limits = []
         self.current_dat_path = path
-        self.peak_indices = np.asarray([], dtype=int)
-        self._peak_gate_idx = None
-        self.peak_label_lookup = {}
-        self.batch_peak_map = {}
-        self.batch_peak_coords = None
-        self.batch_peak_records = []
-        self.fit_result = None
-        self._fit_gate_idx = None
-        self.batch_fit_map = {}
-        self.batch_fit_coords = None
-        self.batch_fit_result_map = {}
-        self._batch_fit_export_rows = []
-        self._has_batch_fit_results = False
+        self._clear_processing_analysis_state()
         self._reset_csv_seed_source()
-        self._lasso_selected_peak_ids = []
-        self._clear_lasso_selection_visual()
-        self._update_lasso_actions()
-        self._cached_d2 = None
-        self._refresh_peak_delete_controls()
         gate = float(np.nanmedian(cube.gate))
         self.current_gate = gate
         self._sync_gate_controls()
@@ -2126,17 +2651,38 @@ class MainWindow(QMainWindow):
             with QSignalBlocker(self.fix_annotations_chk):
                 self.fix_annotations_chk.setChecked(
                     self._annotation_settings.value("plot_annotations/fixed", True, type=bool))
+            with QSignalBlocker(self.color_scale_combo):
+                self.color_scale_combo.setCurrentIndex(self.color_scale_combo.findData("global"))
+            self._color_scale_mode = "global"
+            self._color_region_boundaries = []
+            self._sync_region_controls()
         self._set_view_limits_to_auto()
         self._set_fit_range_to_full()
         if saved_plot is not None:
             self._restore_plot_controls(saved_plot)
+            self._refresh_auto_signal_title()
+        if self.fix_regions_chk.isChecked():
+            regions = self._fixed_recipe("regions")
+            self._color_scale_mode = regions.get("mode", "global")
+            with QSignalBlocker(self.color_scale_combo):
+                self.color_scale_combo.setCurrentIndex(
+                    self.color_scale_combo.findData(self._color_scale_mode))
+        self._apply_fixed_region_edges()
+        self._sync_region_controls()
+        refresh_colors = (self.fix_processing_chk.isChecked() or self.fix_regions_chk.isChecked()
+                          or self.fix_region_edges_chk.isChecked())
+        if refresh_colors:
+            for lock in (self.vmin_lock, self.vmax_lock):
+                with QSignalBlocker(lock):
+                    lock.setChecked(False)
+            self._update_auto_color_limits_from_visible_view(use_spin_values=True)
         self._refresh_axis_status()
         self._refresh_fit_range_summary()
         self._refresh_fit_readiness()
         self._update_fit_param_unit_labels()
         self._plot_cube()
         if saved_plot is not None:
-            self._restore_effective_plot_limits(saved_plot)
+            self._restore_effective_plot_limits(saved_plot, refresh_colors=refresh_colors)
         self.analysis_text.setPlainText(
             f"Loaded: {path.name}\n"
             f"Detected x-axis: {cube.x_original_label}\n"
@@ -2144,30 +2690,45 @@ class MainWindow(QMainWindow):
             "Use Find Peaks tab to detect peaks, then Lorentz Fit tab to fit.\n"
             "Drag-and-drop a .dat or .csv file onto the window as an alternative to browse."
         )
-        notice = " ".join(part for part in (save_notice, recall_notice) if part)
+        notice = " ".join(part for part in (save_notice, recall_notice, processing_notice) if part)
         suffix = f" — {notice}" if notice else (" — saved plot restored" if saved_plot else "")
         self.statusBar().showMessage(f"Loaded: {path.name}{suffix}")
 
-    def _save_current_plot_state(self) -> str:
+    def _current_plot_state(self) -> dict | None:
         if (self.current_dat_path is None or self.current_cube is None
                 or self._loaded_source_fingerprint is None
                 or self._heat_ax is None or self._heat_mesh is None):
-            return ""
+            return None
         bounds = ("xmin", "xmax", "ymin", "ymax", "vmin", "vmax")
-        plot = {
+        return {
             "axis_override": self.current_cube.x_override,
             "colormap": self.cmap_combo.currentText(),
             "annotations": {**{name: edit.text() for name, edit in self._annotation_edits.items()},
                             "signal_title": self.signal_title_combo.currentText()},
             "fix_annotations": self.fix_annotations_chk.isChecked(),
+            "signal_title_auto": self.signal_title_auto_chk.isChecked(),
             "title_settings": self._copy_title_settings(self._title_settings),
             "bounds": {name: getattr(self, f"{name}_spin").value() for name in bounds},
             "locks": {name: getattr(self, f"{name}_lock").isChecked() for name in bounds},
             "x_limits": list(map(float, self._heat_ax.get_xlim())),
             "y_limits": list(map(float, self._heat_ax.get_ylim())),
             "color_limits": list(map(float, self._heat_mesh.get_clim())),
+            "color_scale_mode": self._color_scale_mode,
+            "color_region_boundaries": [float(value) for value in self._color_region_boundaries],
+            "processing": {
+                "mode": self._processing_mode,
+                "smooth": bool(self._processing_smooth),
+                "window_length": int(self._processing_window_length),
+                "original_signal_title": self._processing_original_signal_title
+                or "ΔR/R (a. u.)",
+            },
             "gate": float(self.current_gate),
         }
+
+    def _save_current_plot_state(self) -> str:
+        plot = self._current_plot_state()
+        if plot is None:
+            return ""
         try:
             # Keep the fingerprint of the loaded data, even if its disk file changed.
             self._plot_state_store.save(self.current_dat_path, self._loaded_source_fingerprint, plot)
@@ -2182,6 +2743,7 @@ class MainWindow(QMainWindow):
         controls = [(self.x_axis_override_combo, "index", self.x_axis_override_combo.findData(plot["axis_override"])),
                     (self.cmap_combo, "text", plot["colormap"]),
                     (self.signal_title_combo, "text", plot["annotations"]["signal_title"]),
+                    (self.signal_title_auto_chk, "checked", plot.get("signal_title_auto", False)),
                     (self.fix_annotations_chk, "checked", plot["fix_annotations"])]
         controls.extend((edit, "edit", plot["annotations"][name])
                         for name, edit in self._annotation_edits.items())
@@ -2194,33 +2756,52 @@ class MainWindow(QMainWindow):
         for widget, kind, value in controls:
             with QSignalBlocker(widget):
                 getattr(widget, setters[kind])(value)
+        mode = plot.get("color_scale_mode", "global")
+        mode_index = self.color_scale_combo.findData(mode)
+        with QSignalBlocker(self.color_scale_combo):
+            self.color_scale_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self._color_scale_mode = mode if mode in ("global", "2", "3") else "global"
+        self._color_region_boundaries = [float(value) for value in plot.get("color_region_boundaries", [])]
+        self._sync_region_controls()
         self._annotation_source = self.current_cube.source_path or id(self.current_cube)
         gate_idx = int(np.argmin(np.abs(self.current_cube.gate - plot["gate"])))
         self.current_gate = float(self.current_cube.gate[gate_idx])
         self._sync_gate_controls()
 
-    def _restore_effective_plot_limits(self, plot: dict) -> None:
+    def _restore_effective_plot_limits(self, plot: dict, *, refresh_colors: bool = False) -> None:
         # The spin boxes round to four decimals; preserve the actual displayed view.
         previous_syncing = self._view_syncing
         self._view_syncing = True
         try:
             self._heat_ax.set_xlim(plot["x_limits"])
             self._heat_ax.set_ylim(plot["y_limits"])
-            self._heat_mesh.set_clim(*plot["color_limits"])
-            self._last_valid_color_limits = tuple(plot["color_limits"])
-            style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
+            if refresh_colors or self._color_scale_mode in ("2", "3"):
+                self._update_auto_color_limits_from_visible_view(use_spin_values=True)
+            else:
+                self._heat_mesh.set_clim(*plot["color_limits"])
+                self._last_valid_color_limits = tuple(plot["color_limits"])
+                style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
             self._layout_live_plots()
         finally:
             self._view_syncing = previous_syncing
         self.canvas.draw_idle()
 
     def closeEvent(self, event) -> None:
+        if self._background_jobs.busy:
+            self._close_pending = True
+            self._background_jobs.cancel()
+            self.statusBar().showMessage("Stopping operation before closing…")
+            event.ignore()
+            return
+        self._finish_annotation_edit(render=False)
         notice = self._save_current_plot_state()
         if notice:
             self.statusBar().showMessage(notice)
         super().closeEvent(event)
 
     def _on_x_axis_override_changed(self) -> None:
+        """Synchronous internal axis-change entry point."""
+        self._background_jobs.cancel()
         if self.current_dat_path is None:
             self._refresh_axis_status()
             return
@@ -2237,28 +2818,37 @@ class MainWindow(QMainWindow):
                     self.x_axis_override_combo.findData(self.current_cube.x_override))
             self._show_error(str(exc))
             return
+        self._apply_axis_override(cube, fingerprint, gate)
+
+    def _on_x_axis_override_async(self) -> None:
+        if self.current_dat_path is None:
+            self._refresh_axis_status()
+            return
+        request = LoadRequest(self.current_dat_path, self._selected_x_axis_override(), recall=False)
+        gate = self.current_gate
+        def failed(exc):
+            with QSignalBlocker(self.x_axis_override_combo):
+                self.x_axis_override_combo.setCurrentIndex(
+                    self.x_axis_override_combo.findData(self.current_cube.x_override))
+            self._show_error(str(exc))
+        self._start_background_job(
+            lambda context: prepare_dat(request, context),
+            lambda prepared: self._apply_axis_override(prepared[0], prepared[1], gate),
+            "Updating axis interpretation…", on_error=failed)
+
+    def _apply_axis_override(self, cube, fingerprint, gate) -> None:
+        self._data_generation += 1
+        self._base_cube = cube
         self.current_cube = cube
+        self._processing_original_signal_title = None
+        self._set_processing_controls()
+        self._processing_mode = "original"
         self._loaded_source_fingerprint = fingerprint
         self._annotation_source = None
         self._last_valid_color_limits = None
-        self.peak_indices = np.asarray([], dtype=int)
-        self._peak_gate_idx = None
-        self.peak_label_lookup = {}
-        self.batch_peak_map = {}
-        self.batch_peak_coords = None
-        self.batch_peak_records = []
-        self.fit_result = None
-        self._fit_gate_idx = None
-        self.batch_fit_map = {}
-        self.batch_fit_coords = None
-        self.batch_fit_result_map = {}
-        self._batch_fit_export_rows = []
-        self._has_batch_fit_results = False
+        self._last_valid_region_color_limits = []
+        self._clear_processing_analysis_state()
         self._reset_csv_seed_source()
-        self._cached_d2 = None
-        self._lasso_selected_peak_ids = []
-        self._clear_lasso_selection_visual()
-        self._update_lasso_actions()
         if cube.gate.size:
             gate_idx = int(np.argmin(np.abs(cube.gate - float(gate))))
             self.current_gate = float(cube.gate[gate_idx])
@@ -2292,7 +2882,22 @@ class MainWindow(QMainWindow):
             self._last_valid_color_limits = self._ordered_pair(
                 float(self.vmin_spin.value()), float(self.vmax_spin.value())
             )
-        self._plot_cube()
+        if self._heat_ax is None:
+            self._plot_cube()
+            return
+        previous_syncing = self._view_syncing
+        self._view_syncing = True
+        try:
+            self._heat_ax.set_xlim(self._ordered_pair(self.xmin_spin.value(), self.xmax_spin.value()))
+            self._heat_ax.set_ylim(self._ordered_pair(self.ymin_spin.value(), self.ymax_spin.value()))
+            if spin in xy_spins:
+                self._update_spectrum_only()
+                self._schedule_view_layout()
+            else:
+                self._apply_color_limits_to_mesh()
+        finally:
+            self._view_syncing = previous_syncing
+        self.canvas.draw_idle()
 
     def _on_view_lock_toggled(self, lock_box: QCheckBox, checked: bool) -> None:
         if checked or self.current_cube is None:
@@ -2332,9 +2937,157 @@ class MainWindow(QMainWindow):
                 spin.setValue(float(value))
                 spin.blockSignals(False)
             self._update_auto_color_limits_from_visible_view(ylim=(ymin, ymax))
-            self._layout_live_plots()
         finally:
             self._view_syncing = False
+
+    def _on_color_scale_changed(self) -> None:
+        self._color_scale_mode = str(self.color_scale_combo.currentData() or "global")
+        self._apply_fixed_region_edges()
+        self._sync_region_controls()
+        self._remember_fixed_regions()
+        if self.current_cube is not None:
+            self._plot_cube()
+
+    def _requested_region_count(self) -> int:
+        if self._color_scale_mode not in ("2", "3"):
+            return 1
+        return int(self._color_scale_mode)
+
+    def _region_layout(self) -> tuple[np.ndarray, list[tuple[int, int]], list[float]]:
+        if self.current_cube is None:
+            return np.asarray([], dtype=float), [(0, 0)], []
+        energy = np.asarray(self.current_cube.energy, dtype=float).ravel()
+        if energy.size == 0:
+            return np.asarray([], dtype=float), [(0, 0)], []
+        edges = self._axis_edges(energy)
+        requested = self._requested_region_count()
+        count = min(requested, energy.size)
+        if count <= 1:
+            return edges, [(0, energy.size)], []
+
+        internal = np.arange(1, energy.size, dtype=int)
+        values = list(self._color_region_boundaries)
+        if len(values) != count - 1:
+            values = list(np.linspace(edges[0], edges[-1], count + 1)[1:-1])
+        indices: list[int] = []
+        for value in values[:count - 1]:
+            indices.append(int(np.argmin(np.abs(edges[internal] - float(value))) + 1))
+        # Make each region contain at least one data column.
+        indices = [max(1, min(energy.size - 1, index)) for index in indices]
+        for idx in range(len(indices)):
+            low = idx + 1
+            high = energy.size - (len(indices) - idx - 1) - 1
+            indices[idx] = max(low, min(high, indices[idx]))
+        for idx in range(1, len(indices)):
+            indices[idx] = max(indices[idx], indices[idx - 1] + 1)
+        boundaries = [float(edges[index]) for index in indices]
+        slices = []
+        starts = [0, *indices]
+        ends = [*indices, energy.size]
+        for start, end in zip(starts, ends):
+            if end > start:
+                slices.append((start, end))
+        return edges, slices, boundaries
+
+    def _sync_region_controls(self) -> None:
+        if not hasattr(self, "region_boundary_spins"):
+            return
+        regional = self._color_scale_mode in ("2", "3")
+        for spin in (self.vmin_spin, self.vmax_spin):
+            spin.setEnabled(not regional)
+        for lock in (self.vmin_lock, self.vmax_lock):
+            lock.setEnabled(not regional)
+        edges, slices, boundaries = self._region_layout()
+        count = len(slices)
+        if regional and len(boundaries) != count - 1:
+            self._color_region_boundaries = boundaries
+        elif not regional:
+            self._color_region_boundaries = []
+        else:
+            self._color_region_boundaries = boundaries
+        for idx, spin in enumerate(self.region_boundary_spins):
+            visible = regional and idx < count - 1
+            spin.setVisible(visible)
+            if visible:
+                with QSignalBlocker(spin):
+                    spin.setRange(float(edges[1]), float(edges[-2]))
+                    spin.setValue(float(self._color_region_boundaries[idx]))
+        if hasattr(self, "_region_edges_row"):
+            self._region_edges_row.setVisible(regional and count > 1)
+
+    def _on_color_region_boundary_changed(self, boundary_idx: int, value: float) -> None:
+        if self.current_cube is None or self._color_scale_mode not in ("2", "3"):
+            return
+        edges, slices, boundaries = self._region_layout()
+        if boundary_idx >= len(slices) - 1:
+            return
+        requested = list(boundaries)
+        requested[boundary_idx] = float(value)
+        internal = np.arange(1, len(edges) - 1, dtype=int)
+        indices = [int(np.argmin(np.abs(edges[internal] - item)) + 1) for item in requested]
+        for idx in range(len(indices)):
+            indices[idx] = max(idx + 1, min(len(edges) - 2 - (len(indices) - idx - 1), indices[idx]))
+        for idx in range(1, len(indices)):
+            indices[idx] = max(indices[idx], indices[idx - 1] + 1)
+        self._color_region_boundaries = [float(edges[index]) for index in indices]
+        self._sync_region_controls()
+        self._remember_fixed_region_edges()
+        self._plot_cube()
+
+    def _visible_color_values_by_region(
+        self,
+        *,
+        use_spin_values: bool = False,
+        xlim: tuple[float, float] | None = None,
+        ylim: tuple[float, float] | None = None,
+    ) -> list[np.ndarray]:
+        if self.current_cube is None:
+            return [np.asarray([], dtype=float)]
+        cube = self.current_cube
+        if xlim is None and (use_spin_values or self._heat_ax is None):
+            xlim = (float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+        elif xlim is None:
+            xlim = self._heat_ax.get_xlim()
+        if ylim is None and (use_spin_values or self._heat_ax is None):
+            ylim = (float(self.ymin_spin.value()), float(self.ymax_spin.value()))
+        elif ylim is None:
+            ylim = self._heat_ax.get_ylim()
+        xmin, xmax = self._ordered_pair(*xlim)
+        ymin, ymax = self._ordered_pair(*ylim)
+        xmask = np.isfinite(cube.energy) & (cube.energy >= xmin) & (cube.energy <= xmax)
+        ymask = np.isfinite(cube.gate) & (cube.gate >= ymin) & (cube.gate <= ymax)
+        _, slices, _ = self._region_layout()
+        if not np.any(xmask) or not np.any(ymask):
+            return [np.asarray([], dtype=float) for _ in slices]
+        out = []
+        for start, end in slices:
+            columns = np.flatnonzero(xmask)
+            columns = columns[(columns >= start) & (columns < end)]
+            if columns.size == 0:
+                out.append(np.asarray([], dtype=float))
+                continue
+            values = np.asarray(cube.z[np.ix_(np.flatnonzero(ymask), columns)], dtype=float)
+            out.append(values[np.isfinite(values)])
+        return out
+
+    def _regional_color_ranges(self, values: list[np.ndarray]) -> list[tuple[float, float]]:
+        previous = self._last_valid_region_color_limits
+        ranges: list[tuple[float, float]] = []
+        for index, region_values in enumerate(values):
+            if region_values.size:
+                low, high = np.nanpercentile(region_values, [0.5, 99.5])
+                low, high = float(low), float(high)
+            elif index < len(previous):
+                low, high = previous[index]
+            else:
+                low, high = float(self.vmin_spin.value()), float(self.vmax_spin.value())
+            if low == high:
+                pad = self._color_gap(low)
+                low, high = low - pad, high + pad
+            elif low > high:
+                low, high = high, low
+            ranges.append((low, high))
+        return ranges or [(float(self.vmin_spin.value()), float(self.vmax_spin.value()))]
 
     def _visible_color_values(
         self,
@@ -2374,6 +3127,13 @@ class MainWindow(QMainWindow):
         xlim: tuple[float, float] | None = None,
         ylim: tuple[float, float] | None = None,
     ) -> None:
+        if self._color_scale_mode in ("2", "3"):
+            values_by_region = self._visible_color_values_by_region(
+                use_spin_values=use_spin_values, xlim=xlim, ylim=ylim)
+            self._last_valid_region_color_limits = self._regional_color_ranges(values_by_region)
+            self._last_valid_color_limits = self._last_valid_region_color_limits[0]
+            self._apply_color_limits_to_mesh()
+            return
         values = self._visible_color_values(use_spin_values=use_spin_values, xlim=xlim, ylim=ylim)
         low_locked = self._view_lock_controls.get(self.vmin_spin)
         high_locked = self._view_lock_controls.get(self.vmax_spin)
@@ -2419,7 +3179,20 @@ class MainWindow(QMainWindow):
         self._apply_color_limits_to_mesh()
 
     def _apply_color_limits_to_mesh(self) -> None:
-        if self._heat_mesh is None:
+        if not self._heat_meshes:
+            return
+        if self._color_scale_mode in ("2", "3"):
+            ranges = self._last_valid_region_color_limits
+            for mesh, (vmin, vmax) in zip(self._heat_meshes, ranges):
+                mesh.set_clim(vmin=float(vmin), vmax=float(vmax))
+            for index, (colorbar, mesh) in enumerate(zip(self._heat_colorbars, self._heat_meshes)):
+                colorbar.update_normal(mesh)
+                region_names = ("Left", "Right") if len(self._heat_colorbars) == 2 else ("Left", "Middle", "Right")
+                style_heatmap_colorbar(
+                    colorbar, region_names[index], font_size=REGIONAL_COLORBAR_FONT_SIZE,
+                )
+            self._schedule_view_layout()
+            self.canvas.draw_idle()
             return
         vmin, vmax = self._ordered_pair(
             float(self.vmin_spin.value()), float(self.vmax_spin.value())
@@ -2625,6 +3398,7 @@ class MainWindow(QMainWindow):
                 self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
 
     def _on_find_peaks(self) -> None:
+        self._invalidate_analysis_jobs()
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
             return
@@ -2727,76 +3501,95 @@ class MainWindow(QMainWindow):
         d2_max_dips = int(self.d2_max_dips_spin.value())
         d2_tgt = int(self.d2_target_spin.value())
 
-        peak_map: dict[int, np.ndarray] = {}
-        batch_kind_lookup: dict[tuple[int, int], bool] = {}
-        ok_count = 0
-        peak_total = 0
+        key = self._analysis_job_key()
+        smooth = self.peak_smooth_chk.isChecked()
+        smooth_window = int(self.peak_smooth_win_spin.value())
+        cube = replace(cube, energy=cube.energy.copy(), gate=cube.gate.copy(), z=cube.z.copy())
 
-        for gi, gate in enumerate(cube.gate):
-            y = np.asarray(cube.z[gi, :], dtype=float)
-            yr = np.asarray(y[mask], dtype=float)
+        def work(context):
+            peak_map: dict[int, np.ndarray] = {}
+            batch_kind_lookup: dict[tuple[int, int], bool] = {}
+            ok_count = 0
+            peak_total = 0
 
-            try:
-                if use_d2:
-                    idx_local, kinds_local, _ = find_peaks_second_derivative(
-                        xr, yr,
-                        mode=peak_mode,  # type: ignore[arg-type]
-                        sg_window=sg_win, sg_polyorder=sg_poly,
-                        d2_prom_frac=d2_prom, d2_distance=d2_dist,
-                        d2_sep_ev=d2_sep, max_peaks=d2_max, max_dips=d2_max_dips,
-                        target_count=d2_tgt,
-                    )
-                else:
-                    if self.peak_smooth_chk.isChecked():
-                        win = _clamp_sg_window(yr.size, int(self.peak_smooth_win_spin.value()))
-                        if win >= 3 and yr.size > win:
-                            yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
-                    idx_local, kinds_local = find_peak_indices(
-                        xr, yr,
-                        mode=peak_mode,  # type: ignore[arg-type]
-                        prominence_frac=prom, min_distance=min_dist,
-                        max_peaks=max_peaks_o, max_dips=max_dips_o,
-                    )
-            except Exception:
-                continue
+            for gi, gate in enumerate(cube.gate):
+                context.report(f"Batch peak finding… gate {gi+1}/{cube.gate.size}")
+                y = np.asarray(cube.z[gi, :], dtype=float)
+                yr = np.asarray(y[mask], dtype=float)
 
-            if idx_local.size == 0:
-                continue
-            ok_count += 1
-            peak_total += int(idx_local.size)
-            full_idx = np.asarray(mask_idx[idx_local], dtype=int)
-            peak_map[gi] = full_idx
-            for fi, ki in zip(full_idx, kinds_local):
-                batch_kind_lookup[(gi, int(fi))] = bool(ki)
+                context.check_cancelled()
+                try:
+                    if use_d2:
+                        idx_local, kinds_local, _ = find_peaks_second_derivative(
+                            xr, yr,
+                            mode=peak_mode,  # type: ignore[arg-type]
+                            sg_window=sg_win, sg_polyorder=sg_poly,
+                            d2_prom_frac=d2_prom, d2_distance=d2_dist,
+                            d2_sep_ev=d2_sep, max_peaks=d2_max, max_dips=d2_max_dips,
+                            target_count=d2_tgt,
+                        )
+                    else:
+                        if smooth:
+                            win = _clamp_sg_window(yr.size, smooth_window)
+                            if win >= 3 and yr.size > win:
+                                yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
+                        idx_local, kinds_local = find_peak_indices(
+                            xr, yr,
+                            mode=peak_mode,  # type: ignore[arg-type]
+                            prominence_frac=prom, min_distance=min_dist,
+                            max_peaks=max_peaks_o, max_dips=max_dips_o,
+                        )
+                except CancelledError:
+                    raise
+                except Exception:
+                    continue
 
-            if gi % 25 == 0:
-                self.statusBar().showMessage(f"Batch peak finding… gate {gi+1}/{cube.gate.size}")
-                QApplication.processEvents()
+                context.check_cancelled()
+                if idx_local.size == 0:
+                    continue
+                ok_count += 1
+                peak_total += int(idx_local.size)
+                full_idx = np.asarray(mask_idx[idx_local], dtype=int)
+                peak_map[gi] = full_idx
+                for fi, ki in zip(full_idx, kinds_local):
+                    batch_kind_lookup[(gi, int(fi))] = bool(ki)
 
-        self.batch_peak_map = peak_map
-        self.batch_peak_kind_lookup = batch_kind_lookup
-        current_gate_idx = self._current_gate_index()
-        self.peak_indices = np.asarray(peak_map.get(current_gate_idx, []), dtype=int)
-        self.peak_kind_lookup = {
-            int(ei): batch_kind_lookup.get((current_gate_idx, int(ei)), True)
-            for ei in self.peak_indices
-        }
-        self._peak_gate_idx = current_gate_idx
-        self._lasso_selected_peak_ids = []
-        self._clear_lasso_selection_visual()
-        self._sync_batch_peak_coords()
-        self._update_spectrum_only()
-        gate_used, y = self._nearest_spectrum(self.current_gate)
-        self._update_peak_text(gate_used, x, y, title_prefix="UI-detected")
-        mode_str = "2nd-derivative" if use_d2 else "original-spectrum"
-        self.statusBar().showMessage(f"Batch peaks ({mode_str}): {ok_count} gates, {peak_total} peaks total.")
-        self.analysis_text.setPlainText(
-            f"Batch peak finding ({mode_str}).\n"
-            f"Gates processed: {cube.gate.size}\n"
-            f"Gates with peaks: {ok_count}\n"
-            f"Total peaks: {peak_total}\n"
-            "Shown as cyan circles on heatmap."
-        )
+
+            context.check_cancelled()
+            return peak_map, batch_kind_lookup, ok_count, peak_total
+
+        def apply(payload):
+            if key != self._analysis_job_key():
+                self.statusBar().showMessage("Batch peaks discarded because analysis inputs changed.")
+                return
+            peak_map, batch_kind_lookup, ok_count, peak_total = payload
+            self.batch_peak_map = peak_map
+            self.batch_peak_kind_lookup = batch_kind_lookup
+            current_gate_idx = self._current_gate_index()
+            self.peak_indices = np.asarray(peak_map.get(current_gate_idx, []), dtype=int)
+            self.peak_kind_lookup = {
+                int(ei): batch_kind_lookup.get((current_gate_idx, int(ei)), True)
+                for ei in self.peak_indices
+            }
+            self._peak_gate_idx = current_gate_idx
+            self._lasso_selected_peak_ids = []
+            self._clear_lasso_selection_visual()
+            self._sync_batch_peak_coords()
+            self._update_spectrum_only()
+            gate_used, y = self._nearest_spectrum(self.current_gate)
+            self._update_peak_text(gate_used, x, y, title_prefix="UI-detected")
+            mode_str = "2nd-derivative" if use_d2 else "original-spectrum"
+            self.statusBar().showMessage(f"Batch peaks ({mode_str}): {ok_count} gates, {peak_total} peaks total.")
+            self.analysis_text.setPlainText(
+                f"Batch peak finding ({mode_str}).\n"
+                f"Gates processed: {cube.gate.size}\n"
+                f"Gates with peaks: {ok_count}\n"
+                f"Total peaks: {peak_total}\n"
+                "Shown as cyan circles on heatmap."
+            )
+
+        self._start_background_job(work, apply, "Batch peak finding…",
+                                   on_error=lambda exc: self._analysis_job_error(key, exc))
 
     def _on_save_peaks_csv(self) -> None:
         if self.current_cube is None:
@@ -2857,6 +3650,7 @@ class MainWindow(QMainWindow):
         n = int(self.peak_delete_spin.value())
         if n < 1 or n > int(self.peak_indices.size):
             return
+        self._invalidate_analysis_jobs()
         idx_to_remove = int(self.peak_indices[n - 1])
         self.peak_indices = np.asarray(self.peak_indices[self.peak_indices != idx_to_remove], dtype=int)
         self.peak_label_lookup.pop((self._current_gate_index(), idx_to_remove), None)
@@ -2868,6 +3662,7 @@ class MainWindow(QMainWindow):
         self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
 
     def _on_clear_peaks(self) -> None:
+        self._invalidate_analysis_jobs()
         if self.current_cube is None:
             return
         gate_idx = self._current_gate_index()
@@ -2884,6 +3679,7 @@ class MainWindow(QMainWindow):
         self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
 
     def _on_clear_batch_peaks(self) -> None:
+        self._invalidate_analysis_jobs()
         self.batch_peak_map = {}
         self.batch_peak_kind_lookup = {}
         self.peak_label_lookup = {}
@@ -2963,6 +3759,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Lasso: 0 of {n_total} heatmap peaks fell inside the selection.")
 
     def _on_delete_lasso_selection(self) -> None:
+        self._invalidate_analysis_jobs()
         if not self._lasso_selected_peak_ids:
             return
         delete_map: dict[int, set[int]] = {}
@@ -3003,6 +3800,38 @@ class MainWindow(QMainWindow):
     #  Lorentz fit logic
     # =========================================================================
 
+    def _invalidate_analysis_jobs(self) -> None:
+        self._analysis_revision = getattr(self, "_analysis_revision", 0) + 1
+
+    def _analysis_job_key(self) -> tuple:
+        # Read only on the GUI thread. Gate navigation deliberately is not part
+        # of the key: completed fits belong to their captured gate.
+        controls = (
+            self.fit_smooth_chk.isChecked(), self.fit_smooth_win_spin.value(),
+            self.fit_model_combo.currentText(), self.lw_min_spin.value(),
+            self.lw_max_spin.value(), self.peak_move_limit_spin.value(), self.maxfev_spin.value(),
+            self._fit_range_bounds(), self._peak_search_bounds(), self._peak_mode(),
+            self._seeds_from_csv_radio.isChecked(), self._d2_radio.isChecked(),
+            self.prom_spin.value(), self.distance_spin.value(), self.max_peaks_spin.value(),
+            self.max_dips_spin.value(), self.peak_smooth_chk.isChecked(),
+            self.peak_smooth_win_spin.value(), self.d2_sg_win_spin.value(),
+            self.d2_sg_poly_spin.value(), self.d2_prom_spin.value(), self.d2_dist_spin.value(),
+            self.d2_sep_spin.value(), self.d2_max_peaks_spin.value(),
+            self.d2_max_dips_spin.value(), self.d2_target_spin.value(),
+        )
+        seeds = (
+            tuple((gi, tuple(np.asarray(indices, dtype=int))) for gi, indices in sorted(self.batch_peak_map.items())),
+            tuple((gi, tuple(values)) for gi, values in sorted((self._csv_seeds_map or {}).items())),
+            tuple((gi, int(ei), self.batch_peak_kind_lookup.get((gi, int(ei)), True))
+                  for gi, indices in sorted(self.batch_peak_map.items()) for ei in indices),
+        )
+        return (id(self.current_cube), self._data_generation,
+                getattr(self, "_analysis_revision", 0), controls, seeds)
+
+    def _analysis_job_error(self, key: tuple, error: Exception, prefix: str = "") -> None:
+        if key == self._analysis_job_key():
+            self._show_error(f"{prefix}{error}")
+
     def _on_fit(self) -> None:
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
@@ -3042,11 +3871,18 @@ class MainWindow(QMainWindow):
                 self.peak_kind_lookup.get(int(np.argmin(np.abs(x_arr - c))), True)
                 for c in centers_in
             ], dtype=bool)
-        try:
-            res = fit_multi_peak(
+        key = self._analysis_job_key()
+        gate_idx = self._current_gate_index()
+        model = str(self.fit_model_combo.currentText())
+        energy_label = self.current_cube.energy_label
+        xr, yr, centers_in = xr.copy(), yr.copy(), centers_in.copy()
+
+        def work(context):
+            context.check_cancelled()
+            result = fit_multi_peak(
                 xr, yr,
                 centers_hint=centers_in,
-                model=self.fit_model_combo.currentText(),  # type: ignore[arg-type]
+                model=model,  # type: ignore[arg-type]
                 mode=fit_mode,  # type: ignore[arg-type]
                 linewidth_min=lw_min,
                 linewidth_max=lw_max,
@@ -3054,33 +3890,44 @@ class MainWindow(QMainWindow):
                 maxfev=maxfev,
                 kinds=fit_kinds,
             )
-        except Exception as exc:
-            self._show_error(f"Fit failed: {exc}")
-            return
+            context.check_cancelled()
+            return result
 
-        self.fit_result = res
-        self._fit_gate_idx = self._current_gate_index()
-        self.batch_fit_map[self._fit_gate_idx] = np.asarray(res.centers, dtype=float)
-        self.batch_fit_result_map[self._fit_gate_idx] = res
-        fit_row = self._fit_result_to_export_row(
-            float(gate_used), res.model, self.current_cube.energy_label, res, status="ok"
-        )
-        self._upsert_fit_export_row(fit_row)
-        self._refresh_export_actions()
-        self._sync_batch_fit_coords()
-        self.current_gate = gate_used
-        self._update_spectrum_only()
-        lines = [
-            f"{res.model} fit @ gate {gate_used:.6g}",
-            f"Baseline: {res.baseline:.6g}",
-            f"R^2: {res.r_squared:.6g}",
-            f"RMSE: {res.rmse:.6g}",
-        ]
-        for i in range(res.centers.size):
-            lines.append(f"  {i+1}. cen={res.centers[i]:.6g}, amp={res.amplitudes[i]:.6g}, wid={res.widths[i]:.6g}")
-        self.analysis_text.setPlainText("\n".join(lines))
+        def apply(res):
+            if key != self._analysis_job_key():
+                self.statusBar().showMessage("Fit discarded because analysis inputs changed.")
+                return
+            self.batch_fit_map[gate_idx] = np.asarray(res.centers, dtype=float)
+            self.batch_fit_result_map[gate_idx] = res
+            fit_row = self._fit_result_to_export_row(
+                float(gate_used), res.model, energy_label, res, status="ok"
+            )
+            self._upsert_fit_export_row(fit_row)
+            self._refresh_export_actions()
+            self._sync_batch_fit_coords()
+            if self._current_gate_index() != gate_idx:
+                self.statusBar().showMessage(f"Fit completed for gate {gate_used:.6g}.")
+                self._update_spectrum_only()
+                return
+            self.fit_result = res
+            self._fit_gate_idx = gate_idx
+            self._update_spectrum_only()
+            lines = [
+                f"{res.model} fit @ gate {gate_used:.6g}",
+                f"Baseline: {res.baseline:.6g}",
+                f"R^2: {res.r_squared:.6g}",
+                f"RMSE: {res.rmse:.6g}",
+            ]
+            for i in range(res.centers.size):
+                lines.append(f"  {i+1}. cen={res.centers[i]:.6g}, amp={res.amplitudes[i]:.6g}, wid={res.widths[i]:.6g}")
+            self.analysis_text.setPlainText("\n".join(lines))
+            self.statusBar().showMessage(f"Fit completed for gate {gate_used:.6g}.")
+
+        self._start_background_job(work, apply, "Fitting current gate…",
+                                   on_error=lambda exc: self._analysis_job_error(key, exc, "Fit failed: "))
 
     def _on_clear_fit(self) -> None:
+        self._invalidate_analysis_jobs()
         self.fit_result = None
         self._fit_gate_idx = None
         self.batch_fit_map = {}
@@ -3125,86 +3972,97 @@ class MainWindow(QMainWindow):
         maxfev = int(self.maxfev_spin.value())
         xlo, xhi = self._fit_range_bounds()
 
-        rows: list[dict[str, str]] = []
-        ok_count = 0
-        fail_count = 0
-        fit_map: dict[int, np.ndarray] = {}
-        fit_result_map: dict[int, FitResult] = {}
+        key = self._analysis_job_key()
+        smooth = self.fit_smooth_chk.isChecked()
+        smooth_window = int(self.fit_smooth_win_spin.value())
+        seeds = tuple(self._get_seeds_for_gate_idx(gi).copy() for gi in range(cube.gate.size))
+        kind_lookup = dict(self.batch_peak_kind_lookup)
+        cube = replace(cube, energy=cube.energy.copy(), gate=cube.gate.copy(), z=cube.z.copy())
 
-        for gi, gate in enumerate(cube.gate):
-            y = np.asarray(cube.z[gi, :], dtype=float)
-            yr = np.asarray(y[mask], dtype=float)
-            if self.fit_smooth_chk.isChecked():
-                win = _clamp_sg_window(yr.size, int(self.fit_smooth_win_spin.value()))
-                if win >= 3 and yr.size > win:
-                    yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
+        def work(context):
+            rows = []
+            ok_count = 0
+            fail_count = 0
+            fit_map: dict[int, np.ndarray] = {}
+            fit_result_map: dict[int, FitResult] = {}
 
-            centers = self._get_seeds_for_gate_idx(gi)
-            centers_in = centers[(centers >= xlo) & (centers <= xhi)] if centers.size else centers
-            if centers_in.size == 0:
-                fail_count += 1
-                rows.append(
-                    self._fit_result_to_export_row(
-                        float(gate), model, cube.energy_label, None, status="no_seeds"
+            for gi, gate in enumerate(cube.gate):
+                context.report(f"Batch fitting… gate {gi+1}/{cube.gate.size}")
+                y = np.asarray(cube.z[gi, :], dtype=float)
+                yr = np.asarray(y[mask], dtype=float)
+                if smooth:
+                    win = _clamp_sg_window(yr.size, smooth_window)
+                    if win >= 3 and yr.size > win:
+                        yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
+
+                centers = seeds[gi]
+                centers_in = centers[(centers >= xlo) & (centers <= xhi)] if centers.size else centers
+                if centers_in.size == 0:
+                    fail_count += 1
+                    rows.append((float(gate), None, "no_seeds"))
+                    continue
+
+                batch_kinds: np.ndarray | None = None
+                if use_kinds:
+                    x_arr = cube.energy
+                    batch_kinds = np.asarray([
+                        kind_lookup.get(
+                            (gi, int(np.argmin(np.abs(x_arr - c)))), True
+                        )
+                        for c in centers_in
+                    ], dtype=bool)
+                context.check_cancelled()
+                try:
+                    res = fit_multi_peak(
+                        xr_base, yr,
+                        centers_hint=centers_in,
+                        model=model,  # type: ignore[arg-type]
+                        mode=peak_mode,  # type: ignore[arg-type]
+                        linewidth_min=lw_min, linewidth_max=lw_max,
+                        peak_move_limit=peak_move, maxfev=maxfev,
+                        kinds=batch_kinds,
                     )
-                )
-                continue
+                except CancelledError:
+                    raise
+                except Exception as exc:
+                    fail_count += 1
+                    rows.append((float(gate), None, f"fit_failed:{exc}"))
+                    continue
 
-            batch_kinds: np.ndarray | None = None
-            if use_kinds and self.current_cube is not None:
-                x_arr = cube.energy
-                batch_kinds = np.asarray([
-                    self.batch_peak_kind_lookup.get(
-                        (gi, int(np.argmin(np.abs(x_arr - c)))), True
-                    )
-                    for c in centers_in
-                ], dtype=bool)
-            try:
-                res = fit_multi_peak(
-                    xr_base, yr,
-                    centers_hint=centers_in,
-                    model=model,  # type: ignore[arg-type]
-                    mode=peak_mode,  # type: ignore[arg-type]
-                    linewidth_min=lw_min, linewidth_max=lw_max,
-                    peak_move_limit=peak_move, maxfev=maxfev,
-                    kinds=batch_kinds,
-                )
-            except Exception as exc:
-                fail_count += 1
-                rows.append(
-                    self._fit_result_to_export_row(
-                        float(gate), model, cube.energy_label, None, status=f"fit_failed:{exc}"
-                    )
-                )
-                continue
+                context.check_cancelled()
+                ok_count += 1
+                fit_map[gi] = np.asarray(res.centers, dtype=float)
+                fit_result_map[gi] = res
+                rows.append((float(gate), res, "ok"))
 
-            ok_count += 1
-            fit_map[gi] = np.asarray(res.centers, dtype=float)
-            fit_result_map[gi] = res
-            rows.append(
-                self._fit_result_to_export_row(float(gate), model, cube.energy_label, res, status="ok")
+            context.check_cancelled()
+            return fit_map, fit_result_map, rows, ok_count, fail_count
+
+        def apply(payload):
+            if key != self._analysis_job_key():
+                self.statusBar().showMessage("Batch fit discarded because analysis inputs changed.")
+                return
+            fit_map, fit_result_map, rows, ok_count, fail_count = payload
+            self.batch_fit_map = fit_map
+            self.batch_fit_result_map = fit_result_map
+            self._batch_fit_export_rows = [self._fit_result_to_export_row(
+                gate, model, cube.energy_label, result, status=status) for gate, result, status in rows]
+            self._has_batch_fit_results = True
+            self._sync_batch_fit_coords()
+            self._refresh_export_actions()
+            if self.current_cube.gate.size:
+                current_gate_idx = self._current_gate_index()
+                self.fit_result = self.batch_fit_result_map.get(current_gate_idx)
+                self._fit_gate_idx = current_gate_idx if self.fit_result is not None else None
+            self.statusBar().showMessage(f"Batch fit done: OK={ok_count}, fail={fail_count}")
+            self.analysis_text.setPlainText(
+                f"Batch fit done.\nGates: {cube.gate.size}  OK: {ok_count}  Failed: {fail_count}\n"
+                "Use 'Export All Results CSV' to save the results."
             )
+            self._update_spectrum_only()
 
-            if gi % 20 == 0:
-                self.statusBar().showMessage(f"Batch fitting… gate {gi+1}/{cube.gate.size}")
-                QApplication.processEvents()
-
-        self.batch_fit_map = fit_map
-        self.batch_fit_result_map = fit_result_map
-        self._batch_fit_export_rows = [dict(row) for row in rows]
-        self._has_batch_fit_results = True
-        self._sync_batch_fit_coords()
-        self._refresh_export_actions()
-        if self.current_cube.gate.size:
-            current_gate_idx = self._current_gate_index()
-            self.fit_result = self.batch_fit_result_map.get(current_gate_idx)
-            self._fit_gate_idx = current_gate_idx if self.fit_result is not None else None
-        self.statusBar().showMessage(f"Batch fit done: OK={ok_count}, fail={fail_count}")
-        self.analysis_text.setPlainText(
-            f"Batch fit done.\nGates: {cube.gate.size}  OK: {ok_count}  Failed: {fail_count}\n"
-            "Use 'Export All Results CSV' to save the results."
-        )
-        self._update_spectrum_only()
+        self._start_background_job(work, apply, "Batch fitting…",
+                                   on_error=lambda exc: self._analysis_job_error(key, exc))
 
     # =========================================================================
     #  CSV seeds loading
@@ -3249,6 +4107,7 @@ class MainWindow(QMainWindow):
                         continue
                     gi = int(np.argmin(np.abs(self.current_cube.gate - gate_v)))
                     seeds_map.setdefault(gi, []).append(peak_e)
+            self._invalidate_analysis_jobs()
             self._csv_seeds_map = seeds_map
             self._csv_seeds_path = str(path)
             self._csv_path_label.setText(path.name)
@@ -3301,7 +4160,7 @@ class MainWindow(QMainWindow):
             self.export_png_btn.setEnabled(
                 self.current_cube is not None
                 and self._heat_ax is not None
-                and self._heat_colorbar is not None
+                and bool(self._heat_colorbars)
             )
 
     def _heatmap_export_metadata(self) -> dict[str, Any]:
@@ -3316,9 +4175,15 @@ class MainWindow(QMainWindow):
             "x_limits": [float(value) for value in self._heat_ax.get_xlim()],
             "y_limits": [float(value) for value in self._heat_ax.get_ylim()],
             "color_limits": [float(value) for value in self._heat_mesh.get_clim()],
+            "color_scale_mode": self._color_scale_mode,
+            "color_region_boundaries": [float(value) for value in self._color_region_boundaries],
+            "color_region_limits": [list(map(float, mesh.get_clim())) for mesh in self._heat_meshes],
             "x_label": self._heat_ax.get_xlabel(),
             "y_label": self._heat_ax.get_ylabel(),
-            "signal_label": self._heat_colorbar.ax.get_xlabel(),
+            "signal_label": (
+                self._heat_signal_label.get_text() if self._heat_signal_label is not None
+                else self._heat_colorbars[-1].ax.get_xlabel().split(" · ", 1)[-1]
+            ),
             "colormap": self._heat_mesh.get_cmap().name,
             "axis_original_type": cube.x_original_type,
             "axis_original_label": cube.x_original_label,
@@ -3327,7 +4192,12 @@ class MainWindow(QMainWindow):
             "axis_detection_note": cube.x_detection_note,
             "axis_is_ambiguous": cube.x_is_ambiguous,
             "photon_energy_note": cube.photon_energy_note,
-            "processing": "raw",
+            "processing": (
+                "energy_second_derivative"
+                if self._processing_mode == "energy_second_derivative" else "raw"
+            ),
+            "processing_smooth": bool(self._processing_smooth),
+            "processing_window_length": int(self._processing_window_length),
             "plot_title": self._heat_ax.get_title(),
         }
 
@@ -3539,6 +4409,7 @@ class MainWindow(QMainWindow):
                         if self.fix_annotations_chk.isChecked() else "")
                 self._set_title_text(text)
         if source == self._annotation_source:
+            self._refresh_auto_signal_title()
             return
         self._annotation_source = source
         match = re.fullmatch(r"(.*?)\s*\(([^()]*)\)\s*", cube.gate_label)
@@ -3552,26 +4423,71 @@ class MainWindow(QMainWindow):
             edit.blockSignals(True)
             edit.setText(text)
             edit.blockSignals(False)
+        with QSignalBlocker(self.signal_title_auto_chk):
+            self.signal_title_auto_chk.setChecked(self._annotation_settings.value(
+                "plot_annotations/signal_auto",
+                not self._annotation_settings.contains("plot_annotations/signal_title"), type=bool)
+                if self.fix_annotations_chk.isChecked() else True)
+        if not self.signal_title_auto_chk.isChecked():
+            with QSignalBlocker(self.signal_title_combo):
+                self.signal_title_combo.setCurrentText(self._annotation_settings.value(
+                    "plot_annotations/signal_title", self.signal_title_combo.currentText(), type=str))
+        self._refresh_auto_signal_title()
+
+    def _refresh_auto_signal_title(self) -> None:
+        if not self.signal_title_auto_chk.isChecked():
+            self.signal_title_combo.setToolTip("Manual signal title. Enable Auto to infer from signal metadata or filename.")
+            return
+        cube = self._base_cube or self.current_cube
+        kind = cube.signal_kind if cube is not None else "unknown"
+        if kind == "unknown" and cube is not None:
+            kind = infer_signal_kind(cube.source_path)
+        if self._processing_mode == "energy_second_derivative":
+            kind = "energy_second_derivative"
         with QSignalBlocker(self.signal_title_combo):
-            self.signal_title_combo.setCurrentText(
-                self._annotation_settings.value("plot_annotations/signal_title", "ΔR/R (a. u.)", type=str)
-                if self.fix_annotations_chk.isChecked() else "ΔR/R (a. u.)")
+            self.signal_title_combo.setCurrentText(DERIVATIVE_LABEL if kind == "energy_second_derivative" else RAW_LABEL)
+        self.signal_title_combo.setToolTip(
+            "Signal unrecognized; default label ΔR/R. Edit to set a manual title."
+            if kind == "unknown" else "Automatic signal title from explicit metadata, filename, or applied processing.")
+
+    def _on_signal_auto_toggled(self, checked: bool) -> None:
+        if self.fix_annotations_chk.isChecked():
+            self._annotation_settings.setValue("plot_annotations/signal_auto", checked)
+            self._sync_annotation_settings()
+        self._refresh_auto_signal_title()
+        self._update_plot_annotations()
 
     def _save_plot_annotation(self, field: str, text: str) -> None:
+        if field == "signal_title":
+            # Avoid the auto-toggle handler doing a synchronous layout while typing.
+            with QSignalBlocker(self.signal_title_auto_chk):
+                self.signal_title_auto_chk.setChecked(False)
+            if self.fix_annotations_chk.isChecked():
+                self._annotation_settings.setValue("plot_annotations/signal_auto", False)
         if field == "plot_title":
             self._title_settings["manual_override"] = text
             if self._title_settings["mode"] == "template":
                 self.title_template_status.setText("Manual override for this DAT; Apply template to regenerate.")
-                self._update_plot_annotations()
-                return
-        if self.fix_annotations_chk.isChecked():
+        if self.fix_annotations_chk.isChecked() and not (
+                field == "plot_title" and self._title_settings["mode"] == "template"):
             self._annotation_settings.setValue(f"plot_annotations/{field}", text)
-            self._sync_annotation_settings()
-        self._update_plot_annotations()
+        # Keep export and saved state current, but measure/layout the figure only
+        # once typing pauses. Regional layout otherwise draws three times per key.
+        self._update_plot_annotations(layout=False)
+        self._annotation_edit_timer.start()
+
+    def _finish_annotation_edit(self, *, render: bool = True) -> None:
+        if not self._annotation_edit_timer.isActive() and not render:
+            return
+        self._annotation_edit_timer.stop()
+        self._sync_annotation_settings()
+        if render:
+            self._update_plot_annotations()
 
     def _on_fix_annotations_toggled(self, checked: bool) -> None:
         self._annotation_settings.setValue("plot_annotations/fixed", checked)
         if checked:
+            self._annotation_settings.setValue("plot_annotations/signal_auto", self.signal_title_auto_chk.isChecked())
             for field, edit in self._annotation_edits.items():
                 if field == "plot_title" and self._title_settings["mode"] == "template":
                     continue
@@ -3585,42 +4501,106 @@ class MainWindow(QMainWindow):
         if self._annotation_settings.status() != QSettings.NoError:
             self.statusBar().showMessage("Could not save plot annotations for the next session.")
 
-    def _update_plot_annotations(self) -> None:
+    def _update_plot_annotations(self, *, layout: bool = True) -> None:
         if self._heat_ax is None:
             return
         self._heat_ax.set_title(self.plot_title_edit.text(), fontsize=PLOT_FONT_SIZE, parse_math=False)
         name, unit = self.y_axis_name_edit.text(), self.y_axis_unit_edit.text()
         self._heat_ax.set_ylabel(f"{name} ({unit})" if unit else name, fontsize=PLOT_FONT_SIZE, parse_math=False)
-        if self._heat_colorbar is not None:
-            style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
-        self._layout_live_plots()
-        self.canvas.draw_idle()
+        for index, colorbar in enumerate(self._heat_colorbars):
+            if len(self._heat_colorbars) > 1:
+                region_names = ("Left", "Right") if len(self._heat_colorbars) == 2 else ("Left", "Middle", "Right")
+                style_heatmap_colorbar(
+                    colorbar, region_names[index], font_size=REGIONAL_COLORBAR_FONT_SIZE,
+                )
+            else:
+                style_heatmap_colorbar(colorbar, self.signal_title_combo.currentText())
+        if self._heat_signal_label is not None:
+            self._heat_signal_label.set_text(self.signal_title_combo.currentText())
+        if layout:
+            self._layout_live_plots()
+            self.canvas.draw_idle()
+
+    def _schedule_view_layout(self) -> None:
+        # Color values update immediately; renderer-based label measurements can
+        # wait until a burst of pan/zoom events has settled.
+        if not hasattr(self, "_view_layout_timer"):
+            self._view_layout_timer = QTimer(self)
+            self._view_layout_timer.setSingleShot(True)
+            self._view_layout_timer.timeout.connect(lambda: self._layout_live_plots())
+            self._view_layout_timer.timeout.connect(self.canvas.draw_idle)
+        self._view_layout_timer.start(40)
 
     def _layout_live_plots(self, _event=None) -> None:
-        if self._heat_ax is None or self._heat_colorbar is None:
+        if hasattr(self, "_view_layout_timer"):
+            self._view_layout_timer.stop()
+        if self._heat_ax is None or not self._heat_colorbars:
             return
         width, height = self.figure.get_size_inches()
-        plot_height = min((width - 1.35) * 3 / 4, height * 0.51, height * 0.64 - 0.9)
+        bars = self._heat_colorbars
+        regional = len(bars) > 1
+        header_reserve = 0.58 if regional else 0.9
+        plot_height = min((width - 1.35) * 3 / 4, height * 0.51, height * 0.64 - header_reserve)
         plot_width = plot_height * 4 / 3
         left = (width - plot_width) / 2
         bottom = height * 0.36
         self._heat_ax.set_position([left / width, bottom / height, plot_width / width, plot_height / height])
-        bar_width = min(1.1, plot_width * 0.48)
-        self._heat_colorbar.ax.set_position([
-            (left + plot_width - bar_width) / width, (bottom + plot_height + 0.04) / height,
-            bar_width / width, 0.07 / height,
-        ])
+        bar_gap = REGIONAL_COLORBAR_GAP if regional else 0.0
+        if regional:
+            bar_width = min(
+                REGIONAL_COLORBAR_WIDTH,
+                max(0.25, (plot_width - bar_gap * (len(bars) - 1)) / len(bars)),
+            )
+        else:
+            bar_width = min(1.1, plot_width * 0.48)
+        strip_width = len(bars) * bar_width + max(0, len(bars) - 1) * bar_gap
+        bar_left = left + plot_width - strip_width
+        region_names = ("Left", "Right") if len(bars) == 2 else ("Left", "Middle", "Right")
+        for index, colorbar in enumerate(bars):
+            colorbar.ax.set_position([
+                (bar_left + index * (bar_width + bar_gap)) / width,
+                (bottom + plot_height + 0.04) / height,
+                bar_width / width,
+                (REGIONAL_COLORBAR_HEIGHT if regional else 0.07) / height,
+            ])
+            if regional:
+                style_heatmap_colorbar(
+                    colorbar, region_names[index], font_size=REGIONAL_COLORBAR_FONT_SIZE,
+                )
+                colorbar.formatter = FuncFormatter(_cb_fmt_regional)
+                colorbar.update_ticks()
+        if regional:
+            signal_label = self.signal_title_combo.currentText()
+            if self._heat_signal_label is None:
+                self._heat_signal_label = self.figure.text(
+                    0.0, 0.0, signal_label, ha="right", va="bottom",
+                    fontsize=REGIONAL_COLORBAR_FONT_SIZE, gid="heatmap_signal_label",
+                )
+            self._heat_signal_label.set_text(signal_label)
+            self._heat_signal_label.set_fontsize(REGIONAL_COLORBAR_FONT_SIZE)
+            self._heat_signal_label.set_position(
+                ((bar_left - 0.04) / width,
+                 (bottom + plot_height + 0.04 + REGIONAL_COLORBAR_HEIGHT / 2) / height)
+            )
+            self._heat_signal_label.set_horizontalalignment("right")
+            self._heat_signal_label.set_verticalalignment("center")
+        elif self._heat_signal_label is not None:
+            self._heat_signal_label.remove()
+            self._heat_signal_label = None
         self._heat_ax.set_title(self.plot_title_edit.text(), fontsize=PLOT_FONT_SIZE,
                                 parse_math=False, y=1, pad=0)
-        position_heatmap_title(self._heat_ax, self._heat_colorbar.ax, self._heat_ax.title)
+        position_heatmap_title(self._heat_ax, bars[-1].ax, self._heat_ax.title)
         # Reserve space for the heatmap X label and the 12 pt spectrum title.
         spectrum_height = min(height * 0.17, bottom - 0.55 - 0.80)
         self._spec_ax.set_position([
             0.75 / width, 0.55 / height, (width - 1.05) / width, spectrum_height / height,
         ])
+        if regional:
+            _fit_regional_tick_labels(self.figure, [bar.ax for bar in bars], render=False)
+            position_regional_header(self._heat_ax, [bar.ax for bar in bars], self._heat_ax.title, self._heat_signal_label, render=False)
 
     def _on_export_png(self) -> None:
-        if self.current_cube is None or self._heat_ax is None or self._heat_colorbar is None:
+        if self.current_cube is None or self._heat_ax is None or not self._heat_colorbars:
             self._show_error("Load a DAT file first.")
             return
         try:
@@ -3633,7 +4613,7 @@ class MainWindow(QMainWindow):
             saved_path = export_figure_png(
                 self.figure,
                 out_path,
-                selected_axes=(self._heat_ax, self._heat_colorbar.ax),
+                selected_axes=(self._heat_ax, *[bar.ax for bar in self._heat_colorbars]),
                 metadata={"SpectraAnalyzer": json.dumps(self._heatmap_export_metadata(), ensure_ascii=False, sort_keys=True)},
             )
         except ValueError as exc:
@@ -3788,7 +4768,7 @@ class MainWindow(QMainWindow):
         path = Path(urls[0].toLocalFile())
         ext = path.suffix.lower()
         if ext == ".dat":
-            self._load_dat_file_direct(path)
+            self._load_dat_file_async(path)
         elif ext == ".csv":
             # Route to seeds loader (works for both tabs' "save peaks" format and seeds format)
             self._load_seeds_csv_file(path)
@@ -3802,12 +4782,16 @@ class MainWindow(QMainWindow):
     # =========================================================================
 
     def _plot_cube(self) -> None:
+        self._finish_annotation_edit(render=False)
         if self.current_cube is None:
             return
         cube = self.current_cube
         self._view_callbacks_ready = False
         self._heat_mesh = None
         self._heat_colorbar = None
+        self._heat_meshes = []
+        self._heat_colorbars = []
+        self._heat_signal_label = None
 
         # Disconnect lasso before clearing axes
         self._disconnect_lasso_selector()
@@ -3830,7 +4814,6 @@ class MainWindow(QMainWindow):
         self.figure.clear()
         self._initialize_plot_annotations()
         self._heat_ax = self.figure.add_axes([0.15, 0.4, 0.65, 0.45])
-        cax = self.figure.add_axes([0.65, 0.88, 0.15, 0.01])
         self._spec_ax = self.figure.add_axes([0.15, 0.1, 0.75, 0.17], sharex=self._heat_ax)
         self._heat_peak_artists = []
         self._heat_peak_texts = []
@@ -3839,18 +4822,40 @@ class MainWindow(QMainWindow):
         e = cube.energy
         g = cube.gate
         z = cube.z
-        vmin, vmax = self._ordered_pair(float(self.vmin_spin.value()), float(self.vmax_spin.value()))
-        im = self._heat_ax.pcolormesh(
-            self._axis_edges(e), self._axis_edges(g), z,
-            shading="flat",
-            cmap=resolve_colormap(self.cmap_combo.currentText()),
-            norm=Normalize(vmin=float(vmin), vmax=float(vmax)),
-        )
-        self._heat_mesh = im
-        self._heat_colorbar = self.figure.colorbar(im, cax=cax, orientation="horizontal")
-        style_heatmap_colorbar(self._heat_colorbar, self.signal_title_combo.currentText())
-        self._last_valid_color_limits = (float(vmin), float(vmax))
-        self._update_plot_annotations()
+        self._sync_region_controls()
+        x_edges, slices, boundaries = self._region_layout()
+        if self._color_scale_mode in ("2", "3"):
+            self._color_region_boundaries = boundaries
+            ranges = self._regional_color_ranges(
+                self._visible_color_values_by_region(use_spin_values=True))
+        else:
+            vmin, vmax = self._ordered_pair(float(self.vmin_spin.value()), float(self.vmax_spin.value()))
+            ranges = [(float(vmin), float(vmax))]
+        cmap = resolve_colormap(self.cmap_combo.currentText())
+        y_edges = self._axis_edges(g)
+        for index, (start, end) in enumerate(slices):
+            im = self._heat_ax.pcolormesh(
+                x_edges[start:end + 1], y_edges, z[:, start:end],
+                shading="flat", cmap=cmap,
+                norm=Normalize(vmin=float(ranges[index][0]), vmax=float(ranges[index][1])),
+            )
+            cax = self.figure.add_axes([0.65, 0.88 - index * 0.025, 0.15, 0.01])
+            colorbar = self.figure.colorbar(im, cax=cax, orientation="horizontal")
+            if len(slices) > 1:
+                region_names = ("Left", "Right") if len(slices) == 2 else ("Left", "Middle", "Right")
+                style_heatmap_colorbar(
+                    colorbar, region_names[index], font_size=REGIONAL_COLORBAR_FONT_SIZE,
+                )
+            else:
+                style_heatmap_colorbar(colorbar, self.signal_title_combo.currentText())
+            self._heat_meshes.append(im)
+            self._heat_colorbars.append(colorbar)
+        self._heat_mesh = self._heat_meshes[0]
+        self._heat_colorbar = self._heat_colorbars[0]
+        if self._color_scale_mode in ("2", "3"):
+            self._last_valid_region_color_limits = list(ranges)
+        self._last_valid_color_limits = tuple(ranges[0])
+        self._update_plot_annotations(layout=False)
         self._heat_ax.set_xlabel(cube.energy_label)
         style_plot_axis(self._heat_ax)
         xmin, xmax = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
@@ -3893,6 +4898,7 @@ class MainWindow(QMainWindow):
         fit_centers = self._current_fit_centers()
         active_fit = self._active_fit_result()
         self._spec_ax.clear()
+        self._drag_scatter = None
         self._spec_ax.plot(x, y, color="#1f77b4", lw=1.4, label="Spectrum")
         self._spec_ax.set_title(f"Spectrum @ {gate_used:.6g}", fontsize=PLOT_FONT_SIZE)
         self._spec_ax.set_xlabel(self.current_cube.energy_label)
@@ -3989,7 +4995,7 @@ class MainWindow(QMainWindow):
         # ── Drag marker ───────────────────────────────────────────────────────
         if self._drag_peak_arr_idx is not None and self._drag_current_x is not None:
             snap_idx = int(np.argmin(np.abs(x - self._drag_current_x)))
-            self._spec_ax.scatter(
+            self._drag_scatter = self._spec_ax.scatter(
                 [float(x[snap_idx])], [float(y[snap_idx])],
                 s=120, color="gold", edgecolors="k", linewidths=1.2, zorder=9, label="Dragging"
             )
@@ -4298,6 +5304,7 @@ class MainWindow(QMainWindow):
                 x = self.current_cube.energy
                 snap_idx = int(np.argmin(np.abs(x - float(event.xdata))))
                 # Replace the dragged peak index
+                self._invalidate_analysis_jobs()
                 self.peak_indices[self._drag_peak_arr_idx] = snap_idx
                 self.peak_indices = np.asarray(np.sort(np.unique(self.peak_indices)), dtype=int)
                 self._sync_current_trace_peaks_to_batch_map()
@@ -4358,6 +5365,7 @@ class MainWindow(QMainWindow):
         idx = int(np.argmin(np.abs(x - float(x_click))))
         if self.peak_indices.size and np.any(self.peak_indices == idx):
             return False
+        self._invalidate_analysis_jobs()
         merged = np.concatenate([self.peak_indices, np.asarray([idx], dtype=int)])
         self.peak_indices = np.asarray(np.unique(merged), dtype=int)
         _, y_cur = self._nearest_spectrum(self.current_gate)
@@ -4380,6 +5388,7 @@ class MainWindow(QMainWindow):
         x_span = max(float(np.nanmax(x) - np.nanmin(x)), 1e-12)
         if abs(float(x[nearest_idx]) - float(x_click)) > 0.02 * x_span:
             return False
+        self._invalidate_analysis_jobs()
         self.peak_indices = np.asarray(self.peak_indices[self.peak_indices != nearest_idx], dtype=int)
         self.peak_label_lookup.pop((gate_idx, nearest_idx), None)
         self._sync_current_trace_peaks_to_batch_map()
@@ -4400,6 +5409,7 @@ class MainWindow(QMainWindow):
     def _delete_batch_peaks_in_circle(
         self, center_x: float, center_y: float, edge_x: float, edge_y: float
     ) -> int:
+        self._invalidate_analysis_jobs()
         if self.current_cube is None or self._heat_ax is None or not self.batch_peak_map:
             return 0
         x0, x1 = self._heat_ax.get_xlim()

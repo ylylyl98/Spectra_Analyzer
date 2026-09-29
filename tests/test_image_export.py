@@ -15,7 +15,10 @@ from spectra_app.dat_io import DataCube
 from spectra_app.image_export import (
     EXPORT_DPI,
     EXPORT_FIGSIZE,
+    REGIONAL_COLORBAR_FONT_SIZE,
+    REGIONAL_COLORBAR_TICK_GAP,
     _build_heatmap_export_figure,
+    _cb_fmt_regional,
     export_figure_png,
 )
 from spectra_app.main_window import MainWindow
@@ -133,6 +136,127 @@ class ImageExportTests(unittest.TestCase):
         self.assertIs(exported_mesh.get_cmap(), live_mesh.get_cmap())
         self.assertIsNot(exported_mesh.norm, live_mesh.norm)
         self.assertEqual(exported_mesh.get_clim(), live_mesh.get_clim())
+
+    def test_detached_regional_export_copies_all_meshes_norms_and_colorbars(self) -> None:
+        window = self.make_window()
+        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
+        detached = _build_heatmap_export_figure(
+            window.figure,
+            selected_axes=(window._heat_ax, *[bar.ax for bar in window._heat_colorbars]),
+        )
+        self.assertEqual(len(detached.axes), 4)
+        self.assertEqual(len(detached.axes[0].collections), 3)
+        self.assertEqual(
+            [mesh.get_clim() for mesh in detached.axes[0].collections],
+            [mesh.get_clim() for mesh in window._heat_meshes],
+        )
+        for exported, live in zip(detached.axes[0].collections, window._heat_meshes):
+            self.assertIsNot(exported.norm, live.norm)
+            np.testing.assert_array_equal(exported.get_array(), live.get_array())
+        for axis, live_bar in zip(detached.axes[1:], window._heat_colorbars):
+            self.assertEqual(axis.get_xlabel(), live_bar.ax.get_xlabel())
+
+    def test_detached_regional_signal_label_clears_all_ticks_in_fixed_header(self) -> None:
+        for region_count in (2, 3):
+            with self.subTest(region_count=region_count):
+                window = self.make_window(title="Long regional export title with several words")
+                window.plot_title_edit.setText("Long regional export title with several words")
+                window.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
+                window.color_scale_combo.setCurrentIndex(
+                    window.color_scale_combo.findData(str(region_count))
+                )
+                window._layout_live_plots()
+                detached = _build_heatmap_export_figure(
+                    window.figure,
+                    selected_axes=(window._heat_ax, *[bar.ax for bar in window._heat_colorbars]),
+                )
+                detached.canvas.draw()
+                renderer = detached.canvas.get_renderer()
+                signal_labels = [
+                    artist for artist in detached.texts
+                    if artist.get_gid() == "heatmap_signal_label"
+                ]
+                self.assertEqual(len(signal_labels), 1)
+                signal_bbox = signal_labels[0].get_window_extent(renderer)
+                figure_bbox = detached.bbox
+                self.assertGreaterEqual(signal_bbox.x0, figure_bbox.x0)
+                self.assertGreaterEqual(signal_bbox.y0, figure_bbox.y0)
+                self.assertLessEqual(signal_bbox.x1, figure_bbox.x1)
+                self.assertLessEqual(signal_bbox.y1, figure_bbox.y1)
+                self.assertTrue(signal_labels[0].get_text())
+                self.assertTrue(detached.texts[0].get_text())
+                title_bbox = detached.texts[0].get_window_extent(renderer)
+                self.assertGreaterEqual(title_bbox.x0, figure_bbox.x0)
+                self.assertGreaterEqual(title_bbox.y0, figure_bbox.y0)
+                self.assertLessEqual(title_bbox.x1, figure_bbox.x1)
+                self.assertLessEqual(title_bbox.y1, figure_bbox.y1)
+                self.assertFalse(signal_bbox.overlaps(title_bbox))
+                tick_bboxes = []
+                for colorbar_axis in detached.axes[1:]:
+                    for tick in colorbar_axis.get_xticklabels():
+                        tick_bbox = tick.get_window_extent(renderer)
+                        tick_bboxes.append(tick_bbox)
+                        self.assertFalse(signal_bbox.overlaps(tick_bbox))
+                        self.assertFalse(title_bbox.overlaps(tick_bbox))
+                for index, tick_bbox in enumerate(tick_bboxes):
+                    self.assertTrue(
+                        all(not tick_bbox.overlaps(other) for other in tick_bboxes[index + 1:])
+                    )
+                self.assertAlmostEqual(detached.get_size_inches()[0], EXPORT_FIGSIZE[0])
+                self.assertAlmostEqual(detached.get_size_inches()[1], EXPORT_FIGSIZE[1])
+                plot_box = detached.axes[0].get_window_extent(renderer)
+                self.assertAlmostEqual(plot_box.width / detached.dpi, 4.0)
+                self.assertAlmostEqual(plot_box.height / detached.dpi, 3.0)
+
+    def test_regional_endpoint_ticks_are_compact_and_separated_within_each_bar(self) -> None:
+        window = self.make_window(title="p3 8T 0.5TG-BG=0")
+        window.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
+        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
+        window._layout_live_plots()
+        ranges = ((-0.07239, 1.053), (-0.03265, 0.02476), (-0.006, 0.008))
+        for mesh, colorbar, (vmin, vmax) in zip(window._heat_meshes, window._heat_colorbars, ranges):
+            mesh.set_clim(vmin, vmax)
+            colorbar.mappable.set_clim(vmin, vmax)
+        window._layout_live_plots()
+        window.canvas.draw()
+        live_renderer = window.canvas.get_renderer()
+        live_labels = [tick for bar in window._heat_colorbars for tick in bar.ax.get_xticklabels()]
+        live_labels += [window._heat_ax.title, window._heat_signal_label]
+        live_boxes = [label.get_window_extent(live_renderer) for label in live_labels]
+        for index, box in enumerate(live_boxes):
+            self.assertGreaterEqual(box.x0, 0)
+            self.assertGreaterEqual(box.y0, 0)
+            self.assertLessEqual(box.x1, window.figure.bbox.x1)
+            self.assertLessEqual(box.y1, window.figure.bbox.y1)
+            self.assertTrue(all(not box.overlaps(other) for other in live_boxes[index + 1:]))
+        self.assertTrue(all(not bar.ax.get_xlabel() for bar in window._heat_colorbars))
+        detached = _build_heatmap_export_figure(
+            window.figure,
+            selected_axes=(window._heat_ax, *[bar.ax for bar in window._heat_colorbars]),
+        )
+        detached.canvas.draw()
+        renderer = detached.canvas.get_renderer()
+        labels = [
+            tick
+            for axis in detached.axes[1:]
+            for tick in axis.get_xticklabels()
+            if tick.get_text()
+        ]
+        self.assertEqual(
+            [tick.get_text() for tick in labels],
+            ["-0.072", "1.1", "-0.033", "0.025", "-6e-3", "8e-3"],
+        )
+        self.assertEqual(_cb_fmt_regional(-0.006), "-6e-3")
+        self.assertEqual(_cb_fmt_regional(0.008), "8e-3")
+        self.assertTrue(all(tick.get_fontsize() <= REGIONAL_COLORBAR_FONT_SIZE for tick in labels))
+        boxes = [tick.get_window_extent(renderer) for tick in labels]
+        for index, box in enumerate(boxes):
+            for other in boxes[index + 1:]:
+                separated = (
+                    box.x1 + REGIONAL_COLORBAR_TICK_GAP <= other.x0
+                    or other.x1 + REGIONAL_COLORBAR_TICK_GAP <= box.x0
+                )
+                self.assertTrue(separated, (box.bounds, other.bounds))
 
     def test_repeated_detached_exports_do_not_add_callbacks_to_live_norm(self) -> None:
         window = self.make_window()

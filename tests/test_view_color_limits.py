@@ -163,6 +163,61 @@ class ViewColorLimitsTests(unittest.TestCase):
         self.assertEqual(window.vmax_spin.value(), -100.0)
         self.assertLess(window._heat_ax.collections[0].norm.vmin, window._heat_ax.collections[0].norm.vmax)
 
+    def test_regional_color_scale_uses_independent_percentiles_and_contiguous_meshes(self) -> None:
+        window = self.make_window(np.asarray([
+            [1, 2, 3, 4, 100, 200, 300, 400],
+            [2, 3, 4, 5, 200, 300, 400, 500],
+        ], dtype=float))
+        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("2"))
+
+        self.assertEqual(len(window._heat_meshes), 2)
+        self.assertEqual(len(window._heat_colorbars), 2)
+        first = np.nanpercentile(window.current_cube.z[:, :4], [0.5, 99.5])
+        second = np.nanpercentile(window.current_cube.z[:, 4:], [0.5, 99.5])
+        np.testing.assert_allclose(window._heat_meshes[0].get_clim(), first)
+        np.testing.assert_allclose(window._heat_meshes[1].get_clim(), second)
+        self.assertFalse(np.allclose(first, second))
+        left = window._heat_meshes[0].get_coordinates()[-1, -1, 0]
+        right = window._heat_meshes[1].get_coordinates()[0, 0, 0]
+        self.assertEqual(left, right)
+
+    def test_regional_boundary_edit_snaps_to_cell_edge_and_preserves_order(self) -> None:
+        window = self.make_window(np.arange(24, dtype=float).reshape(3, 8))
+        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
+        window.region_boundary_spins[0].setValue(4.71)
+        boundaries = [spin.value() for spin in window.region_boundary_spins[:2]]
+        edges = window._axis_edges(window.current_cube.energy)
+        self.assertIn(boundaries[0], edges[1:-1])
+        self.assertLess(boundaries[0], boundaries[1])
+        for left, right in zip(window._heat_meshes, window._heat_meshes[1:]):
+            self.assertEqual(left.get_coordinates()[-1, -1, 0], right.get_coordinates()[0, 0, 0])
+
+    def test_global_color_scale_remains_single_mesh_and_colorbar(self) -> None:
+        window = self.make_window(np.arange(24, dtype=float).reshape(3, 8))
+        self.assertEqual(len(window._heat_meshes), 1)
+        self.assertEqual(len(window._heat_colorbars), 1)
+        expected = np.nanpercentile(window.current_cube.z, [0.5, 99.5])
+        np.testing.assert_allclose(window._heat_meshes[0].get_clim(), expected)
+
+    def test_regional_auto_limits_keep_last_range_for_empty_or_nonfinite_region(self) -> None:
+        window = self.make_window(np.asarray([
+            [1.0, 2.0, np.nan, np.nan],
+            [3.0, 4.0, np.nan, np.nan],
+        ]))
+        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("2"))
+        previous = window._heat_meshes[1].get_clim()
+        window._heat_ax.set_xlim(0.0, 1.0)
+        window._heat_ax.set_ylim(1.0, 2.0)
+        self.assertTrue(np.all(np.isfinite(window._heat_meshes[1].get_clim())))
+        np.testing.assert_allclose(window._heat_meshes[1].get_clim(), previous)
+
+    def test_three_region_mode_with_one_energy_column_degrades_safely(self) -> None:
+        window = self.make_window(np.asarray([[7.0], [7.0]]))
+        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
+        self.assertEqual(len(window._heat_meshes), 1)
+        self.assertEqual(len(window._heat_colorbars), 1)
+        self.assertLess(window._heat_meshes[0].norm.vmin, window._heat_meshes[0].norm.vmax)
+
 
 if __name__ == "__main__":
     unittest.main()

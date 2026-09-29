@@ -1,8 +1,19 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+import time
 
 from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication
+
+
+def wait_for_background_jobs(window, timeout=5):
+    """Pump the GUI until asynchronous application has completed, with a hard bound."""
+    deadline = time.monotonic() + timeout
+    while window._background_jobs.busy and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.005)
+    assert not window._background_jobs.busy, "Background operation timed out"
 
 
 def isolate_settings(test_case) -> Path:

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 from spectra_app.main_window import MainWindow
 from spectra_app.image_export import _build_heatmap_export_figure
-from tests.settings_helpers import isolate_settings
+from tests.settings_helpers import isolate_settings, wait_for_background_jobs
 
 
 _APP = QApplication.instance() or QApplication([])
@@ -57,6 +57,11 @@ class PlotStateRecallTests(unittest.TestCase):
         window._heat_ax.set_ylim(0.123456789, 1.876543219)
         window._heat_mesh.set_clim(2.123456789, 15.987654321)
 
+    def configure_regional(self, window):
+        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
+        window.region_boundary_spins[0].setValue(1.4)
+        window.region_boundary_spins[1].setValue(1.8)
+
     def assert_recalled(self, window):
         self.assertEqual(window._heat_ax.get_title(), "Sample A")
         self.assertEqual(window._heat_ax.get_ylabel(), "Bias (mV)")
@@ -99,6 +104,7 @@ class PlotStateRecallTests(unittest.TestCase):
         window = self.window()
         window._load_dat_file_direct(self.a)
         window.x_axis_override_combo.setCurrentIndex(window.x_axis_override_combo.findData("pixel"))
+        wait_for_background_jobs(window)
         self.configure(window)
         window.close()
         restored = self.window()
@@ -113,7 +119,8 @@ class PlotStateRecallTests(unittest.TestCase):
         payload = json.loads(restored._plot_state_store.path_for(self.a).read_text(encoding="utf-8"))
         self.assertEqual(set(payload["plot"]), {
             "axis_override", "colormap", "annotations", "fix_annotations", "bounds", "locks",
-            "x_limits", "y_limits", "color_limits", "gate", "title_settings"})
+            "x_limits", "y_limits", "color_limits", "gate", "title_settings",
+            "color_scale_mode", "color_region_boundaries", "processing", "signal_title_auto"})
 
     def test_changed_source_does_not_restore_old_plot(self):
         window = self.window()
@@ -193,6 +200,10 @@ class PlotStateRecallTests(unittest.TestCase):
         window = self.window()
         window._load_dat_file_direct(self.a)
         window.signal_title_combo.blockSignals(True)
+        # Model a per-file manual recipe without changing global defaults.
+        window.signal_title_auto_chk.blockSignals(True)
+        window.signal_title_auto_chk.setChecked(False)
+        window.signal_title_auto_chk.blockSignals(False)
         window.signal_title_combo.setEditText("Saved custom Z")
         window.signal_title_combo.blockSignals(False)
         window._load_dat_file_direct(self.b)
@@ -246,3 +257,26 @@ class PlotStateRecallTests(unittest.TestCase):
                 self.assertFalse(restored.xmin_lock.isChecked())
                 self.assertIn("ignored", restored.statusBar().currentMessage())
                 restored.close()
+
+    def test_regional_color_scale_round_trips_and_old_sidecar_defaults_to_global(self):
+        window = self.window()
+        window._load_dat_file_direct(self.a)
+        self.configure_regional(window)
+        saved_boundaries = [spin.value() for spin in window.region_boundary_spins[:2]]
+        window.close()
+        restored = self.window()
+        restored._load_dat_file_direct(self.a)
+        self.assertEqual(restored.color_scale_combo.currentData(), "3")
+        np.testing.assert_allclose(
+            [spin.value() for spin in restored.region_boundary_spins[:2]], saved_boundaries)
+        self.assertEqual(len(restored._heat_meshes), 3)
+
+        path = restored._plot_state_store.path_for(self.a)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["plot"].pop("color_scale_mode")
+        payload["plot"].pop("color_region_boundaries")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        old = self.window()
+        old._load_dat_file_direct(self.a)
+        self.assertEqual(old.color_scale_combo.currentData(), "global")
+        self.assertEqual(len(old._heat_meshes), 1)

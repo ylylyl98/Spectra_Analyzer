@@ -13,6 +13,7 @@ from spectra_app.dat_io import DataCube
 from spectra_app.fitting import FitResult, fit_multi_peak
 from spectra_app.main_window import MainWindow
 from tests.settings_helpers import isolate_settings
+from tests.background_helpers import wait_jobs
 
 
 _APP = QApplication.instance() or QApplication([])
@@ -138,6 +139,7 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertTrue(window.detect_then_fit_btn.isEnabled())
         window.detect_then_fit_btn.click()
+        wait_jobs(window)
         self.assertGreater(window._get_seeds_for_current_gate().size, 0)
         self.assertIsNotNone(window._active_fit_result())
         self.assertFalse(messages)
@@ -155,6 +157,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(window.detect_then_fit_btn.isEnabled())
         self.assertIn("outside", window.fit_readiness_label.text().lower())
         window._on_fit()
+        wait_jobs(window)
         self.assertTrue(messages)
         self.assertIn("outside", messages[-1].lower())
 
@@ -169,6 +172,7 @@ class WorkflowTests(unittest.TestCase):
         messages: list[str] = []
         window._show_error = messages.append
         window._on_fit()
+        wait_jobs(window)
 
         self.assertEqual(window.peak_indices.tolist(), [40])
         self.assertIsNotNone(window._active_fit_result())
@@ -187,6 +191,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(window._seeds_from_csv_radio.isChecked())
             self.assertEqual(window._get_seeds_for_current_gate().tolist(), [10.0])
             window._on_fit()
+            wait_jobs(window)
         self.assertIsNotNone(window._active_fit_result())
         self.assertFalse(messages)
 
@@ -207,6 +212,7 @@ class WorkflowTests(unittest.TestCase):
         window._show_error = messages.append
 
         window._on_fit()
+        wait_jobs(window)
         self.assertTrue(messages)
         self.assertIn("CSV", messages[-1])
         self.assertEqual(window._get_seeds_for_current_gate().size, 0)
@@ -225,6 +231,7 @@ class WorkflowTests(unittest.TestCase):
         window._show_error = messages.append
 
         window._on_batch_fit_all_gates()
+        wait_jobs(window)
 
         self.assertTrue(messages)
         self.assertIn("CSV", messages[-1])
@@ -247,10 +254,12 @@ class WorkflowTests(unittest.TestCase):
         window.peak_indices = np.asarray([5], dtype=int)
         window._peak_gate_idx = 0
         window._on_fit()
+        wait_jobs(window)
         window._set_current_gate_from_index(1)
         window.peak_indices = np.asarray([15], dtype=int)
         window._peak_gate_idx = 1
         window._on_fit()
+        wait_jobs(window)
         window._batch_fit_export_rows.append(
             window._fit_result_to_export_row(13.0, "Lorentzian", "X", None, status="fit_failed:test")
         )
