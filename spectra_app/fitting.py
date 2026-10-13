@@ -6,9 +6,10 @@ from typing import Literal
 import numpy as np
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks, savgol_filter
+from scipy.special import voigt_profile
 
 PeakMode = Literal["Peaks", "Dips", "Both"]
-FitModel = Literal["Lorentzian", "Gaussian"]
+FitModel = Literal["Lorentzian", "Gaussian", "Voigt"]
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,12 @@ class FitResult:
     baseline: float
     rmse: float
     r_squared: float
+    sigmas: np.ndarray | None = None  # Voigt only; identical to widths
+    gammas: np.ndarray | None = None  # Voigt only; Lorentzian HWHM
+
+    def __post_init__(self) -> None:
+        if self.model == 'Voigt' and self.sigmas is not None and not np.array_equal(self.sigmas, self.widths):
+            raise ValueError('Voigt sigmas must equal the Gaussian widths.')
 
 
 def _clamp_sg_window(n: int, requested: int) -> int:
@@ -48,7 +55,7 @@ def find_peak_indices(
 
     Returns (indices, kinds) where kinds is a bool array: True=peak, False=dip.
     In 'Both' mode detects peaks and dips independently with separate limits,
-    then merges and deduplicates collisions within min_distance.
+    then merges; distance suppression applies only within each kind.
     """
     xv = np.asarray(x, float).ravel()
     yv = np.asarray(y, float).ravel()
@@ -83,7 +90,7 @@ def find_peak_indices(
         all_idx = all_idx[order]
         all_kinds = all_kinds[order]
         all_prom = all_prom[order]
-        # Deduplicate within dist: keep the more prominent of any pair
+        # Never suppress a peak because of a nearby dip (or vice versa).
         n = all_idx.size
         keep = np.ones(n, dtype=bool)
         for i in range(n):
@@ -92,7 +99,7 @@ def find_peak_indices(
             for j in range(i + 1, n):
                 if all_idx[j] - all_idx[i] > dist:
                     break
-                if keep[j]:
+                if keep[j] and all_kinds[i] == all_kinds[j]:
                     if all_prom[i] >= all_prom[j]:
                         keep[j] = False
                     else:
@@ -186,7 +193,7 @@ def find_peaks_second_derivative(
             for j in range(i + 1, nall):
                 if all_idx[j] - all_idx[i] > effective_distance:
                     break
-                if keep[j]:
+                if keep[j] and all_kinds[i] == all_kinds[j]:
                     if all_prom[i] >= all_prom[j]:
                         keep[j] = False
                     else:
@@ -213,6 +220,11 @@ def _gauss(x: np.ndarray, amp: float, cen: float, wid: float) -> np.ndarray:
     return amp * np.exp(-0.5 * ((x - cen) / ww) ** 2)
 
 
+def _voigt(x: np.ndarray, amp: float, cen: float, sigma: float, gamma: float) -> np.ndarray:
+    """True Voigt convolution normalized to signed peak height, not area."""
+    return amp * voigt_profile(x-cen, sigma, gamma) / voigt_profile(0., sigma, gamma)
+
+
 def fit_multi_peak(
     x: np.ndarray,
     y: np.ndarray,
@@ -225,100 +237,143 @@ def fit_multi_peak(
     peak_move_limit: float = 0.0,  # 0 = unconstrained
     maxfev: int = 20000,
     kinds: np.ndarray | None = None,  # per-component: True=peak, False=dip (used in Both mode)
+    initial_amplitudes: np.ndarray | None = None,
+    initial_widths: np.ndarray | None = None,
+    initial_gammas: np.ndarray | None = None,
+    fixed_centers: bool | np.ndarray = False,
+    center_bounds: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> FitResult:
-    """Fit a multi-peak model (Lorentzian or Gaussian) + constant baseline.
+    """Fit signed components plus a constant baseline to every finite X/Y pair.
 
-    Parameters
-    ----------
-    kinds : optional bool array, length == len(centers_hint).
-        When mode == 'Both', supplies per-component sign: True → positive amplitude
-        (peak), False → negative amplitude (dip).  Ignored in Peaks/Dips modes.
+    Amplitudes are signed heights in all models. Gaussian widths are sigma,
+    Lorentzian widths are gamma (HWHM), and Voigt widths/sigmas are Gaussian
+    sigma with separate Lorentzian gammas. Both Voigt widths obey linewidth
+    bounds. Optional seed arrays must contain one value per component; initial
+    widths are clipped into valid bounds. In Both mode, kinds assigns component
+    signs (True=peak, False=dip), otherwise the global mode assigns the sign.
+
+    Fixed centers are excluded from optimizer variables and returned exactly.
+    center_bounds is a (lower, upper) pair of scalars or per-component arrays,
+    intersected with the data interval and peak_move_limit when specified.
     """
     xv = np.asarray(x, float).ravel()
     yv = np.asarray(y, float).ravel()
-    centers = np.asarray(centers_hint, float).ravel()
-    if xv.size < 5 or yv.size != xv.size:
+    centers = np.asarray(centers_hint, float).ravel().copy()
+    if yv.size != xv.size:
+        raise ValueError("X and Y lengths must match for fitting.")
+    finite = np.isfinite(xv) & np.isfinite(yv)
+    xv, yv = xv[finite], yv[finite]
+    if xv.size < 5:
         raise ValueError("Not enough valid data points for fitting.")
-    if centers.size == 0:
-        raise ValueError("No peak centers provided.")
-
-    fn = _lorentz if model == "Lorentzian" else _gauss
+    if centers.size == 0 or not np.all(np.isfinite(centers)):
+        raise ValueError("Finite peak centers must be provided.")
+    if model not in ('Lorentzian', 'Gaussian', 'Voigt') or mode not in ('Peaks', 'Dips', 'Both'):
+        raise ValueError('Unknown fit model or mode.')
+    fn = {'Lorentzian': _lorentz, 'Gaussian': _gauss, 'Voigt': _voigt}[model]
     n = int(centers.size)
-    xrange = float(np.nanmax(xv) - np.nanmin(xv))
-    baseline0 = float(np.nanmedian(yv))
-
-    # Global sign for non-Both modes; per-component sign computed below for Both.
-    global_sign = 1.0 if mode == "Peaks" else (-1.0 if mode == "Dips" else None)
-
+    xmin, xmax = float(np.min(xv)), float(np.max(xv))
+    xrange = xmax-xmin
+    if xrange <= 0:
+        raise ValueError('Fitting requires a nonzero X interval.')
+    baseline0 = float(np.median(yv))
+    for name, value in (('linewidth_min', linewidth_min), ('linewidth_max', linewidth_max),
+                        ('peak_move_limit', peak_move_limit)):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f'{name} must be finite and nonnegative.')
     lw_min = max(float(linewidth_min), 1e-9)
-    lw_max_v = float(linewidth_max)
-    lw_max = lw_max_v if lw_max_v > lw_min else (xrange * 2.0 + 1e-9)
-    lw_max = max(lw_max, lw_min)
-    # Keep the optimizer's initial width inside the configured bounds.  This
-    # matters when a cropped range makes the heuristic width narrower than the
-    # GUI's point-based minimum.
+    lw_max = float(linewidth_max) if linewidth_max > 0 else max(xrange*2.+1e-9, lw_min*2.)
+    if lw_max <= lw_min:
+        raise ValueError('Maximum linewidth must be greater than minimum linewidth.')
     width0 = float(np.clip(xrange / max(8.0 * n, 20.0), lw_min, lw_max))
 
-    p0: list[float] = [baseline0]
-    lower: list[float] = [float(np.nanmin(yv) - abs(np.nanmax(yv - baseline0)) * 2.0)]
-    upper: list[float] = [float(np.nanmax(yv) + abs(np.nanmax(yv - baseline0)) * 2.0)]
+    def seed_array(values, name: str, default: np.ndarray) -> np.ndarray:
+        if values is None:
+            return default.copy()
+        result = np.asarray(values, dtype=float).ravel()
+        if result.size != n or not np.all(np.isfinite(result)):
+            raise ValueError(f'{name} must contain one finite value per component.')
+        return result.copy()
 
-    for i, c in enumerate(centers):
-        idx = int(np.argmin(np.abs(xv - c)))
-        if global_sign is None:
-            # Both mode: determine sign per component
-            if kinds is not None and i < kinds.size:
-                sign_i = 1.0 if bool(kinds[i]) else -1.0
-            else:
-                sign_i = 1.0  # default to peak if kinds unavailable
-        else:
-            sign_i = global_sign
+    fixed = np.asarray(fixed_centers, dtype=bool)
+    fixed = np.full(n, bool(fixed)) if fixed.ndim == 0 else fixed.ravel().copy()
+    if fixed.size != n:
+        raise ValueError('fixed_centers must contain one flag per component.')
+    signs = np.full(n, -1. if mode == 'Dips' else 1.)
+    if mode == 'Both' and kinds is not None:
+        kind_values = np.asarray(kinds, dtype=bool).ravel()
+        if kind_values.size != n:
+            raise ValueError('kinds must contain one flag per component.')
+        signs = np.where(kind_values, 1., -1.)
+    amplitudes = seed_array(initial_amplitudes, 'initial_amplitudes', np.array([
+        signs[i]*max(abs(float(yv[np.argmin(np.abs(xv-c))]-baseline0)), 1e-6)
+        for i, c in enumerate(centers)]))
+    if np.any(amplitudes*signs < 0):
+        raise ValueError('Initial amplitude signs must agree with the peak/dip kinds.')
+    widths = seed_array(initial_widths, 'initial_widths', np.full(n, width0))
+    gammas = seed_array(initial_gammas, 'initial_gammas', np.full(n, width0))
+    if np.any(widths <= 0) or np.any(gammas < 0):
+        raise ValueError('Initial widths must be positive and gammas nonnegative.')
+    if initial_gammas is not None and model != 'Voigt':
+        raise ValueError('initial_gammas is only supported for Voigt fits.')
+    widths, gammas = np.clip(widths, lw_min, lw_max), np.clip(gammas, lw_min, lw_max)
+    center_lower, center_upper = np.full(n, xmin), np.full(n, xmax)
+    if peak_move_limit > 0:
+        center_lower = np.maximum(center_lower, centers-peak_move_limit)
+        center_upper = np.minimum(center_upper, centers+peak_move_limit)
+    if center_bounds is not None:
+        try:
+            lower_values, upper_values = center_bounds
+            lower_values = np.broadcast_to(np.asarray(lower_values, float), (n,))
+            upper_values = np.broadcast_to(np.asarray(upper_values, float), (n,))
+        except (TypeError, ValueError) as error:
+            raise ValueError('center_bounds must be a lower/upper pair of scalar or component arrays.') from error
+        if not np.all(np.isfinite(lower_values)) or not np.all(np.isfinite(upper_values)):
+            raise ValueError('Center bounds must be finite.')
+        center_lower, center_upper = np.maximum(center_lower, lower_values), np.minimum(center_upper, upper_values)
+    if np.any(center_lower > center_upper) or np.any(centers < center_lower) or np.any(centers > center_upper):
+        raise ValueError('Initial centers must lie inside the data interval and center bounds.')
+    fixed |= center_lower == center_upper
 
-        amp0 = sign_i * max(abs(float(yv[idx] - baseline0)), 1e-6)
-        p0.extend([amp0, float(c), width0])
+    # Use full component arrays for evaluation and only optimize free entries.
+    stride = 4 if model == 'Voigt' else 3
+    parameters = np.empty((n, stride), dtype=float)
+    parameters[:, 0], parameters[:, 1], parameters[:, 2] = amplitudes, centers, widths
+    if model == 'Voigt':
+        parameters[:, 3] = gammas
+    parameter_lower = np.empty_like(parameters)
+    parameter_upper = np.empty_like(parameters)
+    parameter_lower[:, 0], parameter_upper[:, 0] = np.where(signs > 0, 0., -np.inf), np.where(signs > 0, np.inf, 0.)
+    parameter_lower[:, 1], parameter_upper[:, 1] = center_lower, center_upper
+    parameter_lower[:, 2:], parameter_upper[:, 2:] = lw_min, lw_max
+    free_mask = np.ones_like(parameters, dtype=bool)
+    free_mask[:, 1] = ~fixed
+    baseline_margin = max(float(np.max(np.abs(yv-baseline0)))*2., 1e-6)
+    p0 = np.r_[baseline0, parameters[free_mask]]
+    lower = np.r_[np.min(yv)-baseline_margin, parameter_lower[free_mask]]
+    upper = np.r_[np.max(yv)+baseline_margin, parameter_upper[free_mask]]
+    if xv.size <= p0.size:
+        raise ValueError(f'Fitting needs more valid samples than free parameters ({p0.size}).')
 
-        pml = float(peak_move_limit)
-        if pml > 0:
-            c_lo = float(max(np.nanmin(xv), c - pml))
-            c_hi = float(min(np.nanmax(xv), c + pml))
-        else:
-            c_lo = float(np.nanmin(xv))
-            c_hi = float(np.nanmax(xv))
-
-        if sign_i > 0:
-            lower.extend([0.0, c_lo, lw_min])
-            upper.extend([np.inf, c_hi, lw_max])
-        else:
-            lower.extend([-np.inf, c_lo, lw_min])
-            upper.extend([0.0, c_hi, lw_max])
+    def unpack(p: np.ndarray) -> np.ndarray:
+        values = parameters.copy()
+        values[free_mask] = p[1:]
+        return values
 
     def model_fn(xarr: np.ndarray, *p: float) -> np.ndarray:
-        base = p[0]
-        out = np.full_like(xarr, base, dtype=float)
-        for k in range(n):
-            a, c, w = p[1 + 3 * k : 1 + 3 * (k + 1)]
-            out = out + fn(xarr, a, c, w)
-        return out
+        return np.full_like(xarr, p[0], dtype=float) + np.sum([
+            fn(xarr, *component) for component in unpack(np.asarray(p))], axis=0)
 
     popt, _ = curve_fit(
         model_fn,
         xv,
         yv,
-        p0=np.asarray(p0, dtype=float),
-        bounds=(np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)),
+        p0=p0,
+        bounds=(lower, upper),
         maxfev=int(maxfev),
     )
     y_fit = model_fn(xv, *popt)
-    comps = []
-    amps = []
-    cens = []
-    widths = []
-    for k in range(n):
-        a, c, w = popt[1 + 3 * k : 1 + 3 * (k + 1)]
-        comps.append(fn(xv, float(a), float(c), float(w)))
-        amps.append(float(a))
-        cens.append(float(c))
-        widths.append(float(abs(w)))
+    fitted = unpack(popt)
+    comps = np.asarray([fn(xv, *component) for component in fitted], dtype=float)
     residual = np.asarray(yv - y_fit, dtype=float)
     rmse = float(np.sqrt(np.nanmean(residual * residual)))
     ss_res = float(np.nansum(residual * residual))
@@ -330,10 +385,12 @@ def fit_multi_peak(
         x=np.asarray(xv, dtype=float),
         y_fit=np.asarray(y_fit, dtype=float),
         components=np.asarray(comps, dtype=float),
-        centers=np.asarray(cens, dtype=float),
-        amplitudes=np.asarray(amps, dtype=float),
-        widths=np.asarray(widths, dtype=float),
+        centers=fitted[:, 1].copy(),
+        amplitudes=fitted[:, 0].copy(),
+        widths=fitted[:, 2].copy(),
         baseline=float(popt[0]),
         rmse=rmse,
         r_squared=float(r_squared),
+        sigmas=fitted[:, 2].copy() if model == 'Voigt' else None,
+        gammas=fitted[:, 3].copy() if model == 'Voigt' else None,
     )

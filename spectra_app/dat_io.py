@@ -7,7 +7,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .signal_titles import infer_signal_kind
+from .signal_titles import infer_signal_kind, infer_source_signal_kind
 
 
 AXIS_TYPE_EV = "ev"
@@ -70,6 +70,7 @@ class DataCube:
     photon_energy_note: str
     energy_label: str
     signal_kind: str = "unknown"
+    signal_source_kind: str = "unknown"
 
     @property
     def has_photon_energy(self) -> bool:
@@ -253,7 +254,8 @@ def interpret_x_axis(
     )
 
 
-def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> DataCube:
+def _read_dat_layout(path: str | Path):
+    """Shared layout evidence for detection and the scientific matrix reader."""
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise FileNotFoundError(f"File not found: {p}")
@@ -324,6 +326,23 @@ def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> Da
             and _has_outlier_leading_step(arr[:, 0])
         )
 
+    complete_header = (header_tokens is not None and len(header_tokens) == arr.shape[1]
+                       and header_gates.size == arr.shape[1] - 1
+                       and np.all(np.isfinite(header_gates)))
+    reason = ('Embedded Gate row after a padded title.' if padded_title_layout else
+              'Numeric Gate row with a separate spectral axis.' if numeric_header_layout else
+              'Complete numeric Gate labels in the header.' if complete_header else '')
+    return arr, header_gates, x_label_hint, metadata_lines, numeric_header_layout, reason
+
+
+def matrix_layout_reason(path: str | Path) -> str:
+    """Return credible Gate-layout evidence, never the synthetic Gate Index fallback."""
+    return _read_dat_layout(path)[-1]
+
+
+def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> DataCube:
+    p = Path(path)
+    arr, header_gates, x_label_hint, metadata_lines, numeric_header_layout, _ = _read_dat_layout(p)
     if numeric_header_layout:
         x_original = arr[1:, 0]
         vals = arr[1:, 1:]
@@ -388,4 +407,5 @@ def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> Da
         photon_energy_note=x_info.photon_energy_note,
         energy_label=energy_label,
         signal_kind=infer_signal_kind(str(p), metadata_lines),
+        signal_source_kind=infer_source_signal_kind(str(p), metadata_lines),
     )

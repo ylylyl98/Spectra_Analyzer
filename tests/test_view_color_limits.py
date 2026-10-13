@@ -76,6 +76,32 @@ class ViewColorLimitsTests(unittest.TestCase):
         self.assertAlmostEqual(window._heat_ax.collections[0].norm.vmin, float(expected[0]), places=4)
         self.assertAlmostEqual(window._heat_ax.collections[0].norm.vmax, float(expected[1]), places=4)
 
+    def test_native_edit_locks_only_changed_bound_and_auto_recalculates_visible_values(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtCore import Qt
+        window = self.make_window(np.arange(20., dtype=float).reshape(4, 5))
+        window.show(); _APP.processEvents()
+        window._heat_ax.set_xlim(1., 3.); window._heat_ax.set_ylim(1., 2.)
+        xy = (window._heat_ax.get_xlim(), window._heat_ax.get_ylim())
+        window.vmin_spin.setValue(3.)
+        self.assertFalse(window.vmin_lock.isChecked())
+        window.vmin_spin.setFocus(); window.vmin_spin.lineEdit().selectAll()
+        QTest.keyClicks(window.vmin_spin, '7')
+        QTest.keyClick(window.vmin_spin, Qt.Key_Return)
+        self.assertTrue(window.vmin_lock.isChecked())
+        self.assertFalse(window.vmax_lock.isChecked())
+        window.vmax_spin.setFocus(); window.vmax_spin.lineEdit().selectAll()
+        QTest.keyClicks(window.vmax_spin, '12')
+        QTest.keyClick(window.vmax_spin, Qt.Key_Return)
+        self.assertTrue(window.vmax_lock.isChecked())
+        QTest.mouseClick(window.auto_color_btn, Qt.LeftButton)
+        self.assertFalse(window.vmin_lock.isChecked()); self.assertFalse(window.vmax_lock.isChecked())
+        expected = np.percentile(np.array([[6, 7, 8], [11, 12, 13]]), [.5, 99.5])
+        np.testing.assert_allclose(window._heat_mesh.get_clim(), expected, atol=1e-4)
+        self.assertEqual((window._heat_ax.get_xlim(), window._heat_ax.get_ylim()), xy)
+        self.assertIn('0.5–99.5', window.color_range_status.text())
+        self.assertIn('%', window.color_clipping_status.text())
+
     def test_axes_changes_sync_xy_controls_and_shared_spectrum_x(self) -> None:
         window = self.make_window(np.arange(20, dtype=float).reshape(4, 5))
         window._heat_ax.set_xlim(1.0, 3.0)
@@ -106,6 +132,17 @@ class ViewColorLimitsTests(unittest.TestCase):
         window.vmin_lock.setChecked(False)
         self.assertNotEqual(window.vmin_spin.value(), 8.0)
 
+    def test_auto_mode_status_refreshes_when_visible_log_values_are_empty(self):
+        window = self.make_window([[1., 2., 3.], [4., 5., 6.]])
+        window.mapping_combo.setCurrentIndex(window.mapping_combo.findData('log'))
+        window.vmin_lock.setChecked(True); window.vmax_lock.setChecked(True)
+        window._heat_ax.set_xlim(100., 101.)
+        previous = window._heat_mesh.get_clim()
+        window.auto_color_btn.click()
+        self.assertFalse(window.vmin_lock.isChecked()); self.assertFalse(window.vmax_lock.isChecked())
+        self.assertIn('Global: Auto', window.color_range_status.text())
+        self.assertEqual(window._heat_mesh.get_clim(), previous)
+
     def test_spectrum_redraw_restores_sync_guard_when_plotting_fails(self) -> None:
         window = self.make_window(np.arange(12, dtype=float).reshape(3, 4))
         original = window._update_heatmap_peak_labels
@@ -127,6 +164,25 @@ class ViewColorLimitsTests(unittest.TestCase):
             (window._heat_ax.collections[0].norm.vmin, window._heat_ax.collections[0].norm.vmax),
             previous,
         )
+
+    def test_color_edits_preserve_axes_beyond_control_decimal_precision(self):
+        window = self.make_window(np.arange(20., dtype=float).reshape(4, 5))
+        window._heat_ax.set_xlim(.1234567, 3.7654321)
+        window._heat_ax.set_ylim(.2345678, 2.8765432)
+        xy = (window._heat_ax.get_xlim(), window._heat_ax.get_ylim())
+        window.vmin_spin.setValue(6.)
+        window.vmax_spin.setValue(12.)
+        self.assertEqual((window._heat_ax.get_xlim(), window._heat_ax.get_ylim()), xy)
+        window.auto_color_btn.click()
+        self.assertEqual((window._heat_ax.get_xlim(), window._heat_ax.get_ylim()), xy)
+
+    def test_restored_exact_limits_refresh_visible_clipping_scope(self):
+        window = self.make_window(np.arange(12.).reshape(3, 4))
+        window._restore_effective_plot_limits({'x_limits': [.1234567, 2.7654321],
+                                               'y_limits': [-.1234567, 1.8765432],
+                                               'color_limits': [2., 5.]})
+        self.assertEqual(window._visible_color_values().size, 4)
+        self.assertIn('of 4 visible valid cells', window.color_clipping_status.text())
 
     def test_nonfinite_visible_data_keeps_last_valid_color_limits_after_redraw(self) -> None:
         window = self.make_window(np.asarray([[1.0, 2.0], [np.nan, np.nan]]))
@@ -172,6 +228,8 @@ class ViewColorLimitsTests(unittest.TestCase):
 
         self.assertEqual(len(window._heat_meshes), 2)
         self.assertEqual(len(window._heat_colorbars), 2)
+        self.assertTrue(window.auto_color_btn.isEnabled())
+        window.auto_color_btn.click()
         first = np.nanpercentile(window.current_cube.z[:, :4], [0.5, 99.5])
         second = np.nanpercentile(window.current_cube.z[:, 4:], [0.5, 99.5])
         np.testing.assert_allclose(window._heat_meshes[0].get_clim(), first)

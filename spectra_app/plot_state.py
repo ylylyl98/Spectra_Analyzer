@@ -11,6 +11,9 @@ import tempfile
 
 from .dat_io import AXIS_OVERRIDE_ITEMS
 from .title_templates import manual_settings, validate_title_settings
+from .plot_presentation import NormSpec, PlotPresentation
+from .signal_titles import RAW_LABEL
+from .svg_export import build_color_norm
 
 
 _BOUND_NAMES = ("xmin", "xmax", "ymin", "ymax", "vmin", "vmax")
@@ -18,7 +21,7 @@ _ANNOTATION_NAMES = ("plot_title", "y_axis_name", "y_axis_unit", "signal_title")
 _REGIONAL_NAMES = ("color_scale_mode", "color_region_boundaries")
 _PROCESSING_DEFAULT = {
     "mode": "original", "smooth": True, "window_length": 21,
-    "original_signal_title": "ΔR/R (a. u.)",
+    "original_signal_title": RAW_LABEL,
 }
 
 
@@ -27,7 +30,7 @@ def source_fingerprint(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def validate_plot_state(plot: object, *, version: int = 2) -> dict:
+def validate_plot_state(plot: object, *, version: int = 3) -> dict:
     """Reject the whole recipe before any UI mutation, including non-finite JSON."""
     def exact_keys(value, keys):
         if not isinstance(value, dict) or set(value) != set(keys):
@@ -40,6 +43,16 @@ def validate_plot_state(plot: object, *, version: int = 2) -> dict:
             "bounds", "locks", "x_limits", "y_limits", "color_limits", "gate")
     if not isinstance(plot, dict):
         raise ValueError("Unexpected plot recipe fields")
+    if version not in (1, 2, 3):
+        raise ValueError("Incompatible recipe version")
+    norm, presentation = NormSpec(), PlotPresentation(width_in=3.30, frame_width_in=None, frame_height_in=None)
+    region_limits = []
+    if version == 3:
+        plot = dict(plot)
+        norm = NormSpec.from_dict(plot.pop('norm', {}))
+        presentation = PlotPresentation.from_dict(plot.pop('presentation', {}))
+        region_limits = plot.pop('color_region_limits', [])
+        version = 2
     signal_auto = plot.get("signal_title_auto", False)
     if type(signal_auto) is not bool:
         raise ValueError("Invalid automatic signal title setting")
@@ -110,10 +123,92 @@ def validate_plot_state(plot: object, *, version: int = 2) -> dict:
                 or (name == "color_limits" and pair[0] > pair[1])):
             raise ValueError("Invalid saved plot limits")
     plot = {**plot, "signal_title_auto": signal_auto}
+    if not isinstance(region_limits, list):
+        raise ValueError('Invalid saved regional color limits')
+    count = int(plot['color_scale_mode']) if plot['color_scale_mode'] in ('2', '3') else 0
+    if region_limits and len(region_limits) != count:
+        raise ValueError('Saved regional color limits do not match the region count')
+    for pair in region_limits:
+        if (not isinstance(pair, list) or len(pair) != 2 or not all(number(value) for value in pair)):
+            raise ValueError('Invalid saved regional color limits')
+        build_color_norm(norm, pair)
+    build_color_norm(norm, plot['color_limits'])
     if version == 1:
-        return {**plot, "title_settings": manual_settings(plot["annotations"]["plot_title"]),
-                "processing": dict(processing)}
-    return plot
+        plot = {**plot, "title_settings": manual_settings(plot["annotations"]["plot_title"])}
+    return {**plot, 'processing': dict(processing), 'norm': norm.to_dict(),
+            'presentation': presentation.to_dict(), 'color_region_limits': region_limits}
+
+
+class PlotCollection(dict):
+    """Canonical collection with read-only legacy active-recipe key projection.
+
+    JSON/dict iteration contains only collection fields; no saved active copy.
+    """
+    def __missing__(self, key):
+        return active_plot_recipe(self)[key]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def active_plot_recipe(collection):
+    if 'graphs' not in collection:
+        return collection
+    graph = next(record for record in collection['graphs']
+                 if record['graph_id'] == collection['active_graph_id'])
+    return {**graph['plot'], 'axis_override': collection['axis_override'],
+            'processing': collection['processing']}
+
+
+def validate_plot_collection(value, *, version=6):
+    from .dataset_state import validate_graph_source
+    if version in (1, 2, 3):
+        recipe = validate_plot_state(value, version=version)
+        axis, processing = recipe.pop('axis_override'), recipe.pop('processing')
+        return PlotCollection(axis_override=axis, processing=processing,
+                              active_graph_id='default', graphs=[{
+                                  'graph_id': 'default', 'name': 'Graph 1', 'plot': recipe,
+                                  'source_mode': 'processed', 'gate_indices': None, 'published': True}])
+    if (version not in (4, 5, 6) or not isinstance(value, dict)
+            or set(value) != {'axis_override', 'processing', 'graphs', 'active_graph_id'}
+            or not isinstance(value['graphs'], list) or not value['graphs']):
+        raise ValueError('Invalid graph collection.')
+    ids, names, records = set(), set(), []
+    for record in value['graphs']:
+        fields = {'graph_id', 'name', 'plot'} | ({'source_mode', 'gate_indices'} if version >= 5 else set())
+        if version >= 6:
+            fields.add('published')
+        if not isinstance(record, dict) or set(record) != fields:
+            raise ValueError('Invalid graph record.')
+        published = record.get('published', True)
+        if type(published) is not bool:
+            raise ValueError('Graph publication must be boolean.')
+        source_mode, gate_indices = record.get('source_mode', 'processed'), record.get('gate_indices')
+        validate_graph_source(source_mode, gate_indices)
+        graph_id, name, plot = record['graph_id'], record['name'], record['plot']
+        if (not isinstance(graph_id, str) or not graph_id.strip() or '\x00' in graph_id
+                or graph_id in ids or not isinstance(name, str) or not name.strip()
+                or name != name.strip() or '\x00' in name or name in names):
+            raise ValueError('Graph IDs and names must be nonempty and unique.')
+        if not isinstance(plot, dict) or 'processing' in plot or 'axis_override' in plot:
+            raise ValueError('Shared processing and axis belong to the DAT.')
+        normalized = validate_plot_state({**plot, 'processing': value['processing'],
+                                         'axis_override': value['axis_override']})
+        if set(plot) != set(normalized) - {'processing', 'axis_override'}:
+            raise ValueError('Invalid or missing graph fields.')
+        axis, processing = normalized.pop('axis_override'), normalized.pop('processing')
+        records.append({'graph_id': graph_id, 'name': name, 'plot': normalized,
+                        'published': published,
+                        'source_mode': source_mode, 'gate_indices': None if gate_indices is None else list(gate_indices)})
+        ids.add(graph_id)
+        names.add(name)
+    if not isinstance(value['active_graph_id'], str) or value['active_graph_id'] not in ids:
+        raise ValueError('Active graph does not exist.')
+    return PlotCollection(axis_override=axis, processing=processing, graphs=records,
+                          active_graph_id=value['active_graph_id'])
 
 
 class PlotStateStore:
@@ -129,18 +224,18 @@ class PlotStateStore:
         except (OSError, ValueError, UnicodeError):
             return None, "Saved plot settings ignored: the recipe could not be read."
         try:
-            if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] not in (1, 2):
+            if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] not in (1, 2, 3, 4, 5, 6):
                 raise ValueError("Incompatible recipe")
             if payload.get("fingerprint") != fingerprint:
                 return None, "Saved plot settings ignored: DAT content has changed."
-            return validate_plot_state(payload.get("plot"), version=payload["version"]), ""
+            return validate_plot_collection(payload.get("plot"), version=payload["version"]), ""
         except (ValueError, TypeError, OverflowError):
             return None, "Saved plot settings ignored: the recipe is invalid or incompatible."
 
     def save(self, path: Path, fingerprint: str, plot: dict) -> None:
-        plot = validate_plot_state(plot)
+        plot = validate_plot_collection(plot, version=6 if 'graphs' in plot else 3)
         # The sidecar's name associates the pair; the informational name is portable.
-        payload = {"version": 2, "source_file": path.name,
+        payload = {"version": 6, "source_file": path.name,
                    "fingerprint": fingerprint, "plot": plot}
         temporary = None
         try:

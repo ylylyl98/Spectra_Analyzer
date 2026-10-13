@@ -205,8 +205,63 @@ class BackgroundAnalysisTests(unittest.TestCase):
             w.maxfev_spin.setValue(original_maxfev + 1)
             self.release.set()
             wait_jobs(w)
-        self.assertEqual(captured, [original_maxfev, original_maxfev])
+        self.assertEqual(captured, [original_maxfev])
         self.assertEqual(w.batch_fit_result_map, {})
+
+    def test_invalidated_batch_stops_after_current_gate(self):
+        w = self.window
+        for change in ('clear', 'fit_range', 'search_range', 'seeds', 'fit_full', 'use_view', 'toolbar_range'):
+            with self.subTest(change=change):
+                w.batch_peak_map = {0: np.array([50]), 1: np.array([50])}
+                w.peak_indices = np.array([50])
+                w._peak_gate_idx = 0
+                self.release.clear()
+                started, calls = threading.Event(), []
+                def solver(*args, **kwargs):
+                    calls.append(True)
+                    started.set()
+                    self.release.wait(2)
+                    return _fit_result(10)
+                with patch('spectra_app.main_window.fit_multi_peak', side_effect=solver):
+                    w._on_batch_fit_all_gates()
+                    self.assertTrue(started.wait(1))
+                    if change == 'clear':
+                        w._on_clear_fit()
+                    elif change == 'fit_range':
+                        w.fit_xmin_spin.setValue(w.fit_xmin_spin.value()+.1)
+                    elif change == 'search_range':
+                        w.xmin_spin.setValue(w.xmin_spin.value()+.1)
+                    elif change == 'fit_full':
+                        w._on_set_fit_full_range()
+                    elif change == 'use_view':
+                        w._on_use_current_x_range()
+                    elif change == 'toolbar_range':
+                        w._heat_ax.set_xlim(w.xmin_spin.value()+.1, w.xmax_spin.value())
+                    else:
+                        w._on_clear_peaks()
+                    self.release.set()
+                    wait_jobs(w)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(w.batch_fit_result_map, {})
+
+    def test_analysis_input_edits_do_not_cancel_unrelated_background_work(self):
+        w = self.window
+        started, applied = threading.Event(), []
+        def work(context):
+            started.set()
+            self.release.wait(2)
+            context.check_cancelled()
+            return 7
+        w._start_background_job(work, applied.append, 'Folder discovery')
+        self.assertTrue(started.wait(1))
+        with patch.object(w, '_analysis_job_key', side_effect=AssertionError('unnecessary seed hashing')):
+            w.maxfev_spin.setValue(w.maxfev_spin.value()+1)
+            w.plot_title_edit.setText('new title')
+            w._set_current_gate_from_index(1, update_plot=True)
+            w._on_clear_fit()
+        self.release.set()
+        wait_jobs(w)
+        self.assertEqual(applied, [7])
 
     def test_cancel_running_batch_fit_keeps_previous_results(self):
         w = self.window
@@ -243,6 +298,9 @@ class BackgroundAnalysisTests(unittest.TestCase):
         with patch('spectra_app.main_window.fit_multi_peak', side_effect=solver):
             w._on_fit()
             self.assertTrue(started.wait(2))
+            # An explicitly changed request still supersedes the running fit;
+            # repeated clicks with identical inputs are now ignored by the UI.
+            w.lw_min_spin.setValue(12)
             w._on_fit()
             self.release.set()
             wait_jobs(w)

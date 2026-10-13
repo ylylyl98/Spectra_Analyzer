@@ -8,6 +8,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication
 from spectra_app.main_window import MainWindow
 from spectra_app.processing import energy_second_derivative
+from tests.background_helpers import wait_jobs
 from tests.settings_helpers import isolate_settings
 
 _APP = QApplication.instance() or QApplication([])
@@ -38,6 +39,7 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         w.processing_smooth_chk.setChecked(False)
         w.processing_window_spin.setValue(9)
         w._on_generate_heatmap()
+        wait_jobs(w)
 
     def test_fixed_processing_overrides_recall_and_restart_without_cumulative_derivative(self):
         a, b = self.source("a"), self.source("b", scale=4)

@@ -82,8 +82,8 @@ class CustomColormapTests(unittest.TestCase):
     def test_selector_resolves_custom_and_builtin_colormaps_on_real_heatmap(self) -> None:
         window = self.make_window()
         self.assertEqual(window.cmap_combo.currentText(), "RdBu_r")
-        for name in (*CUSTOM_COLORMAP_NAMES, "viridis"):
-            window.cmap_combo.setCurrentText(name)
+        for name in (*CUSTOM_COLORMAP_NAMES, "jet", "viridis"):
+            window.cmap_combo.setCurrentIndex(window.cmap_combo.findData(name))
             cmap = window._heat_mesh.get_cmap()
             if name in CUSTOM_COLORMAP_NAMES:
                 expected = _read_jasc_palette(_PALETTE_DIR / f"{name}.pal")
@@ -91,6 +91,37 @@ class CustomColormapTests(unittest.TestCase):
                 np.testing.assert_array_equal(np.asarray(cmap.colors), expected)
             else:
                 self.assertEqual(cmap.name, name)
+
+    def test_common_palettes_have_previews_and_canonical_saved_values(self):
+        window = self.make_window()
+        self.assertEqual([window.cmap_combo.itemText(i) for i in range(3)],
+                         ['jet', 'RdBu_r', 'RdBu_r_0.6'])
+        for i in range(3):
+            self.assertFalse(window.cmap_combo.itemIcon(i).isNull())
+        window.cmap_combo.setCurrentIndex(2)
+        window._capture_dataset_controls()
+        self.assertEqual(window._unregistered_session.view.colormap, 'RdBu_r_p0p6')
+
+    def test_native_selection_of_current_default_preserves_manual_choice_for_fresh_pl(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtCore import Qt
+        import tempfile
+        window = self.make_window()
+        window.show(); _APP.processEvents()
+        self.assertFalse(window._colormap_manual)
+        window.cmap_combo.showPopup(); _APP.processEvents()
+        view = window.cmap_combo.view()
+        rect = view.visualRect(window.cmap_combo.model().index(1, 0))
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=rect.center())
+        self.assertEqual(window.cmap_combo.currentText(), 'RdBu_r')
+        self.assertTrue(window._colormap_manual)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fresh_PL730nm.dat'
+            path.write_text('Energy(eV) 0 1\n1 1 2\n2 3 4\n3 5 6\n', encoding='utf-8')
+            window._load_dat_file_direct(path)
+            self.assertEqual(window.cmap_combo.currentText(), 'RdBu_r')
+            self.assertEqual(window.signal_title_combo.currentText(), 'PL (arb. units)')
+            window.current_dat_path = None
 
     def test_palette_only_selection_preserves_color_limits(self) -> None:
         window = self.make_window()
@@ -105,6 +136,20 @@ class CustomColormapTests(unittest.TestCase):
             (window._heat_mesh.norm.vmin, window._heat_mesh.norm.vmax),
             before,
         )
+
+    def test_palette_selection_preserves_exact_norm_and_view_at_subcontrol_precision(self):
+        window = self.make_window()
+        window._heat_mesh.set_clim(.1234567, 9.8765432)
+        window._heat_ax.set_xlim(.1234567, 2.8765432)
+        original_norm = window._heat_mesh.norm
+        original_limits = window._heat_mesh.get_clim()
+        original_view = window._heat_ax.get_xlim()
+        data = window.current_cube.z.copy()
+        window.cmap_combo.setCurrentText('RdBu_r_0.6')
+        self.assertIs(window._heat_mesh.norm, original_norm)
+        self.assertEqual(window._heat_mesh.get_clim(), original_limits)
+        self.assertEqual(window._heat_ax.get_xlim(), original_view)
+        np.testing.assert_array_equal(window.current_cube.z, data)
 
 
 if __name__ == "__main__":

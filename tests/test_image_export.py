@@ -1,6 +1,8 @@
 import os
+import json
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,7 @@ from spectra_app.image_export import (
     export_figure_png,
 )
 from spectra_app.main_window import MainWindow
+from spectra_app.svg_export import write_svg_png
 from tests.settings_helpers import isolate_settings
 
 
@@ -110,7 +113,7 @@ class ImageExportTests(unittest.TestCase):
         self.assertEqual(heat_ax.yaxis.label.get_fontsize(), 12)
         self.assertTrue(all(label.get_fontsize() == 12 for label in heat_ax.get_xticklabels()))
         self.assertTrue(all(label.get_fontsize() == 12 for label in heat_ax.get_yticklabels()))
-        self.assertEqual(colorbar_ax.get_xlabel(), "ΔR/R (a. u.)")
+        self.assertEqual(colorbar_ax.get_xlabel(), "Signal (arb. units)")
         self.assertEqual(colorbar_ax.title.get_fontsize(), 12)
         self.assertEqual(tuple(colorbar_ax.get_xticks()), (2.0, 19.0))
         self.assertTrue(all(label.get_fontsize() == 12 for label in colorbar_ax.get_xticklabels()))
@@ -118,7 +121,7 @@ class ImageExportTests(unittest.TestCase):
 
     def test_detached_export_copies_mesh_coordinates_array_cmap_norm_and_ranges(self) -> None:
         window = self.make_window()
-        window.cmap_combo.setCurrentText("RdBu_r_p0p6")
+        window.cmap_combo.setCurrentText("RdBu_r_0.6")
         window._heat_ax.set_xlim(2.0, 7.0)
         window._heat_ax.set_ylim(1.2, 2.8)
         window.vmin_spin.setValue(2.0)
@@ -367,47 +370,91 @@ class ImageExportTests(unittest.TestCase):
             source.write_text("Energy(eV) 0 1\n1.0 1 2\n1.1 2 3\n1.2 3 4\n", encoding="utf-8")
             window._load_dat_file_direct(source)
             window.plot_title_edit.setText("Saved title")
+            window._render_plot_page()
+            self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
             browsing_folder = Path(tmp) / "other-folder"
             browsing_folder.mkdir()
             window.current_folder = str(browsing_folder)
             sidecar = source.with_name("source.dat.plot.json")
             self.assertFalse(sidecar.exists())
+            existing = Path(tmp) / "source_Graph 1_export01.png"
+            existing.write_bytes(b"preserve original export")
             with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")):
                 window._on_export_png()
-            output = Path(tmp) / "source_export01.png"
+            output = Path(tmp) / "source_Graph 1_export02.png"
             self.assertTrue(output.is_file())
+            self.assertEqual(existing.read_bytes(), b"preserve original export")
             self.assertTrue(sidecar.is_file())
-            self.assertFalse((browsing_folder / "source_export01.png").exists())
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(payload["version"], 4)
+            self.assertEqual(payload["plot"]["graphs"][0]["plot"]["annotations"]["plot_title"], "Saved title")
+            self.assertFalse((browsing_folder / "source_Graph 1_export02.png").exists())
             self.assertIn(str(output), window.statusBar().currentMessage())
             with Image.open(output) as image:
                 self.assertEqual(image.format, "PNG")
+                metadata = json.loads(image.info["SpectraAnalyzer"])
+            self.assertEqual(metadata["plot_title"], "Saved title")
+            self.assertEqual(metadata["source_path"], str(source))
             window.close()
         self.assertTrue(window.export_png_btn.isEnabled())
 
-    def test_main_window_export_passes_heatmap_and_colorbar_axes_only(self) -> None:
+    def test_main_window_export_uses_current_svg_without_spectrum_or_editing_handles(self) -> None:
         window = self.make_window()
+        window._spec_ax.set_title("Spectrum-only export sentinel")
+        window._spec_ax.lines[0].set_gid("spectrum-only-line")
+        window._render_plot_page()
+        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+        annotation = window.plot_page.add_annotation("arrow", "Formal annotation")
+        window._render_plot_page()
+        page = window.plot_page.rendered_page
+        self.assertIsNotNone(page, window.plot_page.status_label.text())
+        self.assertEqual(window.plot_page.preview.selected_id, annotation.id)
+        preview_bytes = window.plot_page.preview.svg_bytes
+        root = ET.fromstring(preview_bytes)
+        self.assertIn("Formal annotation", ''.join(root.itertext()))
+        self.assertNotIn("Spectrum-only export sentinel", ''.join(root.itertext()))
+        self.assertNotIn("spectrum-only-line", preview_bytes.decode())
+        self.assertNotIn("editing-handle", preview_bytes.decode())
+        self.assertEqual(len(root.findall('.//{http://www.w3.org/2000/svg}image')), 1)
         with tempfile.TemporaryDirectory() as tmp:
             window.current_folder = tmp
-            path = Path(tmp) / "heatmap_export01.png"
+            path = Path(tmp) / "heatmap_Graph 1_export01.png"
             with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), patch(
-                "spectra_app.main_window.export_figure_png", wraps=export_figure_png
-            ) as export:
+                "spectra_app.main_window.write_svg_png", wraps=write_svg_png
+            ) as export, patch("spectra_app.main_window.render_hybrid_svg", side_effect=AssertionError("Export must use the current preview")):
                 window._on_export_png()
-            self.assertEqual(export.call_args.kwargs["selected_axes"], (window._heat_ax, window._heat_colorbar.ax))
+            self.assertIs(export.call_args.args[0], page)
+            self.assertEqual(export.call_args.args[0].svg_bytes, preview_bytes)
+            self.assertIs(window.plot_page.rendered_page, page)
             self.assertTrue(path.is_file())
+            reference = write_svg_png(page, Path(tmp) / "same-page-reference.png")
+            with Image.open(path) as actual, Image.open(reference) as expected:
+                self.assertEqual(actual.size, expected.size)
+                self.assertEqual(actual.convert("RGBA").tobytes(), expected.convert("RGBA").tobytes())
 
     def test_main_window_export_action_reports_save_failure(self) -> None:
         window = self.make_window()
+        window._render_plot_page()
+        page = window.plot_page.rendered_page
+        self.assertIsNotNone(page, window.plot_page.status_label.text())
         errors: list[str] = []
         window._show_error = errors.append
         with tempfile.TemporaryDirectory() as tmp:
             window.current_folder = tmp
+            existing = Path(tmp) / "heatmap_Graph 1_export01.png"
+            existing.write_bytes(b"preserve original export")
             with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), patch(
-                "spectra_app.main_window.export_figure_png", side_effect=OSError("disk full")
-            ):
+                "spectra_app.main_window.write_svg_png", side_effect=OSError("disk full")
+            ) as export:
                 window._on_export_png()
+            self.assertIs(export.call_args.args[0], page)
+            self.assertEqual(export.call_args.args[1], Path(tmp) / "heatmap_Graph 1_export02.png")
+            self.assertFalse((Path(tmp) / "heatmap_Graph 1_export02.png").exists())
+            self.assertEqual(existing.read_bytes(), b"preserve original export")
         self.assertTrue(errors)
         self.assertIn("PNG", errors[-1])
+        self.assertIn("disk full", errors[-1])
+        self.assertIs(window.plot_page.rendered_page, page)
 
     def test_main_window_export_action_is_guarded_without_data(self) -> None:
         window = MainWindow()
@@ -415,8 +462,10 @@ class ImageExportTests(unittest.TestCase):
         errors: list[str] = []
         window._show_error = errors.append
         self.assertFalse(window.export_png_btn.isEnabled())
-        window._on_export_png()
-        self.assertEqual(errors, ["Load a DAT file first."])
+        with patch("spectra_app.main_window.write_svg_png") as export:
+            window._on_export_png()
+        export.assert_not_called()
+        self.assertEqual(errors, ["Failed to export PNG: The formal page is not ready. Wait for the current preview."])
 
 
 if __name__ == "__main__":

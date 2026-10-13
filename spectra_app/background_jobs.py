@@ -134,7 +134,9 @@ def prepare_dat(request: LoadRequest, context: JobContext):
     context.check_cancelled()
     saved_plot, notice = (PlotStateStore().load(request.path, fingerprint)
                           if request.recall else (None, ""))
-    if saved_plot is not None and saved_plot["colormap"] not in request.colormaps:
+    recipes = ([record['plot'] for record in saved_plot['graphs']] if saved_plot and 'graphs' in saved_plot
+               else [saved_plot] if saved_plot else [])
+    if any(recipe['colormap'] not in request.colormaps for recipe in recipes):
         saved_plot = None
         notice = "Saved plot settings ignored: the colormap is unavailable."
     override = saved_plot["axis_override"] if saved_plot else request.override
@@ -144,6 +146,33 @@ def prepare_dat(request: LoadRequest, context: JobContext):
         raise ValueError("DAT content changed while loading. Please load it again.")
     context.check_cancelled()
     return cube, fingerprint, saved_plot, notice
+
+
+@dataclass(frozen=True)
+class DatImportError:
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class DatBatchPreparation:
+    prepared: tuple[tuple[Path, tuple], ...]
+    errors: tuple[DatImportError, ...]
+
+
+def prepare_dat_batch(requests: tuple[LoadRequest, ...], context: JobContext) -> DatBatchPreparation:
+    """Prepare one ordered batch; expected file failures do not abort other files."""
+    prepared, errors = [], []
+    for index, request in enumerate(requests, 1):
+        context.report(f'Importing DAT {index}/{len(requests)}: {request.path.name}…')
+        try:
+            result = prepare_dat(request, context)
+        except (OSError, ValueError) as exc:
+            errors.append(DatImportError(request.path, str(exc)))
+        else:
+            prepared.append((request.path, result))
+        context.check_cancelled()
+    return DatBatchPreparation(tuple(prepared), tuple(errors))
 
 
 def discover_folders(root: Path, context: JobContext):

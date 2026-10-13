@@ -39,17 +39,23 @@ class PresentationContractTests(unittest.TestCase):
 
     def test_wheel_preserves_focused_controls_and_scrolls_parent_page(self):
         w = self.window
+        w.resize(1100, 680)
         w.show()
         _APP.processEvents()
-        scroll = w.findChild(QScrollArea)
-        scroll.verticalScrollBar().setValue(0)
-        for control in (w.cmap_combo, w.peak_smooth_win_spin, w.xmin_spin):
+        w._analysis_tabs.setCurrentIndex(0)
+        for control, scroll in ((w.cmap_combo, w._view_sidebar_scroll),
+                                (w.peak_smooth_win_spin, w._analysis_sidebar_scroll),
+                                (w.xmin_spin, w._view_sidebar_scroll)):
+            w._sidebar_tabs.setCurrentWidget(scroll)
+            _APP.processEvents()
             control.setFocus()
+            scroll.verticalScrollBar().setValue(0)
             before = control.currentIndex() if hasattr(control, 'currentIndex') else control.value()
             wheel(control)
             after = control.currentIndex() if hasattr(control, 'currentIndex') else control.value()
             self.assertEqual(after, before)
-        self.assertGreater(scroll.verticalScrollBar().value(), 0)
+            self.assertGreater(scroll.verticalScrollBar().value(), 0,
+                               (type(control).__name__, scroll.verticalScrollBar().maximum(), control.isVisible()))
         dialog = QDialog(w)
         for control in (QSpinBox(dialog), QSlider(Qt.Horizontal, dialog)):
             control.setValue(50)
@@ -63,7 +69,7 @@ class PresentationContractTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual((w._heat_ax.get_xlim(), w._heat_ax.get_ylim()), limits)
         w.peak_smooth_win_spin.stepUp()
-        self.assertEqual(w.peak_smooth_win_spin.value(), 12)
+        self.assertEqual(w.peak_smooth_win_spin.value(), 13)
 
     def test_annotations_are_independent_exact_and_synchronized(self):
         w = self.window
@@ -88,21 +94,30 @@ class PresentationContractTests(unittest.TestCase):
         w.y_axis_unit_edit.clear()
         self.assertEqual(w._heat_ax.get_ylabel(), 'Bias')
 
-    def test_fixed_export_plot_area_all_fonts_and_landscape_preview(self):
+    def test_live_presentation_fonts_and_legacy_fixed_export_contract(self):
         w = self.window
         for size in ((8.,6.), (12.,8.)):
             w.figure.set_size_inches(*size)
             w._layout_live_plots()
             w.canvas.draw()
             box = w._heat_ax.get_window_extent()
-            self.assertAlmostEqual(box.width / box.height, 4 / 3, places=6)
+            self.assertAlmostEqual(box.width / box.height, 2.9/2.8, places=6)
+            p = (w.workspace.active or w._unregistered_session).presentation
+            factor = 96*w._analysis_display_scale()*w.canvas.device_pixel_ratio/w.figure.dpi
+            for axis in (w._heat_ax, w._heat_colorbar.ax):
+                self.assertTrue(all(text.get_fontsize() == p.text_pt*factor
+                                    for text in (axis.title, axis.xaxis.label, axis.yaxis.label)))
+                self.assertTrue(all(text.get_fontsize() == p.numeric_pt*factor
+                                    for text in (*axis.get_xticklabels(), *axis.get_yticklabels())))
+            self.assertTrue(all(text.get_fontsize() == p.numeric_pt*factor
+                                for text in (w._heat_ax.xaxis.get_offset_text(), w._heat_ax.yaxis.get_offset_text())))
             detached = _build_heatmap_export_figure(w.figure, selected_axes=(w._heat_ax, w._heat_colorbar.ax))
             detached.canvas.draw()
             box = detached.axes[0].get_window_extent()
             self.assertAlmostEqual(box.width / detached.dpi, 4.0, places=6)
             self.assertAlmostEqual(box.height / detached.dpi, 3.0, places=6)
-            for figure in (w.figure, detached):
-                for axis in figure.axes:
+            for figure, axes in ((w.figure, (w._spec_ax,)), (detached, detached.axes)):
+                for axis in axes:
                     texts = [axis.title, axis.xaxis.label, axis.yaxis.label, axis.xaxis.get_offset_text(), axis.yaxis.get_offset_text(), *axis.get_xticklabels(), *axis.get_yticklabels()]
                     self.assertTrue(all(text.get_fontsize() == 12 for text in texts))
             with tempfile.TemporaryDirectory() as tmp:
@@ -136,8 +151,12 @@ class PresentationContractTests(unittest.TestCase):
                         renderer = figure.canvas.get_renderer()
                         heat_bounds = heat.get_window_extent(renderer)
                         gap = (bar.get_window_extent(renderer).y0 - heat_bounds.y1) / figure.dpi
-                        self.assertGreaterEqual(gap, .03)
-                        self.assertLessEqual(gap, .05)
+                        if figure is w.figure:
+                            factor = 96*w._analysis_display_scale()*w.canvas.device_pixel_ratio/w.figure.dpi
+                            self.assertAlmostEqual(gap, w._unregistered_session.presentation.colorbar.frame_gap_in*factor)
+                        else:
+                            self.assertGreaterEqual(gap, .03)
+                            self.assertLessEqual(gap, .05)
                         quantity = bar.xaxis.label.get_window_extent(renderer)
                         self.assertGreater(quantity.y0, heat_bounds.y1)
                         offset = heat.yaxis.get_offset_text()
@@ -152,22 +171,29 @@ class PresentationContractTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData(mode))
                 w.canvas.draw()
+                p = w._unregistered_session.presentation
+                factor = 96*w._analysis_display_scale()*w.canvas.device_pixel_ratio/w.figure.dpi
                 self.assertEqual([bar.ax.get_xlabel() for bar in w._heat_colorbars], [""] * len(names))
                 self.assertTrue(all(
-                    abs(bar.ax.get_position().width * w.figure.get_size_inches()[0] - 0.6) < 1e-6
-                    and abs(bar.ax.get_position().height * w.figure.get_size_inches()[1] - 0.045) < 1e-6
+                    bar.ax.get_position().width * w.figure.get_size_inches()[0] >= p.colorbar.width_in*factor - 1e-6
+                    and abs(bar.ax.get_position().height * w.figure.get_size_inches()[1] - p.colorbar.height_in*factor) < 1e-6
                     for bar in w._heat_colorbars
                 ))
                 self.assertTrue(all(
-                    6.5 <= text.get_fontsize() <= 8.0
+                    text.get_fontsize() == p.numeric_pt*factor
                     for bar in w._heat_colorbars
-                    for text in [bar.ax.xaxis.label, *bar.ax.get_xticklabels()]
+                    for text in bar.ax.get_xticklabels()
                 ))
+                self.assertEqual(w._heat_signal_label.get_fontsize(), p.text_pt*factor)
+                self.assertTrue(all(len(bar.get_ticks()) == 3 for bar in w._heat_colorbars))
                 self.assertEqual(
                     [text.get_text() for text in w.figure.texts if text.get_gid() == "heatmap_signal_label"],
-                    ["d²(ΔR/R)/dE² (a. u.)"],
+                    ["d²(ΔR/R)/dE² (arb. units)"],
                 )
                 renderer = w.canvas.get_renderer()
+                ticks = [tick.get_window_extent(renderer) for bar in w._heat_colorbars
+                         for tick in bar.ax.get_xticklabels()]
+                self.assertTrue(all(not a.overlaps(b) for a, b in zip(ticks, ticks[1:])))
                 title = w._heat_ax.title.get_window_extent(renderer)
                 self.assertTrue(all(
                     not title.overlaps(tick.get_window_extent(renderer))
@@ -237,7 +263,7 @@ class PresentationContractTests(unittest.TestCase):
                         self.assertTrue(all(not title_bounds.overlaps(text.get_window_extent(renderer)) for text in bar.get_xticklabels()))
                         self.assertLessEqual(title_bounds.y1, page.y1)
 
-    def test_manual_title_is_close_to_plot_upper_left_without_annotation_overlap(self):
+    def test_live_title_is_inside_frame_and_legacy_export_retains_header_contract(self):
         w = self.window
         for size in ((4., 5.), (8., 6.), (12., 8.)):
             w.figure.set_size_inches(*size)
@@ -252,16 +278,22 @@ class PresentationContractTests(unittest.TestCase):
                             figure.canvas.draw()
                             renderer = figure.canvas.get_renderer()
                             self.assertEqual(artist.get_text(), title)
-                            self.assertEqual(bar.get_xlabel(), 'ΔR/R (a. u.)')
+                            self.assertEqual(bar.get_xlabel(), 'Signal (arb. units)')
                             if not title:
                                 continue
                             bounds = artist.get_window_extent(renderer)
                             plot = heat.get_window_extent(renderer)
+                            if figure is w.figure:
+                                self.assertAlmostEqual(bounds.x0, plot.x0+.02*plot.width, delta=.1)
+                                self.assertAlmostEqual(bounds.y1, plot.y0+.98*plot.height, delta=.1)
+                                self.assertTrue(artist.get_clip_on())
+                                self.assertFalse(artist.get_in_layout())
+                                continue
                             self.assertAlmostEqual(bounds.x0, plot.x0, delta=.1)
                             gap = (bounds.y0 - plot.y1) / figure.dpi
                             self.assertGreaterEqual(gap, .03)
                             self.assertLess(gap, .40)
-                            if title == 'E=18V 9T Kp' and limits == (1., 3.) and size != (4., 5.):
+                            if figure is detached and title == 'E=18V 9T Kp' and limits == (1., 3.) and size != (4., 5.):
                                 self.assertLessEqual(gap, .06)
                             for text in (bar.xaxis.label, *bar.get_xticklabels(), heat.yaxis.get_offset_text()):
                                 if text.get_text():
@@ -270,7 +302,7 @@ class PresentationContractTests(unittest.TestCase):
     def test_short_filename_is_readable_and_independent_of_title_and_view(self):
         w = self.window
         original = w._heatmap_export_filename()
-        self.assertEqual(original, 'sample_export01.png')
+        self.assertEqual(original, 'sample_Graph 1_export01.png')
         self.assertEqual(w._heatmap_export_filename(), original)
         w.plot_title_edit.setText('not_a_filename')
         w.fit_smooth_chk.setChecked(True)
@@ -292,11 +324,14 @@ class PresentationContractTests(unittest.TestCase):
         source = 'C:/measurements/原始数据/' + stem + '.dat'
         w.current_cube = replace(w.current_cube, source_path=source)
         filename = w._heatmap_export_filename()
-        self.assertEqual(filename, stem + '_export01.png')
+        self.assertEqual(filename, stem + '_Graph 1_export01.png')
         w.current_cube = replace(w.current_cube, source_path=source.replace('rep01', 'rep02'))
         self.assertNotEqual(w._heatmap_export_filename(), filename)
         w.current_cube = replace(w.current_cube, source_path=source)
         w.plot_title_edit.setText('Independent display title')
+        w.plot_page.height_spin.setValue(4.5)  # Space for the deliberately long provenance title.
+        w._render_plot_page()
+        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_label.text())
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / filename
             w.current_folder = tmp
@@ -311,39 +346,41 @@ class PresentationContractTests(unittest.TestCase):
             self.assertEqual(metadata['color_limits'], list(w._heat_mesh.get_clim()))
             self.assertEqual(metadata['x_label'], 'X')
             self.assertEqual(metadata['y_label'], 'Doping (V)')
-            self.assertEqual(metadata['signal_label'], 'ΔR/R (a. u.)')
+            self.assertEqual(metadata['signal_label'], 'Signal (arb. units)')
             self.assertEqual(metadata['colormap'], 'RdBu_r')
             self.assertEqual(metadata['axis_original_type'], 'pixel')
             self.assertIsNone(metadata['axis_override'])
             self.assertEqual(metadata['processing'], 'raw')
             self.assertEqual(metadata['plot_title'], 'Independent display title')
-        w.current_cube = replace(w.current_cube, source_path='$' + 's' * 240 + '.dat')
-        self.assertEqual(w._heatmap_export_filename(), '$' + 's' * 240 + '_export01.png')
+        w.current_cube = replace(w.current_cube, source_path='$' + 's' * 232 + '.dat')
+        self.assertEqual(w._heatmap_export_filename(), '$' + 's' * 232 + '_Graph 1_export01.png')
         w.current_cube = replace(w.current_cube, source_path='s' * 250 + '.dat')
         with self.assertRaisesRegex(ValueError, 'too long'):
             w._heatmap_export_filename()
 
     def test_png_export_uses_next_unused_sequence_in_current_dat_folder(self):
         w = self.window
+        w._render_plot_page()
+        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_label.text())
         with tempfile.TemporaryDirectory() as tmp:
             w.current_folder = tmp
-            existing = Path(tmp) / 'sample_export01.png'
+            existing = Path(tmp) / 'sample_Graph 1_export01.png'
             existing.write_bytes(b'preserve original export')
-            third = Path(tmp) / 'sample_export03.png'
+            third = Path(tmp) / 'sample_Graph 1_export03.png'
             third.write_bytes(b'preserve third export')
             with patch('spectra_app.main_window.QFileDialog.getSaveFileName', side_effect=AssertionError('PNG must save without a dialog')):
                 w._on_export_png()
-                self.assertTrue((Path(tmp) / 'sample_export02.png').is_file())
+                self.assertTrue((Path(tmp) / 'sample_Graph 1_export02.png').is_file())
                 w._on_export_png()
-                self.assertTrue((Path(tmp) / 'sample_export04.png').is_file())
+                self.assertTrue((Path(tmp) / 'sample_Graph 1_export04.png').is_file())
             self.assertEqual(existing.read_bytes(), b'preserve original export')
             self.assertEqual(third.read_bytes(), b'preserve third export')
-            self.assertEqual(w._heatmap_export_filename(), 'sample_export05.png')
+            self.assertEqual(w._heatmap_export_filename(), 'sample_Graph 1_export05.png')
             next_folder = Path(tmp) / 'next'
             next_folder.mkdir()
             w.current_folder = str(next_folder)
             w._on_export_png()
-            self.assertTrue((next_folder / 'sample_export01.png').is_file())
+            self.assertTrue((next_folder / 'sample_Graph 1_export01.png').is_file())
 
     def test_spectrum_legend_fit_stats_and_peak_annotations_use_twelve_point_text(self):
         w = self.window

@@ -1,0 +1,74 @@
+"""Width-aware Project rows, using Qt's native item rendering and navigation."""
+from PySide6.QtCore import QEvent, QRect, Qt
+from PySide6.QtGui import QTextLayout, QTextOption
+from PySide6.QtWidgets import QHeaderView, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QTreeWidget
+
+
+class _ProjectItemDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        tree = self.parent()
+        style = tree.style()
+        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, option, tree)
+        margin = style.pixelMetric(QStyle.PM_FocusFrameHMargin, option, tree) + 1
+        width = max(1, text_rect.width() - 2 * margin)
+        layout = QTextLayout(option.text, option.font)
+        text_option = QTextOption()
+        text_option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        text_option.setTextDirection(option.direction)
+        layout.setTextOption(text_option)
+        # Qt's native item style uses WordWrap, which clips unbroken filenames.
+        # Supply display-only line breaks; model text and accessible names stay intact.
+        # QTextLine offsets count UTF-16 units, including supplementary characters.
+        encoded = option.text.encode('utf-16-le')
+        lines = []
+        layout.beginLayout()
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(width)
+            start = line.textStart() * 2
+            end = start + line.textLength() * 2
+            lines.append(encoded[start:end].decode('utf-16-le').rstrip('\u2028'))
+        layout.endLayout()
+        option.text = '\u2028'.join(lines)
+        # Only these measured breaks should wrap; a second WordWrap pass can
+        # turn a trailing space at the boundary into an extra empty line.
+        option.features &= ~QStyleOptionViewItem.WrapText
+
+    def sizeHint(self, option, index):
+        tree = self.parent()
+        depth = int(tree.rootIsDecorated())
+        ancestor = index.parent()
+        while ancestor.isValid():
+            depth += 1
+            ancestor = ancestor.parent()
+        option = QStyleOptionViewItem(option)
+        # QTreeView supplies an invalid size-hint rectangle. Give the native
+        # delegate the same usable column width that paint() receives.
+        width = max(1, tree.viewport().width() - depth * tree.indentation())
+        option.rect = QRect(0, 0, width, 1)
+        option.features |= QStyleOptionViewItem.WrapText
+        return super().sizeHint(option, index)
+
+
+class ProjectTreeWidget(QTreeWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWordWrap(True)
+        self.setTextElideMode(Qt.ElideNone)
+        self.setUniformRowHeights(False)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.header().setSectionResizeMode(QHeaderView.Stretch)
+        self.setItemDelegate(_ProjectItemDelegate(self))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # This also runs when a vertical scrollbar changes the viewport width.
+        self.scheduleDelayedItemsLayout()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange, QEvent.LayoutDirectionChange):
+            self.scheduleDelayedItemsLayout()

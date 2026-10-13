@@ -15,6 +15,8 @@ from PySide6.QtWidgets import QApplication
 from spectra_app.dat_io import DataCube
 from spectra_app.main_window import MainWindow
 from spectra_app.processing import energy_second_derivative
+from spectra_app.signal_titles import RAW_LABEL
+from tests.background_helpers import wait_jobs
 from tests.settings_helpers import isolate_settings, wait_for_background_jobs
 
 
@@ -81,11 +83,13 @@ class HeatmapProcessingTests(unittest.TestCase):
         window.processing_mode_combo.setCurrentIndex(
             window.processing_mode_combo.findData("energy_second_derivative"))
         window._on_generate_heatmap()
+        wait_jobs(window)
         np.testing.assert_allclose(window.current_cube.z, expected)
         np.testing.assert_allclose(window._base_cube.z, original)
         self.assertIn("d²", window.signal_title_combo.currentText())
 
         window._on_generate_heatmap()
+        wait_jobs(window)
         np.testing.assert_allclose(window.current_cube.z, expected)
 
     def test_original_restores_exact_source_after_processing(self):
@@ -94,8 +98,10 @@ class HeatmapProcessingTests(unittest.TestCase):
         window.processing_mode_combo.setCurrentIndex(
             window.processing_mode_combo.findData("energy_second_derivative"))
         window._on_generate_heatmap()
+        wait_jobs(window)
         window.processing_mode_combo.setCurrentIndex(
             window.processing_mode_combo.findData("original"))
+        window._on_generate_heatmap()
         np.testing.assert_array_equal(window.current_cube.z, original)
         self.assertEqual(window._processing_mode, "original")
 
@@ -106,6 +112,7 @@ class HeatmapProcessingTests(unittest.TestCase):
             window.processing_mode_combo.setCurrentIndex(
                 window.processing_mode_combo.findData("energy_second_derivative"))
             window._on_generate_heatmap()
+            wait_jobs(window)
         np.testing.assert_array_equal(window.current_cube.z, original)
         show_error.assert_called_once()
         self.assertIn("photon energy", show_error.call_args.args[0].lower())
@@ -122,12 +129,14 @@ class HeatmapProcessingTests(unittest.TestCase):
         window.processing_smooth_chk.setChecked(False)
         window.processing_window_spin.setValue(9)
         window._on_generate_heatmap()
+        wait_jobs(window)
         unsmoothed = window.current_cube.z.copy()
         self.assertFalse(window._processing_smooth)
         self.assertEqual(window._processing_window_length, 9)
 
         window.processing_smooth_chk.setChecked(True)
         window._on_generate_heatmap()
+        wait_jobs(window)
         smoothed = window.current_cube.z.copy()
         expected = energy_second_derivative(
             window._base_cube.photon_energy, window._base_cube.z,
@@ -152,13 +161,14 @@ class HeatmapProcessingTests(unittest.TestCase):
             window.processing_smooth_chk.setChecked(False)
             window.processing_window_spin.setValue(11)
             window._on_generate_heatmap()
+            wait_jobs(window)
             expected = energy_second_derivative(window._base_cube.photon_energy, window._base_cube.z,
                                                 smooth=False, window_length=11)
             window.close()
             payload = json.loads(window._plot_state_store.path_for(path).read_text(encoding="utf-8"))
             self.assertEqual(payload["plot"]["processing"], {
                 "mode": "energy_second_derivative", "smooth": False, "window_length": 11,
-                "original_signal_title": "ΔR/R (a. u.)",
+                "original_signal_title": RAW_LABEL,
             })
 
             restored = MainWindow()
@@ -192,6 +202,8 @@ class HeatmapProcessingTests(unittest.TestCase):
             window.processing_mode_combo.setCurrentIndex(
                 window.processing_mode_combo.findData("energy_second_derivative"))
             window._on_generate_heatmap()
+            wait_jobs(window)
+            window._render_plot_page()
             window._on_export_png()
             with Image.open(path.with_name("quadratic_export01.png")) as image:
                 metadata = json.loads(image.info["SpectraAnalyzer"])
@@ -215,6 +227,7 @@ class HeatmapProcessingTests(unittest.TestCase):
             window.processing_mode_combo.setCurrentIndex(
                 window.processing_mode_combo.findData("energy_second_derivative"))
             window._on_generate_heatmap()
+            wait_jobs(window)
             window._load_dat_file_direct(second)
             self.assertEqual(window._processing_mode, "original")
             np.testing.assert_array_equal(window.current_cube.z, original)
@@ -228,6 +241,7 @@ class HeatmapProcessingTests(unittest.TestCase):
                 window.processing_mode_combo.setCurrentIndex(
                     window.processing_mode_combo.findData("energy_second_derivative"))
                 window._on_generate_heatmap()
+                wait_jobs(window)
             show_error.assert_called_once()
 
     def test_original_annotation_survives_processed_recipe_round_trip(self):
@@ -244,6 +258,7 @@ class HeatmapProcessingTests(unittest.TestCase):
             window.processing_mode_combo.setCurrentIndex(
                 window.processing_mode_combo.findData("energy_second_derivative"))
             window._on_generate_heatmap()
+            wait_jobs(window)
             window.close()
             restored = MainWindow()
             self.windows.append(restored)
@@ -251,4 +266,5 @@ class HeatmapProcessingTests(unittest.TestCase):
             self.assertEqual(restored._processing_mode, "energy_second_derivative")
             restored.processing_mode_combo.setCurrentIndex(
                 restored.processing_mode_combo.findData("original"))
+            restored._on_generate_heatmap()
             self.assertEqual(restored.signal_title_combo.currentText(), "Measured signal")

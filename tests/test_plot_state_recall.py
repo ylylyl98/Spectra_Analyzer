@@ -11,6 +11,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication
 
 from spectra_app.main_window import MainWindow
+from spectra_app.plot_state import active_plot_recipe
 from spectra_app.image_export import _build_heatmap_export_figure
 from tests.settings_helpers import isolate_settings, wait_for_background_jobs
 
@@ -111,16 +112,20 @@ class PlotStateRecallTests(unittest.TestCase):
         with patch("spectra_app.image_export.PLOT_FONT_SIZE", 14):
             restored._load_dat_file_direct(self.a)
             self.assertEqual(restored.current_cube.x_override, "pixel")
-            self.assertEqual(restored._heat_ax.xaxis.label.get_fontsize(), 14)
+            p = restored.workspace.active.presentation
+            factor = 96*restored.plot_page.display_scale*restored.canvas.device_pixel_ratio/restored.figure.dpi
+            self.assertEqual(restored._heat_ax.xaxis.label.get_fontsize(), p.text_pt*factor)
             detached = _build_heatmap_export_figure(restored.figure,
                 selected_axes=(restored._heat_ax, restored._heat_colorbar.ax))
             self.assertEqual(detached.axes[0].xaxis.label.get_fontsize(), 14)
         self.assert_recalled(restored)
         payload = json.loads(restored._plot_state_store.path_for(self.a).read_text(encoding="utf-8"))
-        self.assertEqual(set(payload["plot"]), {
+        self.assertEqual(set(payload['plot']), {'graphs', 'active_graph_id', 'processing', 'axis_override'})
+        self.assertEqual(set(active_plot_recipe(payload["plot"])), {
             "axis_override", "colormap", "annotations", "fix_annotations", "bounds", "locks",
             "x_limits", "y_limits", "color_limits", "gate", "title_settings",
-            "color_scale_mode", "color_region_boundaries", "processing", "signal_title_auto"})
+            "color_scale_mode", "color_region_boundaries", "processing", "signal_title_auto",
+            'norm', 'presentation', 'color_region_limits'})
 
     def test_changed_source_does_not_restore_old_plot(self):
         window = self.window()
@@ -211,24 +216,30 @@ class PlotStateRecallTests(unittest.TestCase):
         self.assertEqual(window.signal_title_combo.currentText(), "Saved custom Z")
         self.assertFalse(window._annotation_settings.contains("plot_annotations/signal_title"))
         window._load_dat_file_direct(self.make_dat("third.dat"))
-        self.assertEqual(window.signal_title_combo.currentText(), "ΔR/R (a. u.)")
+        self.assertEqual(window.signal_title_combo.currentText(), "Signal (arb. units)")
 
     def test_png_export_saves_sidecar_while_window_remains_open(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
+        window.open_graph_document()
         self.configure(window)
-        output = self.a.with_name(self.a.stem + "_export01.png")
+        window._render_plot_page()
+        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+        output = self.a.with_name(self.a.stem + "_Graph 1_export01.png")
         with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")):
             window._on_export_png()
         self.assertTrue(output.is_file())
         sidecar = self.a.with_name(self.a.name + ".plot.json")
         self.assertTrue(sidecar.is_file())
-        self.assertEqual(json.loads(sidecar.read_text(encoding="utf-8"))["plot"]["annotations"]["plot_title"], "Sample A")
+        self.assertEqual(active_plot_recipe(json.loads(sidecar.read_text(encoding="utf-8"))["plot"])["annotations"]["plot_title"], "Sample A")
 
     def test_png_export_success_is_reported_even_when_sidecar_save_fails(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
-        output = self.a.with_name(self.a.stem + "_export01.png")
+        window.open_graph_document()
+        window._render_plot_page()
+        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+        output = self.a.with_name(self.a.stem + "_Graph 1_export01.png")
         with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), \
                 patch.object(window._plot_state_store, "save", side_effect=PermissionError("Folder is read-only")):
             window._on_export_png()
@@ -244,9 +255,9 @@ class PlotStateRecallTests(unittest.TestCase):
         path = window._plot_state_store.path_for(self.a)
         original = json.loads(path.read_text(encoding="utf-8"))
         for mutation in (lambda data: data.update(version=99),
-                         lambda data: data["plot"].update(color_limits=[float("nan"), 9]),
-                         lambda data: data["plot"].update(colormap="unavailable-map"),
-                         lambda data: data["plot"]["locks"].update(xmin="false")):
+                         lambda data: data["plot"]["graphs"][0]["plot"].update(color_limits=[float("nan"), 9]),
+                         lambda data: data["plot"]["graphs"][0]["plot"].update(colormap="unavailable-map"),
+                         lambda data: data["plot"]["graphs"][0]["plot"]["locks"].update(xmin="false")):
             with self.subTest(mutation=mutation):
                 recipe = json.loads(json.dumps(original))
                 mutation(recipe)
@@ -273,6 +284,8 @@ class PlotStateRecallTests(unittest.TestCase):
 
         path = restored._plot_state_store.path_for(self.a)
         payload = json.loads(path.read_text(encoding="utf-8"))
+        payload['plot'] = active_plot_recipe(payload['plot'])
+        payload['version'] = 3
         payload["plot"].pop("color_scale_mode")
         payload["plot"].pop("color_region_boundaries")
         path.write_text(json.dumps(payload), encoding="utf-8")

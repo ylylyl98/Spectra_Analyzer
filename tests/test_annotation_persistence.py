@@ -122,10 +122,11 @@ class AnnotationPersistenceTests(unittest.TestCase):
         window = self.make_window()
         self.load_source(window)
         self.assertTrue(hasattr(window, "signal_title_combo"))
-        self.assertEqual(window.signal_title_combo.currentText(), "ΔR/R (a. u.)")
-        for label in ("d²(ΔR/R)/dE² (a. u.)", "PL (a. u.)", "Custom signal", ""):
+        self.assertEqual(window.signal_title_combo.currentText(), "Signal (arb. units)")
+        for label in ("d²(ΔR/R₀)/dE² (arb. units)", "PL (arb. units)",
+                      "d²(ΔR/R)/dE² (arb. units)", "Custom signal", ""):
             with self.subTest(label=label):
-                if label in ("d²(ΔR/R)/dE² (a. u.)", "PL (a. u.)"):
+                if label in ("d²(ΔR/R₀)/dE² (arb. units)", "PL (arb. units)"):
                     index = window.signal_title_combo.findText(label)
                     self.assertGreaterEqual(index, 0)
                     window.signal_title_combo.setCurrentIndex(index)
@@ -181,11 +182,11 @@ class AnnotationPersistenceTests(unittest.TestCase):
         self.assertEqual(window._heat_ax.get_title(), "Fixed title")
         window._plot_cube()
         self.assertEqual(window._heat_ax.get_ylabel(), "Bias (mV)")
-        self.assertEqual(window._heat_colorbar.ax.get_xlabel(), "PL (a. u.)")
+        self.assertEqual(window._heat_colorbar.ax.get_xlabel(), "PL (arb. units)")
         self.load_source(window, "next.dat", "Temperature (K)")
         self.assertEqual(window._heat_ax.get_title(), "")
         self.assertEqual(window._heat_ax.get_ylabel(), "Temperature (K)")
-        self.assertEqual(window._heat_colorbar.ax.get_xlabel(), "ΔR/R (a. u.)")
+        self.assertEqual(window._heat_colorbar.ax.get_xlabel(), "Signal (arb. units)")
         window.plot_title_edit.setText("Current image only")
         window.y_axis_unit_edit.clear()
         window.signal_title_combo.setEditText("Current signal only")
@@ -196,7 +197,7 @@ class AnnotationPersistenceTests(unittest.TestCase):
         self.load_source(restored)
         self.assertEqual(restored._heat_ax.get_title(), "")
         self.assertEqual(restored._heat_ax.get_ylabel(), "Doping (V)")
-        self.assertEqual(restored._heat_colorbar.ax.get_xlabel(), "ΔR/R (a. u.)")
+        self.assertEqual(restored._heat_colorbar.ax.get_xlabel(), "Signal (arb. units)")
 
     def test_enabling_fix_captures_current_fields_including_blanks(self):
         window = self.make_window()

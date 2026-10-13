@@ -2,9 +2,39 @@ import tempfile
 import unittest
 from pathlib import Path
 from spectra_app.dat_io import load_dat_cube
+from spectra_app.plot_state import active_plot_recipe
 from tests import test_annotation_persistence as annotations
+from tests.settings_helpers import wait_for_background_jobs
 
 class SignalDetectionTests(unittest.TestCase):
+    def test_unit_suppression_preserves_literal_manual_meanings(self):
+        from spectra_app.signal_titles import display_signal_label
+        for unit in ('a. u.', 'a.u.', 'a.u', 'A. U.'):
+            literal = f'∂²(DR/R₀)/∂E² ({unit})'
+            self.assertEqual(display_signal_label(literal), '∂²(DR/R₀)/∂E² (arb. units)')
+            self.assertEqual(display_signal_label(literal, False), '∂²(DR/R₀)/∂E²')
+        self.assertEqual(display_signal_label('DR literal (a. u.)', False), 'DR literal')
+        self.assertEqual(display_signal_label('ΔR/R₀ (a. u.)', False), 'ΔR/R₀')
+        self.assertEqual(display_signal_label('PL (arb. units)', False), 'PL')
+        for text in ('Manual D (sample)', 'Unit (a. u.) followed by text', 'Manual D', 'PL (counts)'):
+            self.assertEqual(display_signal_label(text), text)
+        for text in ('Manual D (sample)', 'Unit (a. u.) followed by text', 'Manual D'):
+            self.assertEqual(display_signal_label(text, False), text)
+
+    def test_pl_and_reference_source_evidence_is_conservative(self):
+        from spectra_app.signal_titles import infer_signal_kind, infer_source_signal_kind
+        self.assertEqual(infer_signal_kind('scan_PL730nm.dat'), 'pl')
+        self.assertEqual(infer_signal_kind('scan.dat', ['#Signal PL']), 'pl')
+        self.assertEqual(infer_signal_kind('sample.dat', ['# Signal: photoluminescence']), 'pl')
+        for name in ('sample.dat', 'apple.dat', 'scan_PLanning.dat'):
+            self.assertEqual(infer_signal_kind(name), 'unknown')
+        self.assertEqual(infer_source_signal_kind('scan.dat', ['# Signal: d²(ΔR/R₀)/dE²']), 'reflection_reference')
+        self.assertEqual(infer_signal_kind('scan.dat', ['# Signal: d²(ΔR/R₀)/dE²']), 'energy_second_derivative')
+        self.assertEqual(infer_signal_kind('scan.dat', ['# Signal: d²PL/dE²']), 'energy_second_derivative')
+        self.assertEqual(infer_signal_kind('scan.dat', ['# Signal: ∂²(ΔR/R₀)/∂E²']), 'energy_second_derivative')
+        self.assertEqual(infer_source_signal_kind('scan.dat', ['# Signal: ∂²(ΔR/R₀)/∂E²']), 'reflection_reference')
+        self.assertEqual(infer_signal_kind('scan.dat', ['# Signal: ∂²PL/∂E²']), 'energy_second_derivative')
+
     def test_loader_signal_evidence(self):
         cases = [('scan_DR_R.dat', '', 'reflection'),
                  ('scan_DR_R_External_d2E_Regrid.dat', '', 'energy_second_derivative'),
@@ -38,12 +68,15 @@ class AutoSignalTests(unittest.TestCase):
         window._plot_cube()
         window.processing_mode_combo.setCurrentIndex(1)
         window._on_generate_heatmap()
+        wait_for_background_jobs(window)
         self.assertIn('d²', window.signal_title_combo.currentText())
         window.processing_mode_combo.setCurrentIndex(0)
-        self.assertEqual(window.signal_title_combo.currentText(), 'ΔR/R (a. u.)')
+        window._on_generate_heatmap()
+        self.assertEqual(window.signal_title_combo.currentText(), 'Signal (arb. units)')
         window.signal_title_combo.setCurrentText('Manual')
         window.processing_mode_combo.setCurrentIndex(1)
         window._on_generate_heatmap()
+        wait_for_background_jobs(window)
         self.assertEqual(window.signal_title_combo.currentText(), 'Manual')
         window.signal_title_auto_chk.setChecked(True)
         self.assertIn('d²', window.signal_title_combo.currentText())
@@ -58,9 +91,42 @@ class AutoSignalTests(unittest.TestCase):
         self.load_source(window, 'scan_DR_R.dat')
         self.assertEqual(window.signal_title_combo.currentText(), 'Custom')
         window.signal_title_auto_chk.setChecked(True)
-        self.assertEqual(window.signal_title_combo.currentText(), 'ΔR/R (a. u.)')
+        self.assertEqual(window.signal_title_combo.currentText(), 'ΔR/R₀ (arb. units)')
         self.load_source(window, 'mystery.dat')
         self.assertIn('unrecognized', window.signal_title_combo.toolTip().lower())
+
+    def test_applied_derivatives_follow_pl_and_unknown_sources(self):
+        from dataclasses import replace
+        from tests.test_heatmap_processing import _cube
+        import numpy as np
+        for source, expected in [('scan_PL730nm.dat', 'd²PL/dE² (arb. units)'),
+                                 ('mystery.dat', 'd²Signal/dE² (arb. units)'),
+                                 ('scan_DR_R.dat', 'd²(ΔR/R₀)/dE² (arb. units)')]:
+            window = self.make_window()
+            window.current_cube = replace(_cube(np.ones((2, 13))), source_path=source)
+            window._set_view_limits_to_auto(); window._plot_cube()
+            window.processing_mode_combo.setCurrentIndex(1)
+            window._on_generate_heatmap()
+            wait_for_background_jobs(window)
+            self.assertEqual(window.signal_title_combo.currentText(), expected)
+
+    def test_applied_derivative_of_declared_derivative_has_fourth_order_label(self):
+        from dataclasses import replace
+        from tests.test_heatmap_processing import _cube
+        import numpy as np
+        for kind, expected in [('pl', 'd⁴PL/dE⁴ (arb. units)'),
+                               ('reflection', 'd⁴(ΔR/R₀)/dE⁴ (arb. units)')]:
+            window = self.make_window()
+            window.current_cube = replace(_cube(np.ones((2, 13))),
+                                          signal_kind='energy_second_derivative', signal_source_kind=kind)
+            window._set_view_limits_to_auto(); window._plot_cube()
+            self.assertIn('d²', window.signal_title_combo.currentText())
+            window.processing_mode_combo.setCurrentIndex(1); window._on_generate_heatmap()
+            wait_for_background_jobs(window)
+            self.assertEqual(window.signal_title_combo.currentText(), expected)
+            window.processing_mode_combo.setCurrentIndex(0)
+            window._on_generate_heatmap()
+            self.assertIn('d²', window.signal_title_combo.currentText())
 
     def test_legacy_recipe_remains_manual_and_new_auto_recipe_roundtrips(self):
         import json
@@ -72,8 +138,10 @@ class AutoSignalTests(unittest.TestCase):
             window._save_current_plot_state()
             recipe = window._plot_state_store.path_for(path)
             payload = json.loads(recipe.read_text(encoding='utf-8'))
-            self.assertTrue(payload['plot']['signal_title_auto'])
+            self.assertTrue(active_plot_recipe(payload['plot'])['signal_title_auto'])
             window.current_dat_path = None
+            payload['version'] = 3
+            payload['plot'] = active_plot_recipe(payload['plot'])
             payload['plot'].pop('signal_title_auto')
             payload['plot']['annotations']['signal_title'] = 'Legacy custom'
             recipe.write_text(json.dumps(payload), encoding='utf-8')

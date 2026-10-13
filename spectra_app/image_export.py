@@ -14,6 +14,8 @@ from matplotlib.axes import Axes
 from matplotlib.ticker import FuncFormatter, NullFormatter, NullLocator, ScalarFormatter
 from matplotlib.collections import QuadMesh
 
+from .signal_titles import RAW_LABEL, display_signal_label
+
 
 EXPORT_FIGSIZE = (5.15, 4.14)
 EXPORT_DPI = 300
@@ -82,7 +84,7 @@ def style_plot_axis(axis: Axes, *, font_size: float | None = None) -> None:
 
 def style_heatmap_colorbar(
     colorbar,
-    label: str = "ΔR/R (a. u.)",
+    label: str = RAW_LABEL,
     *,
     font_size: float | None = None,
 ) -> None:
@@ -99,7 +101,7 @@ def style_heatmap_colorbar(
     axis.xaxis.set_minor_formatter(NullFormatter())
     axis.xaxis.set_ticks_position("top")
     axis.tick_params(top=True, labeltop=True, bottom=False, labelbottom=False, pad=2)
-    axis.set_xlabel("" if label in _REGIONAL_LABELS else label, fontsize=font_size)
+    axis.set_xlabel("" if label in _REGIONAL_LABELS else display_signal_label(label), fontsize=font_size)
     axis.xaxis.set_label_coords(-0.10, 0.8)
     axis.xaxis.label.set_horizontalalignment("right")
     axis.xaxis.label.set_verticalalignment("center")
@@ -115,9 +117,22 @@ def position_heatmap_title(heat_axis: Axes, colorbar_axis: Axes, title) -> None:
     """Keep the manual title near the upper-left corner, clear of other labels."""
     figure = heat_axis.figure
     renderer = figure.canvas.get_renderer()
+    # Re-measure the normal anchor on every layout, so a temporary small canvas
+    # does not leave the label raised after the view grows or its offset clears.
+    colorbar_axis.xaxis.set_label_coords(-0.10, 0.8)
     # Refresh tick and scientific-offset text before measuring their bounds.
     colorbar_axis.get_tightbbox(renderer)
     heat_axis.yaxis.get_tightbbox(renderer)
+    signal = colorbar_axis.xaxis.label
+    offset = heat_axis.yaxis.get_offset_text()
+    if signal.get_text() and offset.get_text():
+        signal_bounds = signal.get_window_extent(renderer)
+        offset_bounds = offset.get_window_extent(renderer)
+        if signal_bounds.overlaps(offset_bounds):
+            x, y = signal.get_position()
+            rise = offset_bounds.y1 + 0.02 * figure.dpi - signal_bounds.y0
+            colorbar_axis.xaxis.set_label_coords(
+                x, y + rise / colorbar_axis.get_window_extent(renderer).height)
     plot = heat_axis.get_window_extent(renderer)
     title.set_transform(figure.transFigure)
     title.set_horizontalalignment("left")
@@ -250,6 +265,13 @@ def position_regional_header(heat_axis: Axes, colorbar_axes: Sequence[Axes], tit
         signal.set_horizontalalignment("right")
         signal.set_verticalalignment("bottom")
         signal.set_position(figure.transFigure.inverted().transform((plot.x1, top + 0.02 * figure.dpi)))
+        # Actual font metrics can extend a fraction of a pixel beyond the
+        # nominal fixed header. Keep a small measured page-edge allowance.
+        bounds = signal.get_window_extent(renderer)
+        overflow = max(0.0, bounds.y1 - figure.bbox.y1 + 0.003 * figure.dpi)
+        if overflow:
+            signal.set_position(figure.transFigure.inverted().transform(
+                (plot.x1, top + 0.02 * figure.dpi - overflow)))
 
 
 def _build_heatmap_export_figure(

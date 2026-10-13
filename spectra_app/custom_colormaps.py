@@ -8,6 +8,11 @@ from matplotlib.colors import ListedColormap
 
 
 CUSTOM_COLORMAP_NAMES = ("RdBu_r_p0p45", "RdBu_r_p0p6")
+COMMON_COLORMAPS = (("jet", "jet"), ("RdBu_r", "RdBu_r"), ("RdBu_r_0.6", "RdBu_r_p0p6"))
+
+
+def canonical_colormap(name: str) -> str:
+    return 'RdBu_r_p0p6' if name == 'RdBu_r_0.6' else name
 _PALETTE_FILES = {
     name: Path(__file__).with_name("palettes") / f"{name}.pal"
     for name in CUSTOM_COLORMAP_NAMES
@@ -45,6 +50,7 @@ def _read_jasc_palette(path: Path) -> np.ndarray:
 @lru_cache(maxsize=None)
 def resolve_colormap(name: str) -> str | ListedColormap:
     """Return a bundled ListedColormap or the original Matplotlib name."""
+    name = canonical_colormap(name)
     path = _PALETTE_FILES.get(name)
     if path is None:
         return name

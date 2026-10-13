@@ -3,6 +3,9 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import json
 import shutil
 import unittest
+import xml.etree.ElementTree as ET
+from unittest.mock import patch
+from PIL import Image
 from PySide6.QtWidgets import QApplication
 from spectra_app.main_window import MainWindow
 from spectra_app.image_export import _build_heatmap_export_figure
@@ -130,29 +133,53 @@ class TitleWorkflowTests(unittest.TestCase):
         payload = json.loads(sidecar.read_text(encoding='utf-8'))
         payload['version'] = 1
         payload['plot'].pop('title_settings', None)
+        # v1 predates both title templates and saved processing recipes.
+        payload['plot'].pop('processing')
+        # Formal presentation and color mapping were added in v3.
+        for field in ('norm', 'presentation', 'color_region_limits'):
+            payload['plot'].pop(field)
         original = json.loads(json.dumps(payload['plot']))
         sidecar.write_text(json.dumps(payload), encoding='utf-8')
         from spectra_app.plot_state import source_fingerprint
         loaded, notice = w._plot_state_store.load(p, source_fingerprint(p))
         self.assertEqual(notice, '')
-        self.assertEqual({k:v for k,v in loaded.items() if k != 'title_settings'}, original)
+        migrated_fields = ('title_settings', 'processing', 'norm', 'presentation', 'color_region_limits')
+        self.assertEqual({k:v for k,v in loaded.items() if k not in migrated_fields}, original)
         self.assertEqual(loaded['title_settings']['manual_override'], '')
+        self.assertEqual(loaded['processing'], {
+            'mode': 'original', 'smooth': True, 'window_length': 21,
+            'original_signal_title': 'ΔR/R₀ (arb. units)',
+        })
+        self.assertEqual(loaded['norm'], {'kind': 'linear', 'linthresh': 1.0})
+        self.assertEqual(loaded['presentation']['width_in'], 3.3)
+        self.assertEqual(loaded['color_region_limits'], [])
         restored = self.window()
         self.select_builtin(restored)
         restored._load_dat_file_direct(p)
         self.assertEqual(restored._heat_ax.get_title(), '')
         self.assertEqual(restored.cmap_combo.currentText(), 'viridis')
         self.assertEqual(restored.title_preset_combo.currentText(), 'Manual')
-    def test_export_keeps_generated_literal_title_and_saves_v2(self):
+    def test_export_keeps_generated_literal_title_and_saves_v3(self):
         w = self.window()
         self.select_builtin(w)
         p = self.dat()
         w._load_dat_file_direct(p)
         fig = _build_heatmap_export_figure(w.figure, selected_axes=(w._heat_ax, w._heat_colorbar.ax))
         self.assertIn('E=18V 8T K', [t.get_text() for t in fig.texts])
-        w._on_export_png()
+        w._render_plot_page()
+        page = w.plot_page.rendered_page
+        self.assertIsNotNone(page, w.plot_page.status_label.text())
+        self.assertIn('E=18V 8T K', ''.join(ET.fromstring(page.svg_bytes).itertext()))
+        with patch.object(w, '_show_error', side_effect=AssertionError('PNG export must succeed')):
+            w._on_export_png()
+        output = p.with_name(p.stem + '_export01.png')
+        self.assertTrue(output.is_file())
+        with Image.open(output) as image:
+            metadata = json.loads(image.info['SpectraAnalyzer'])
+        self.assertEqual(metadata['plot_title'], 'E=18V 8T K')
+        self.assertEqual(metadata['source_path'], str(p))
         payload = json.loads(w._plot_state_store.path_for(p).read_text(encoding='utf-8'))
-        self.assertEqual(payload['version'], 2)
+        self.assertEqual(payload['version'], 3)
         self.assertEqual(payload['plot']['annotations']['plot_title'], 'E=18V 8T K')
 
     def test_template_override_never_pins_future_title_or_global_manual_default(self):
