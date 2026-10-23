@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 from matplotlib import rc_context
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QSlider, QSpinBox, QScrollArea
 from tests.test_image_export import _cube
@@ -30,16 +30,29 @@ class PresentationContractTests(unittest.TestCase):
     def setUp(self):
         self.settings_path = isolate_settings(self)
         self.window = MainWindow()
-        self.window.current_cube = replace(_cube(np.arange(24.).reshape(3,8)), gate_label='Doping (V)', source_path='sample.dat')
+        self.errors = []
+        self.window._show_error = self.errors.append
+        self.set_cube(replace(_cube(np.arange(24.).reshape(3,8)), gate_label='Doping (V)', source_path='sample.dat'))
         self.window.current_folder = str(self.settings_path.parent)
         self.window._set_view_limits_to_auto()
         self.window._plot_cube()
+        self.window.plot_tabs.setCurrentIndex(0)
     def tearDown(self):
         self.window.close()
+        _APP.processEvents()
+        self.window.deleteLater()
+        _APP.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        _APP.processEvents()
+
+    def set_cube(self, cube):
+        # A raw graph renders Original data, independently of applied data.
+        self.window._base_cube = self.window.current_cube = cube
 
     def test_wheel_preserves_focused_controls_and_scrolls_parent_page(self):
         w = self.window
         w.resize(1100, 680)
+        w.plot_tabs.setCurrentIndex(0)
         w.show()
         _APP.processEvents()
         w._analysis_tabs.setCurrentIndex(0)
@@ -129,7 +142,7 @@ class PresentationContractTests(unittest.TestCase):
 
     def test_large_intensity_spectrum_label_stays_inside_canvas(self):
         w = self.window
-        w.current_cube = replace(w.current_cube, z=w.current_cube.z * 1e5)
+        self.set_cube(replace(w.current_cube, z=w.current_cube.z * 1e5))
         w._plot_cube()
         w.canvas.draw()
         box = w._spec_ax.yaxis.label.get_window_extent(w.canvas.get_renderer())
@@ -175,7 +188,7 @@ class PresentationContractTests(unittest.TestCase):
                 factor = 96*w._analysis_display_scale()*w.canvas.device_pixel_ratio/w.figure.dpi
                 self.assertEqual([bar.ax.get_xlabel() for bar in w._heat_colorbars], [""] * len(names))
                 self.assertTrue(all(
-                    bar.ax.get_position().width * w.figure.get_size_inches()[0] >= p.colorbar.width_in*factor - 1e-6
+                    abs(bar.ax.get_position().width * w.figure.get_size_inches()[0] - p.colorbar.width_in*factor) < 1e-6
                     and abs(bar.ax.get_position().height * w.figure.get_size_inches()[1] - p.colorbar.height_in*factor) < 1e-6
                     for bar in w._heat_colorbars
                 ))
@@ -191,9 +204,9 @@ class PresentationContractTests(unittest.TestCase):
                     ["d²(ΔR/R)/dE² (arb. units)"],
                 )
                 renderer = w.canvas.get_renderer()
-                ticks = [tick.get_window_extent(renderer) for bar in w._heat_colorbars
-                         for tick in bar.ax.get_xticklabels()]
-                self.assertTrue(all(not a.overlaps(b) for a, b in zip(ticks, ticks[1:])))
+                for previous, current in zip(w._heat_colorbars, w._heat_colorbars[1:]):
+                    gap = (current.ax.get_position().x0 - previous.ax.get_position().x1) * w.figure.get_size_inches()[0]
+                    self.assertAlmostEqual(gap, p.colorbar.gap_in*factor)
                 title = w._heat_ax.title.get_window_extent(renderer)
                 self.assertTrue(all(
                     not title.overlaps(tick.get_window_extent(renderer))
@@ -228,7 +241,7 @@ class PresentationContractTests(unittest.TestCase):
         w = self.window
         groups = [box.title() for box in w.findChildren(QGroupBox)]
         self.assertLess(groups.index("Color Scale"), groups.index("View Range"))
-        self.assertLess(groups.index("View Range"), groups.index("Annotations"))
+        self.assertLess(groups.index("View Range"), groups.index("Labels"))
         self.assertTrue(w._region_edges_row.isHidden())
 
     def test_compact_export_labels_fit_without_overlap_for_signed_scientific_axes(self):
@@ -322,12 +335,12 @@ class PresentationContractTests(unittest.TestCase):
         w = self.window
         stem = 'YZD320~pa~9T3.6KRef0.2sx10~680nmc~R1_175deg~0.95TG-BG=18_rep01_001_avg13_DR_R_External_d2E_Regrid'
         source = 'C:/measurements/原始数据/' + stem + '.dat'
-        w.current_cube = replace(w.current_cube, source_path=source)
+        self.set_cube(replace(w.current_cube, source_path=source))
         filename = w._heatmap_export_filename()
         self.assertEqual(filename, stem + '_Graph 1_export01.png')
-        w.current_cube = replace(w.current_cube, source_path=source.replace('rep01', 'rep02'))
+        self.set_cube(replace(w.current_cube, source_path=source.replace('rep01', 'rep02')))
         self.assertNotEqual(w._heatmap_export_filename(), filename)
-        w.current_cube = replace(w.current_cube, source_path=source)
+        self.set_cube(replace(w.current_cube, source_path=source))
         w.plot_title_edit.setText('Independent display title')
         w.plot_page.height_spin.setValue(4.5)  # Space for the deliberately long provenance title.
         w._render_plot_page()
@@ -337,6 +350,7 @@ class PresentationContractTests(unittest.TestCase):
             w.current_folder = tmp
             with patch('spectra_app.main_window.QFileDialog.getSaveFileName', side_effect=AssertionError('PNG must save without a dialog')):
                 w._on_export_png()
+            self.assertEqual(self.errors, [])
             with Image.open(path) as image:
                 metadata = json.loads(image.info['SpectraAnalyzer'])
             self.assertEqual(metadata['source_path'], source)
@@ -352,9 +366,9 @@ class PresentationContractTests(unittest.TestCase):
             self.assertIsNone(metadata['axis_override'])
             self.assertEqual(metadata['processing'], 'raw')
             self.assertEqual(metadata['plot_title'], 'Independent display title')
-        w.current_cube = replace(w.current_cube, source_path='$' + 's' * 232 + '.dat')
+        self.set_cube(replace(w.current_cube, source_path='$' + 's' * 232 + '.dat'))
         self.assertEqual(w._heatmap_export_filename(), '$' + 's' * 232 + '_Graph 1_export01.png')
-        w.current_cube = replace(w.current_cube, source_path='s' * 250 + '.dat')
+        self.set_cube(replace(w.current_cube, source_path='s' * 250 + '.dat'))
         with self.assertRaisesRegex(ValueError, 'too long'):
             w._heatmap_export_filename()
 
@@ -370,8 +384,10 @@ class PresentationContractTests(unittest.TestCase):
             third.write_bytes(b'preserve third export')
             with patch('spectra_app.main_window.QFileDialog.getSaveFileName', side_effect=AssertionError('PNG must save without a dialog')):
                 w._on_export_png()
+                self.assertEqual(self.errors, [])
                 self.assertTrue((Path(tmp) / 'sample_Graph 1_export02.png').is_file())
                 w._on_export_png()
+                self.assertEqual(self.errors, [])
                 self.assertTrue((Path(tmp) / 'sample_Graph 1_export04.png').is_file())
             self.assertEqual(existing.read_bytes(), b'preserve original export')
             self.assertEqual(third.read_bytes(), b'preserve third export')
@@ -380,6 +396,7 @@ class PresentationContractTests(unittest.TestCase):
             next_folder.mkdir()
             w.current_folder = str(next_folder)
             w._on_export_png()
+            self.assertEqual(self.errors, [])
             self.assertTrue((next_folder / 'sample_Graph 1_export01.png').is_file())
 
     def test_spectrum_legend_fit_stats_and_peak_annotations_use_twelve_point_text(self):

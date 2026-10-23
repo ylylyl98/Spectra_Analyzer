@@ -159,7 +159,7 @@ class UnifiedImportGuards(unittest.TestCase):
 
     def test_preparation_cancel_and_stale_review_leave_no_sources_or_documents(self):
         started, release = Event(), Event()
-        def blocked(requests, defaults, context):
+        def blocked(requests, defaults, context, *, preferred_kinds=None):
             started.set()
             release.wait(3)
             context.check_cancelled()

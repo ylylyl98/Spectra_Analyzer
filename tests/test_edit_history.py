@@ -28,6 +28,7 @@ class EditHistoryTests(unittest.TestCase):
         self.path.write_text('Energy(eV) 0 1 2\n' + '\n'.join(
             f'{1+i/10} {i+1} {2*(i+1)} {3*(i+1)}' for i in range(12)))
         self.w._load_dat_file_direct(self.path)
+        self.w.open_graph_document()
         self.s = self.w.workspace.active
         self.w.resize(1250, 900)
         self.w.plot_tabs.setCurrentWidget(self.w.graph_documents)
@@ -337,7 +338,9 @@ class EditHistoryTests(unittest.TestCase):
         self.assertIn('Add annotation', w._graph_command_actions['undo'].text())
         w._graph_command_actions['undo'].trigger()
         self.assertEqual(self.s.presentation.annotations, ())
+        self.render()
         p.preview.setFocus()
+        self.assertTrue(p.preview.hasFocus())
         QTest.keyClick(p.preview, Qt.Key_Y, Qt.ControlModifier)
         self.assertEqual(len(self.s.presentation.annotations), 1)
 

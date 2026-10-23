@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QCheckBox, QComboBox, QDoubleSp
                                QMenu, QToolButton, QSizePolicy)
 
 from .plot_presentation import ColorbarTicks, PlotAnnotation, PlotPresentation
+from .disclosure import DisclosureSection, protect_disclosure_drafts, reveal_editor
 from .plot_annotations import coordinates_to_page, page_to_coordinates
 from .svg_export import _bar_ticks, colorbar_labels_rounded, render_svg_image
 
@@ -408,10 +409,12 @@ class PlotPage(QWidget):
         for button in (self.copy_graph_btn, self.export_svg_btn, self.export_png_btn):
             self.action_layout.addWidget(button)
         commands.addLayout(self.action_layout)
-        format_row = QHBoxLayout()
+        format_row = QVBoxLayout()
+        format_actions = QHBoxLayout()
         for button in (self.settings_menu_btn, self.formats_menu_btn, self.batch_menu_btn):
-            format_row.addWidget(button)
-        format_row.addWidget(self.format_combo, 1)
+            format_actions.addWidget(button)
+        format_row.addLayout(format_actions)
+        format_row.addWidget(self.format_combo)
         self.clipboard_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.clipboard_label.hide()
         self.settings_menu_btn.setToolTip(self.clipboard_label.text())
@@ -440,21 +443,12 @@ class PlotPage(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self._build_controls()
+        protect_disclosure_drafts(controls)
         for label in controls.findChildren(QLabel):
             label.setWordWrap(True)
         for spin in controls.findChildren(QAbstractSpinBox):
             # Native editors scroll long numbers while retaining every digit.
             spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        for check in controls.findChildren(QCheckBox):
-            words = check.text().split()
-            lines, line = [], ''
-            for word in words:
-                if line and len(line) + len(word) + 1 > 16:
-                    lines.append(line)
-                    line = word
-                else:
-                    line = f'{line} {word}'.strip()
-            check.setText('\n'.join((*lines, line)))
         splitter.setSizes([370, 630])
         self.set_presentation(self.presentation)
 
@@ -491,15 +485,18 @@ class PlotPage(QWidget):
 
     def property_editor(self, kind, identifier=''):
         """Return the existing editor for a displayed page object."""
+        editor = None
         if kind == 'annotation':
             self.select_annotation(identifier)
-            return self.annotation_text
-        if kind in ('horizontal-axis', 'vertical-axis'):
-            return self.x_mode_combo if kind == 'horizontal-axis' else self.y_mode_combo
-        if kind == 'colorbar':
+            editor = self.annotation_text
+        elif kind in ('horizontal-axis', 'vertical-axis'):
+            editor = self.x_mode_combo if kind == 'horizontal-axis' else self.y_mode_combo
+        elif kind == 'colorbar':
             self.bar_id_combo.setCurrentText(identifier)
-            return self.tick_values_edit if self.custom_ticks.isChecked() else self.custom_ticks
-        return None
+            editor = self.tick_values_edit if self.custom_ticks.isChecked() else self.custom_ticks
+        if editor is not None:
+            reveal_editor(editor)
+        return editor
 
     def cancel_interaction(self):
         self.preview.cancel_interaction()
@@ -560,6 +557,7 @@ class PlotPage(QWidget):
         try:
             for control in self.control_scroll.findChildren(QAbstractSpinBox):
                 if not control.hasAcceptableInput():
+                    self._reveal_invalid_editor(control)
                     raise ValueError('Correct the current page editor first: invalid numeric value.')
                 control.interpretText()
             item = self.preview._selected()
@@ -571,7 +569,20 @@ class PlotPage(QWidget):
             self._loading = False
         self._emit_presentation()
         if self.presentation_error:
+            if self.custom_ticks.isChecked():
+                try:
+                    self._edited_colorbar_ticks()
+                except (ValueError, TypeError):
+                    self._reveal_invalid_editor(self.tick_values_edit)
+            if not self.font_edit.text().strip():
+                self._reveal_invalid_editor(self.font_edit)
             raise ValueError(f'Correct the current page editor first: {self.presentation_error}')
+
+    def _reveal_invalid_editor(self, editor):
+        reveal_editor(editor)
+        if self.control_scroll.isVisible():
+            self.control_scroll.ensureWidgetVisible(editor)
+            editor.setFocus(Qt.OtherFocusReason)
 
     def _form(self, name):
         box = QGroupBox(name)
@@ -579,6 +590,19 @@ class PlotPage(QWidget):
         form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.control_layout.addWidget(box)
+        return form
+
+    def _advanced_form(self, name, parent_form=None):
+        content = QWidget()
+        form = QFormLayout(content)
+        form.setContentsMargins(4, 4, 4, 4)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        section = DisclosureSection(name, content)
+        if parent_form is None:
+            self.control_layout.addWidget(section)
+        else:
+            parent_form.addRow(section)
         return form
 
     def _number(self, form, label, minimum=.01, maximum=100., decimals=3, step=.05):
@@ -597,7 +621,7 @@ class PlotPage(QWidget):
         return check
 
     def _build_controls(self):
-        form = self._form('Page including labels and colorbars')
+        form = self._form('Page and text size')
         self.width_spin = self._number(form, 'Width (in):', .1, 40, 8)
         self.height_spin = self._number(form, 'Height (in):', .1, 40)
         self.aspect_lock = self._check(form, 'Lock aspect ratio')
@@ -605,6 +629,7 @@ class PlotPage(QWidget):
         self.height_spin.valueChanged.connect(lambda: self._dimension_changed('height_in'))
         self.numeric_spin = self._number(form, 'Numeric (pt):', 1, 100, 1, step=1)
         self.text_spin = self._number(form, 'Text (pt):', 1, 100, 1, step=1)
+        form = self._advanced_form('Font and export', form)
         self.font_edit = QLineEdit()
         form.addRow('Font:', self.font_edit)
         self.dpi_spin = QSpinBox()
@@ -616,26 +641,25 @@ class PlotPage(QWidget):
         for spin in (self.numeric_spin, self.text_spin, self.dpi_spin):
             spin.valueChanged.connect(self._emit_presentation)
         self.font_edit.editingFinished.connect(self._emit_presentation)
-        form = self._form('Data plot frame')
+        form = self._advanced_form('Frame and title layout')
         frame_note = QLabel('Area inside the axes. Page size also includes labels and colorbars.')
         frame_note.setWordWrap(True)
         form.addRow(frame_note)
-        self.frame_auto = self._check(form, 'Fit data frame to page automatically')
-        self.frame_width_spin = self._number(form, 'Width (in):', .01, 40)
-        self.frame_height_spin = self._number(form, 'Height (in):', .01, 40)
+        self.frame_auto = self._check(form, 'Fit frame to page')
+        self.frame_width_spin = self._number(form, 'Frame width (in):', .01, 40)
+        self.frame_height_spin = self._number(form, 'Frame height (in):', .01, 40)
         for spin in (self.frame_width_spin, self.frame_height_spin):
             spin.valueChanged.connect(self._emit_presentation)
-        form = self._form('Title position')
         title_note = QLabel('Position relative to the data plot frame (0–1). Drag the title in the preview to move it.')
         title_note.setWordWrap(True)
         form.addRow(title_note)
-        self.title_x_spin = self._number(form, 'X (0–1):', 0, 1, 8, step=.01)
-        self.title_y_spin = self._number(form, 'Y (0–1):', 0, 1, 8, step=.01)
+        self.title_x_spin = self._number(form, 'Title X (0–1):', 0, 1, 8, step=.01)
+        self.title_y_spin = self._number(form, 'Title Y (0–1):', 0, 1, 8, step=.01)
         for control in (self.title_x_spin, self.title_y_spin):
             control.valueChanged.connect(self._emit_presentation)
         self.preview.titleMoved.connect(self._move_title)
-        form = self._form('Axes')
-        labels = {'exchange_xy': 'Exchange horizontal / vertical', 'flip_x': 'Flip horizontal',
+        form = self._advanced_form('Axes and ticks')
+        labels = {'exchange_xy': 'Exchange X and Y', 'flip_x': 'Flip horizontal',
                   'flip_y': 'Flip vertical', 'show_x': 'Show horizontal axis',
                   'show_y': 'Show vertical axis', 'show_x_label': 'Horizontal label',
                   'show_y_label': 'Vertical label', 'show_tick_labels': 'Tick labels',
@@ -666,24 +690,13 @@ class PlotPage(QWidget):
         self.colorbar_visible = self._check(form, 'Visible')
         self.colorbar_label = self._check(form, 'Show signal label')
         self.colorbar_unit = self._check(form, 'Show signal unit')
-        self.bar_width_spin = self._number(form, 'Preferred width (in):', .01, 40)
-        self.bar_height_spin = self._number(form, 'Height (in):', .001, 20)
-        self.bar_gap_spin = self._number(form, 'Between bars (in):', .001, 20)
-        self.bar_frame_gap_spin = self._number(form, 'Above frame (in):', 0, 20)
-        self.bar_alignment_combo = QComboBox()
-        self.bar_alignment_combo.addItems(['right', 'center', 'left'])
-        form.addRow('Alignment:', self.bar_alignment_combo)
-        self.signal_position_combo = QComboBox()
-        self.signal_position_combo.addItems(['left', 'above'])
-        form.addRow('Signal position:', self.signal_position_combo)
-        self.bar_extensions = self._check(form, 'Show under / over triangles')
         self.bar_format_combo = QComboBox()
         self.bar_format_combo.addItems(['Auto', 'Decimal', 'Scientific', 'Engineering'])
         form.addRow('Number format:', self.bar_format_combo)
         self.bar_precision_label = QLabel('Significant digits:')
         self.bar_precision_spin = QSpinBox()
         self.bar_precision_spin.setRange(1, 12)
-        self.bar_precision_spin.setValue(4)
+        self.bar_precision_spin.setValue(2)
         self.bar_precision_spin.setKeyboardTracking(False)
         form.addRow(self.bar_precision_label, self.bar_precision_spin)
         self.bar_scientific_style_combo = QComboBox()
@@ -702,10 +715,23 @@ class PlotPage(QWidget):
         self.bar_format_warning.setWordWrap(True)
         self.bar_format_warning.setAccessibleName('Colorbar precision warning')
         form.addRow(self.bar_format_warning)
+        layout_form = self._advanced_form('Colorbar layout', form)
+        self.bar_width_spin = self._number(layout_form, 'Width (in):', .01, 40)
+        self.bar_height_spin = self._number(layout_form, 'Height (in):', .001, 20)
+        self.bar_gap_spin = self._number(layout_form, 'Between bars (in):', .001, 20)
+        self.bar_frame_gap_spin = self._number(layout_form, 'Above frame (in):', 0, 20)
+        self.bar_alignment_combo = QComboBox()
+        self.bar_alignment_combo.addItems(['right', 'center', 'left'])
+        layout_form.addRow('Alignment:', self.bar_alignment_combo)
+        self.signal_position_combo = QComboBox()
+        self.signal_position_combo.addItems(['left', 'above'])
+        layout_form.addRow('Signal position:', self.signal_position_combo)
+        self.bar_extensions = self._check(layout_form, 'Under / over triangles')
         for combo in (self.bar_alignment_combo, self.signal_position_combo):
             combo.currentTextChanged.connect(self._emit_presentation)
         for spin in (self.bar_width_spin, self.bar_height_spin, self.bar_gap_spin, self.bar_frame_gap_spin):
             spin.valueChanged.connect(self._emit_presentation)
+        form = self._advanced_form('Custom ticks', form)
         self.bar_id_combo = QComboBox()
         self.bar_id_combo.addItems(['global', 'region-1', 'region-2', 'region-3'])
         form.addRow('Bar:', self.bar_id_combo)
@@ -730,7 +756,7 @@ class PlotPage(QWidget):
         self.presentationChanged.emit(self.presentation)
 
     def _build_annotation_controls(self):
-        form=self._form('Text and arrows')
+        form=self._advanced_form('Text and arrows')
         self._annotation_form = form
         actions=QVBoxLayout()
         self.add_text_btn=QPushButton('Add text…')
@@ -813,6 +839,7 @@ class PlotPage(QWidget):
         self.preview._title_selected = False
         for i in range(self.annotation_list.count()):
             if self.annotation_list.item(i).data(Qt.UserRole)==annotation_id:
+                reveal_editor(self.annotation_text)
                 self.annotation_list.setCurrentRow(i)
                 self._show_annotation()
                 return
@@ -995,10 +1022,7 @@ class PlotPage(QWidget):
             ticks = dict(self.presentation.colorbar.ticks)
             bar_id = self.bar_id_combo.currentText()
             if self.custom_ticks.isChecked():
-                values = tuple(float(value.strip()) for value in self.tick_values_edit.text().split(','))
-                labels_text = self.tick_labels_edit.text()
-                labels = tuple(label.strip() for label in labels_text.split('|')) if labels_text.strip() else None
-                ticks[bar_id] = ColorbarTicks(values, labels)
+                ticks[bar_id] = self._edited_colorbar_ticks()
             else:
                 ticks.pop(bar_id, None)
             colorbar = replace(self.presentation.colorbar, visible=self.colorbar_visible.isChecked(),
@@ -1035,6 +1059,12 @@ class PlotPage(QWidget):
         self._update_number_sample()
         self._update_dimensions_summary()
         self.presentationChanged.emit(presentation)
+
+    def _edited_colorbar_ticks(self):
+        values = tuple(float(value.strip()) for value in self.tick_values_edit.text().split(','))
+        labels_text = self.tick_labels_edit.text()
+        labels = tuple(label.strip() for label in labels_text.split('|')) if labels_text.strip() else None
+        return ColorbarTicks(values, labels)
 
     def set_presentation(self, presentation):
         self._loading = True
@@ -1167,36 +1197,36 @@ class PlotPage(QWidget):
     def _update_number_sample(self):
         bar_id = self.bar_id_combo.currentText()
         norm = self._colorbar_norms.get(bar_id)
-        self.bar_format_warning.setVisible(False)
-        self.bar_format_warning.setText('')
+        warnings = list(self.rendered_page.warnings) if self.rendered_page is not None else []
         if norm is None:
             self.bar_sample_label.setText('Selected bar unavailable')
-            return
-        style = self.presentation.colorbar
-        custom = style.ticks.get(bar_id)
-        try:
-            values, labels, _positions = _bar_ticks(norm, custom, style)
-            fallback = False
-        except ValueError:
-            values, labels, _positions = _bar_ticks(norm, None, style)
-            custom, fallback = None, True
-        self.bar_sample_label.setText(' | '.join(labels))
-        warnings = []
-        if fallback:
-            warnings.append('Stored custom ticks are outside the current scale; sample shows automatic ticks.')
-        if custom is not None and custom.labels is not None:
-            warnings.append('Manual labels override the number format.')
         else:
-            if len(set(labels)) < len(labels):
-                warnings.append('This precision produces duplicate labels.')
-            if colorbar_labels_rounded(values, style):
-                warnings.append('Rounded display; tick values and color limits are unchanged.')
+            style = self.presentation.colorbar
+            custom = style.ticks.get(bar_id)
+            try:
+                values, labels, _positions = _bar_ticks(norm, custom, style)
+                fallback = False
+            except ValueError:
+                values, labels, _positions = _bar_ticks(norm, None, style)
+                custom, fallback = None, True
+            self.bar_sample_label.setText(' | '.join(labels))
+            if fallback:
+                warnings.append('Stored custom ticks are outside the current scale; sample shows automatic ticks.')
+            if custom is not None and custom.labels is not None:
+                warnings.append('Manual labels override the number format.')
+            else:
+                if len(set(labels)) < len(labels):
+                    warnings.append('This precision produces duplicate labels.')
+                if colorbar_labels_rounded(values, style):
+                    warnings.append('Rounded display; tick values and color limits are unchanged.')
         self.bar_format_warning.setText(' '.join(warnings))
         self.bar_format_warning.setVisible(bool(warnings))
 
     def invalidate(self, owner_token, message='Page changed; preparing preview…'):
         self.expected_owner = owner_token
         self.rendered_page = None
+        self._update_number_sample()
+        self.status_label.setToolTip('')
         # Display the last successful paper while new bytes are prepared. It
         # is visual history only: export and geometry interaction stay retired.
         self.preview._drag_annotation = None
@@ -1237,6 +1267,10 @@ class PlotPage(QWidget):
                                  f'{page.under_count} below ({100*page.under_count/page.valid_count if page.valid_count else 0:.2f}%) / '
                                  f'{page.over_count} above ({100*page.over_count/page.valid_count if page.valid_count else 0:.2f}%) scale · '
                                  f'{page.missing_count} missing · {page.valid_count} visible valid cells')
+        # Keep layout warnings beside the colorbar controls. Growing the
+        # preview's footer would resize the viewport during a precision edit.
+        self.status_label.setToolTip(' '.join(page.warnings))
+        self._update_number_sample()
         self._resize_preview()
         return True
 

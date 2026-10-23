@@ -5,6 +5,16 @@ from PySide6.QtWidgets import QHeaderView, QStyledItemDelegate, QStyle, QStyleOp
 
 
 class _ProjectItemDelegate(QStyledItemDelegate):
+    def _section_gap(self, index):
+        if not index.parent().isValid() and index.row() > 0:
+            return max(3, self.parent().fontMetrics().height() // 3)
+        return 0
+
+    def paint(self, painter, option, index):
+        option = QStyleOptionViewItem(option)
+        option.rect.adjust(0, self._section_gap(index), 0, 0)
+        super().paint(painter, option, index)
+
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
         tree = self.parent()
@@ -50,7 +60,10 @@ class _ProjectItemDelegate(QStyledItemDelegate):
         width = max(1, tree.viewport().width() - depth * tree.indentation())
         option.rect = QRect(0, 0, width, 1)
         option.features |= QStyleOptionViewItem.WrapText
-        return super().sizeHint(option, index)
+        size = super().sizeHint(option, index)
+        # A small native-font gap separates source parents without adding cards.
+        size.setHeight(size.height() + self._section_gap(index))
+        return size
 
 
 class ProjectTreeWidget(QTreeWidget):
@@ -62,6 +75,40 @@ class ProjectTreeWidget(QTreeWidget):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.header().setSectionResizeMode(QHeaderView.Stretch)
         self.setItemDelegate(_ProjectItemDelegate(self))
+        self._filter_text = ''
+        self._filter_expanded = None
+
+    def filter_items(self, text):
+        """Hide unmatched branches without replacing rows or their identities."""
+        query = text.strip().casefold()
+        if query and not self._filter_text:
+            self._filter_expanded = {}
+            def remember(parent):
+                for index in range(parent.childCount()):
+                    item = parent.child(index)
+                    self._filter_expanded[item.data(0, Qt.UserRole)] = item.isExpanded()
+                    remember(item)
+            remember(self.invisibleRootItem())
+        self._filter_text = query
+
+        def visit(parent, ancestor_matches=False):
+            visible = False
+            for index in range(parent.childCount()):
+                item = parent.child(index)
+                value = item.data(0, Qt.UserRole + 2) or item.toolTip(0)
+                matches = not query or query in (item.text(0) + '\n' + str(value)).casefold()
+                children = visit(item, ancestor_matches or matches)
+                show = matches or ancestor_matches or children
+                item.setHidden(not show)
+                if query and children:
+                    item.setExpanded(True)
+                elif not query and self._filter_expanded is not None:
+                    item.setExpanded(self._filter_expanded.get(item.data(0, Qt.UserRole), True))
+                visible |= show
+            return visible
+        visit(self.invisibleRootItem())
+        if not query:
+            self._filter_expanded = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

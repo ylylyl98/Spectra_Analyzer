@@ -76,8 +76,7 @@ class XYAnalysisWorkflowTests(unittest.TestCase):
         self.w.open_graph_document(active.dataset_id)
         tree = self.w.data_navigator
         tree.clearSelection()
-        for i in range(tree.topLevelItemCount()):
-            item = tree.topLevelItem(i)
+        for item in self.w._navigator_items():
             if item.data(0, Qt.UserRole) == ('xy', self.page.comparison_id):
                 tree.setCurrentItem(item); item.setSelected(True); break
         self.w._refresh_navigator_actions()

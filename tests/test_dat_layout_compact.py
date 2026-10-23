@@ -143,6 +143,8 @@ class DatLayoutCompactTests(unittest.TestCase):
         self.layout_at(1100, 720)
         expected = w.workbench_preview.svg_bytes
         copy_action = next(action for action in w.workbench_export_menu.actions() if action.text() == 'Copy SVG')
+        # The offscreen clipboard owns its QMimeData until explicitly released.
+        self.addCleanup(APP.clipboard().clear)
         copy_action.trigger()
         self.assertEqual(bytes(APP.clipboard().mimeData().data('image/svg+xml')), expected)
         source_id = w._workbench_document().source_graph_id

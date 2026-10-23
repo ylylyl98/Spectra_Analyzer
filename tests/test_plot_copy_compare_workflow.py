@@ -203,6 +203,7 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         APP.processEvents()
         before = p.rendered_page
         self.assertIsNotNone(before, p.status_label.text())
+        w._layout_live_plots()
         self.assertEqual(w._heat_ax.title.get_position(), (.2, .8))
         p.select_annotation('keep')
         start = p.preview.title_point()
@@ -295,6 +296,7 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         APP.processEvents()
         self.assertEqual(w._plot_comparison_windows, [second])
         w.close()
+        APP.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.assertFalse(isValid(second))
 

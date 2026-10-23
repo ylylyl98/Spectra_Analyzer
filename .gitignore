@@ -11,3 +11,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Personal tool permissions are local machine configuration.
+.claude/settings.local.json

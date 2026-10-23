@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 from PySide6.QtCore import Qt, QPoint, QEvent, QItemSelectionModel
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QAbstractButton, QApplication
 
 from spectra_app.main_window import MainWindow
 from spectra_app.plot_snapshot import snapshot_dataset
@@ -84,6 +84,80 @@ class QuickPlotTests(unittest.TestCase):
                 self.assertEqual((artist.get_linestyle(), artist.get_marker()), (line, marker))
                 self.assertEqual(len(artist.get_xdata()), 3)
         np.testing.assert_array_equal(self.w.workspace.sheets[page.sheet_id].data, source)
+
+    def test_dat_header_drag_commits_one_full_length_curve(self):
+        path = self.folder / 'drag.dat'
+        path.write_text('Energy(eV) 0 1 2 3\n' + '\n'.join(
+            f'{1+i/10} {i+1} {i+2} {i+3} {i+4}' for i in range(12)))
+        self.w._load_dat_file_direct(path)
+        session = self.w.workspace.active
+        sheet = ensure_dataset_sheet(self.w.workspace, session.dataset_id)
+        book = self.w._sheet_owner(sheet.sheet_id)
+        page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).tabs.currentWidget()
+        APP.processEvents()
+        self.assertEqual(sheet.y_columns, [1, 2, 3, 4])
+        header = page.table.horizontalHeader()
+        start = QPoint(header.sectionViewportPosition(0) + 12, header.height() // 2)
+        end = QPoint(header.sectionViewportPosition(1) + 12, header.height() // 2)
+        QTest.mousePress(header.viewport(), Qt.LeftButton, Qt.NoModifier, start)
+        QTest.mouseMove(header.viewport(), end)
+        QTest.mouseRelease(header.viewport(), Qt.LeftButton, Qt.NoModifier, end)
+        APP.processEvents()
+        self.assertEqual(sorted(i.column() for i in page.table.selectionModel().selectedColumns()), [0, 1])
+        QTest.mouseClick(self.w.workbook_commands.style_buttons['line'], Qt.LeftButton)
+        graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        self.assertEqual([curve.y_column for curve in graph.comparison.curves.values()], [1])
+        self.assertEqual(sheet.y_columns, [1])
+        self.assertEqual(self.w._current_gate_index(), 0)
+        self.assertEqual(len(graph.axes.lines), 1)
+        np.testing.assert_array_equal(graph.axes.lines[0].get_xdata(), session.base_cube.energy)
+        np.testing.assert_array_equal(graph.axes.lines[0].get_ydata(), session.base_cube.z[0])
+
+    def test_dat_select_all_gestures_replace_subset_for_original_and_processed_heatmaps(self):
+        path = self.folder / 'select-all.dat'
+        path.write_text('Energy(eV) 0 1 2 3\n' + '\n'.join(
+            f'{1+i/10} {i+1} {i+2} {i+3} {i+4}' for i in range(12)))
+        self.w._load_dat_file_direct(path)
+        session = self.w.workspace.active
+        raw = session.base_cube.z.copy()
+        self.w._replace_current_data(replace(session.current_cube, z=raw * 3),
+                                     mode='energy_second_derivative', smooth=False, window_length=5)
+        processed = session.current_cube.z.copy()
+        for role, mode, expected in [('original', 'raw', raw), ('processed', 'processed', processed)]:
+            sheet = ensure_dataset_sheet(self.w.workspace, session.dataset_id, role)
+            book = self.w._sheet_owner(sheet.sheet_id)
+            for gesture, command in [('ctrl_a', 'toolbar'), ('corner', 'context'), ('selectAll', 'toolbar')]:
+                with self.subTest(role=role, gesture=gesture, command=command):
+                    page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).tabs.currentWidget()
+                    self.select(page, [1, 2])
+                    self.assertEqual(sheet.y_columns, [1, 2])
+                    if gesture == 'ctrl_a':
+                        page.table.setFocus()
+                        QTest.keyClick(page.table, Qt.Key_A, Qt.ControlModifier)
+                    elif gesture == 'corner':
+                        corner = next(button for button in page.table.findChildren(QAbstractButton)
+                                      if button.metaObject().className() == 'QTableCornerButton')
+                        QTest.mouseClick(corner, Qt.LeftButton)
+                    else:
+                        page.table.selectAll()
+                    APP.processEvents()
+                    self.assertEqual(sorted(index.column() for index in
+                        page.table.selectionModel().selectedColumns()), [0, 1, 2, 3, 4])
+                    self.assertEqual(sheet.y_columns, [1, 2, 3, 4])
+                    if command == 'toolbar':
+                        QTest.mouseClick(self.w.workbook_commands.heatmap_btn, Qt.LeftButton)
+                    else:
+                        menu = page.column_menu(1)
+                        next(action for action in menu.actions() if action.text() == 'Heatmap').trigger()
+                        menu.deleteLater()
+                    graph = session.active_graph
+                    self.assertEqual((graph.source_mode, graph.gate_indices), (mode, [0, 1, 2, 3]))
+                    snapshot = snapshot_dataset(session)
+                    np.testing.assert_array_equal(snapshot.y, [0, 1, 2, 3])
+                    self.assertEqual(snapshot.z.shape, (4, 12))
+                    np.testing.assert_array_equal(snapshot.z, expected)
+                    np.testing.assert_array_equal(session.base_cube.z, raw)
+                    np.testing.assert_array_equal(session.current_cube.z, processed)
 
     def test_name_does_not_redraw_and_title_style_export_roundtrip(self):
         book, sheet = self.xy()

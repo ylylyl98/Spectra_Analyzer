@@ -188,8 +188,8 @@ class WorkspaceShellTests(unittest.TestCase):
             self.assertFalse(w.dat_details_dock.isVisible())
         finally:
             popup.deleteLater()
-        heatmap = next(w.data_navigator.topLevelItem(i) for i in range(w.data_navigator.topLevelItemCount())
-                       if w.data_navigator.topLevelItem(i).data(0, Qt.UserRole) == ('heatmap', (session.dataset_id, 'default')))
+        heatmap = next(item for item in w._navigator_items()
+                       if item.data(0, Qt.UserRole) == ('heatmap', (session.dataset_id, 'default')))
         w.data_navigator.setCurrentItem(heatmap)
         w._open_navigator_item()
         self.assertIs(w.plot_page, page)
@@ -381,7 +381,7 @@ class WorkspaceShellTests(unittest.TestCase):
         session = self.load_dat()
         w.open_graph_document(session.dataset_id)
         w.rename_graph('default', 'Overview')
-        keys = [w.data_navigator.topLevelItem(i) for i in range(w.data_navigator.topLevelItemCount())]
+        keys = w._navigator_items()
         heatmaps = [item for item in keys if item.data(0, Qt.UserRole)[0] == 'heatmap']
         self.assertEqual(len(heatmaps), 1, 'Formal graphs must be reachable with DAT details closed')
         self.assertIn('Overview', heatmaps[0].text(0))

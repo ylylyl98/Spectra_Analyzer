@@ -27,14 +27,61 @@ Gate navigation is committed from the plot bar: arrow/index stepping is immediat
 
 The Analysis workbench fits Lorentzian (HWHM gamma), Gaussian (sigma), or true Voigt components (independent sigma and gamma). Initial amplitudes are signed heights above the baseline; widths and center bounds use physical X units. **Edit seeds and parameters…** allows continuous positions, explicit peak/dip kind, acceptance, amplitude, width, gamma, fixed centers and optional center bounds. Seed or input changes retire affected fits.
 
-## Install
+## Install on Windows
+
+Download `SpectraAnalyzer-VERSION-Setup.exe` from
+[GitHub Releases](https://github.com/ylylyl98/Spectra_Analyzer/releases/latest)
+and run it. The installer includes Python and all application dependencies;
+Windows 10/11 x64 PCs need no separate Python setup or source checkout.
+Open **Spectra Analyzer (Standalone)** from the desktop or Start Menu. Installation
+is per user and does not require administrator access. Projects and application
+preferences are preserved during upgrades and uninstall.
+
+Use **Help → Check for Updates…** to check the public release channel. An available
+update is downloaded and verified before the app offers to close and launch the
+installer. Save or discard pending work through the normal close prompt. Startup
+does not download or install updates automatically.
+
+The portable ZIP is also available: extract the entire archive and launch
+`SpectraAnalyzer.exe`, keeping its `_internal-VERSION` folder beside it.
+See [Windows packaging](tools/windows/README-Standalone.md) for build and validation
+instructions.
+
+## Run from source
+
+For development or other platforms, create the Python environment first:
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Run
+On Windows, install the source checkout's desktop and Start Menu entry once from
+PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\windows\Install-Launcher.ps1
+```
+
+Open **Spectra Analyzer** from the desktop or Start Menu. To keep it on the taskbar,
+right-click that shortcut and choose **Pin to taskbar** (on Windows 11, use **Show
+more options** if needed), or right-click the running app's taskbar icon and pin it.
+The entry targets `%LOCALAPPDATA%\Programs\SpectraAnalyzer\SpectraAnalyzer.exe`, a
+GUI launcher with an embedded multi-resolution icon and a persistent Windows app
+identity shared with the Qt window. Startup does not download or update anything.
+
+The launcher uses this checkout's `run_qt.py` and `.venv\Scripts\pythonw.exe`;
+keep both in place. After moving the checkout, rerun the setup script from its new
+location. This preserves the installed launcher path, taskbar identity and existing
+app settings. Startup failures show a message; Python diagnostics are saved in
+`%LOCALAPPDATA%\Programs\SpectraAnalyzer\logs\startup.log`. A single `.spectra` or
+`.spextra` filename can also be passed to `SpectraAnalyzer.exe`, including paths
+with spaces or Unicode characters. The old update-on-start and local BAT launchers
+have been retired.
+
+For development or other platforms:
+
 ```bash
 python run_qt.py
 ```
@@ -145,6 +192,14 @@ The comparison toolbar provides Home, Back, Forward, Pan and Zoom. **Inspector**
 Use **Project → Actions → Open / Rename / Remove** (also on the tree context menu) for retained workbooks, ordinary Sheets and comparisons, or **New comparison graph** to begin with an empty graph. Removing a Sheet or workbook also removes its dependent curves; removing a DAT uses the established imported-dataset action. Source files are unchanged. Workbooks, comparisons and heatmaps share Free Windows, Tabbed View, Tile and Cascade. Closing a view retains its contents for reopening.
 
 **Save Project** embeds numeric arrays, mappings, curve styles and document layout in the project. XY-only and mixed projects reopen even when their original files are unavailable; earlier project versions remain readable. Projects with Analysis workbench state use version 9; compatible projects without new state can retain version 8. DAT plot sidecars use version 6. Older native projects and sidecars retain every saved graph as an explicit document. Legacy XY curves retain Line style and the former graph name as their displayed Plot title; legacy heatmaps retain current/processed data and all Gates. Invalid comparison drafts must be corrected before changing documents, leaving Workspace, or saving.
+
+The empty Workspace offers **Import data**, **Open Project**, and **Recent projects**. Project's search box matches Workbook, Sheet, heatmap and XY names and source paths, retains matching ancestors, and preserves the active document and selection while filtering. Clear search to restore the tree.
+
+File-menu Save/Open, recent projects, dropped projects, and Save before New/Open/Close run project archive work in the background. Save captures current editors and independent array copies first; edits made while saving remain unsaved. **Cancel operation** preserves the current workspace and an existing project file until atomic replacement succeeds. A cancellation received after replacement reports the successful save and cancels the pending project transition. Opening keeps the current workspace until reading and validation succeed.
+
+**Edit → Undo / Redo** follows the active XY graph as well as DAT graphs. XY history restores curve edits, removal, order and selection, keeps up to 100 operations per graph during the session, and is omitted from saved projects.
+
+XY draft fields show validation beside the editor; **Esc** or **Revert edits** restores their committed values so navigation can continue. Dense XY previews use bounded samples while scientific analysis and SVG/PNG exports retain full source resolution and missing-data gaps. Fitting scales its calculations for small or large signal units and returns parameters in source units; a constant trace has undefined R². Derivative processing and fit evaluation check cancellation during calculations, and repeated requests retain only the newest pending operation.
 
 ## DAT format expected
 - Header row with gate values is supported, e.g.:

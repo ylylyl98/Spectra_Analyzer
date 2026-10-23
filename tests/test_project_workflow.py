@@ -2,6 +2,7 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import threading
+import time
 from dataclasses import replace
 import unittest
 from pathlib import Path
@@ -11,7 +12,7 @@ import numpy as np
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QStyle
 
 from spectra_app.main_window import MainWindow
 from spectra_app.edit_history import EditCommand, FieldChange
@@ -39,8 +40,17 @@ class ProjectWorkflowTests(unittest.TestCase):
     def tearDown(self):
         for window in self.windows:
             wait_jobs(window)
-            with patch.object(window, '_confirm_project_discard', return_value=True, create=True):
+            self.wait_project(window)
+            with patch.object(window, '_confirm_project_discard_async', side_effect=lambda continuation: continuation()):
                 window.close()
+                QTest.qWait(10)
+
+    def wait_project(self, window):
+        deadline = time.monotonic() + 8
+        while window._project_io_jobs.busy and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertFalse(window._project_io_jobs.busy, 'project operation timed out')
+        QTest.qWait(20)
 
     def window(self):
         window = MainWindow()
@@ -102,7 +112,9 @@ class ProjectWorkflowTests(unittest.TestCase):
         restored.plot_tabs.setCurrentWidget(restored.graph_documents)
         APP.processEvents()
         self.assertEqual(restored.graph_documents.subWindowList(), [])
-        self.assertFalse(restored.graph_command_host.isVisible())
+        self.assertTrue(restored.graph_command_host.isVisible())
+        self.assertTrue(restored.workspace_command_context.isVisible())
+        self.assertEqual(restored.workspace_command_context.text(), 'Open a Workbook or graph from Project.')
         restored._refresh_project_modified()
         self.assertFalse(restored.isWindowModified())
         restored.open_graph_document()
@@ -114,7 +126,8 @@ class ProjectWorkflowTests(unittest.TestCase):
         w._load_dat_file_direct(self.paths[0])
         w.open_graph_document()
         workspace = w._capture_project_workspace()
-        workspace.graph_workspace['documents'][0]['rect'] = [99999, -500, 560, 390]
+        saved_rect = [99999, -500, 560, 390]
+        workspace.graph_workspace['documents'][0]['rect'] = saved_rect
         destination = self.folder / 'offscreen.spectra'
         write_project(destination, workspace)
         restored = self.window()
@@ -123,9 +136,18 @@ class ProjectWorkflowTests(unittest.TestCase):
         restored.show()
         restored.plot_tabs.setCurrentWidget(restored.graph_documents)
         APP.processEvents()
+        QTest.qWait(20)
         window = restored.graph_documents.activeSubWindow()
         self.assertEqual(window.size().toTuple(), (560, 390))
-        self.assertTrue(restored.graph_documents.viewport().rect().contains(window.pos()))
+        viewport = restored.graph_documents.viewport().rect()
+        self.assertGreater(window.width(), viewport.width())
+        title = QRect(window.geometry())
+        title.setHeight(window.style().pixelMetric(QStyle.PM_TitleBarHeight, None, window))
+        reachable = viewport.intersected(title)
+        self.assertGreaterEqual(reachable.width(), 120)
+        self.assertEqual(reachable.height(), title.height())
+        self.assertEqual(restored._capture_project_workspace().graph_workspace['documents'][0]['rect'],
+                         saved_rect)
         restored._refresh_project_modified()
         self.assertFalse(restored.isWindowModified())
 
@@ -199,7 +221,9 @@ class ProjectWorkflowTests(unittest.TestCase):
         event = QCloseEvent()
         with patch('spectra_app.main_window.QMessageBox.warning', side_effect=AssertionError('clean close prompt')):
             restored.closeEvent(event)
-        self.assertTrue(event.isAccepted())
+            self.assertFalse(event.isAccepted())
+            self.wait_project(restored)
+        self.assertFalse(restored._project_close_approved)
 
     def test_menu_shortcuts_preserve_dat_import_and_copy(self):
         w = self.window()
@@ -241,6 +265,7 @@ class ProjectWorkflowTests(unittest.TestCase):
         with patch('spectra_app.main_window.QFileDialog.getSaveFileName',
                    return_value=(str(entered), '')) as dialog:
             w._on_save_project(save_as=True)
+            self.wait_project(w)
         self.assertEqual(Path(dialog.call_args.args[2]).name, 'Untitled.spectra')
         self.assertEqual(dialog.call_args.args[3], 'Spectra projects (*.spectra)')
         self.assertEqual(w._project_path, entered)
@@ -256,6 +281,7 @@ class ProjectWorkflowTests(unittest.TestCase):
                     'spectra_app.main_window.QFileDialog.getOpenFileName',
                     return_value=(str(path), '')) as dialog:
                 other._on_open_project()
+                self.wait_project(other)
                 self.assertEqual(dialog.call_args.args[3],
                                  'Spectra projects (*.spectra *.spextra)')
                 self.assertEqual(other._project_path, path)
@@ -272,6 +298,7 @@ class ProjectWorkflowTests(unittest.TestCase):
         with patch('spectra_app.main_window.QFileDialog.getSaveFileName',
                    side_effect=AssertionError('existing project does not need a path')):
             other._on_save_project()
+            self.wait_project(other)
         self.assertEqual(other._project_path, entered)
         self.assertTrue(entered.exists())
         self.assertFalse(entered.with_name(entered.name + '.spectra').exists())
@@ -377,6 +404,7 @@ class ProjectWorkflowTests(unittest.TestCase):
 
     def test_invalid_edit_blocks_save_but_explicit_discard_can_close(self):
         w = self.loaded_window()
+        w.show()
         w.prom_spin.lineEdit().setText('not a number')
         with self.assertRaisesRegex(ValueError, 'numeric'):
             w.save_project(self.folder / 'invalid.spextra')
@@ -387,7 +415,9 @@ class ProjectWorkflowTests(unittest.TestCase):
         self.assertIn('cannot be saved', prompt.call_args.args[2])
         with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Discard):
             w.closeEvent(event)
-        self.assertTrue(event.isAccepted())
+            self.assertFalse(event.isAccepted())
+            QTest.qWait(20)
+        self.assertFalse(w.isVisible())
 
     def test_invalid_committed_mapping_save_preserves_previous_file_and_baseline(self):
         w = self.loaded_window()
@@ -523,6 +553,7 @@ class ProjectWorkflowTests(unittest.TestCase):
              patch.object(w, 'close', wraps=w.close) as close:
             release.set()
             wait_jobs(w)
+            self.wait_project(w)
             QTest.qWait(15)
             self.assertFalse(w._close_pending)
             self.assertEqual(close.call_count, 1)
@@ -602,6 +633,7 @@ class ProjectWorkflowTests(unittest.TestCase):
 
     def test_project_export_folder_numbering_batch_csv_and_comparison_provenance(self):
         w = self.loaded_window()
+        w.open_graph_document()
         w.peak_indices = np.array([4])
         w._peak_gate_idx = w._current_gate_index()
         w.fit_result = _fit_result(2)

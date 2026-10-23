@@ -31,6 +31,8 @@ class RenderEventPerformanceTests(unittest.TestCase):
         self.w = MainWindow()
         self.w._show_error = self.fail
         self.w._load_dat_file_direct(path)
+        self.w.open_graph_document()
+        self.w.plot_tabs.setCurrentIndex(0)
         QTest.qWait(300)
 
     def tearDown(self):
@@ -73,7 +75,7 @@ class RenderEventPerformanceTests(unittest.TestCase):
         w._render_plot_page()  # Explicit preparation remains available while hidden.
         self.assertEqual(w.plot_page.rendered_page.owner_token, w._plot_owner_token())
 
-    def test_visible_title_burst_produces_one_final_svg_and_layout(self):
+    def test_visible_title_burst_produces_one_svg_and_defers_analysis_layout(self):
         w = self.w
         w.plot_tabs.setCurrentWidget(w.graph_documents)
         w._render_plot_page()
@@ -86,11 +88,75 @@ class RenderEventPerformanceTests(unittest.TestCase):
             self.assertEqual(w.workspace.active.view.annotations['plot_title'], 'One final title')
             self.assertIsNone(w.plot_page.rendered_page)
             self.assertEqual(render.call_count, 0)
+            QTest.keyClick(w.plot_title_edit, Qt.Key_Return)
             QTest.qWait(700)
             self.assertEqual(render.call_count, 1)
-            self.assertEqual(layout.call_count, 1)
+            self.assertEqual(layout.call_count, 0)
             self.assertEqual(sync.call_count, 1)
+            w.plot_tabs.setCurrentIndex(0)
+            self.assertEqual(layout.call_count, 1)
         self.assertIn('One final title', w.plot_page.rendered_page.svg_bytes.decode())
+
+    def test_precision_edit_keeps_current_preview_and_defers_hidden_analysis_draw(self):
+        w = self.w
+        w.resize(1200, 800)
+        w.show()
+        w.plot_tabs.setCurrentWidget(w.graph_documents)
+        saved = w.workspace.active.presentation
+        w.set_plot_presentation(replace(saved, width_in=4.4, height_in=4.2,
+                                       colorbar=replace(saved.colorbar, significant_digits=4)))
+        w._render_plot_page()
+        page = w.plot_page
+        page.set_zoom('200%')
+        QTest.qWait(300)
+        preview, renderer = page.preview, page.preview.renderer
+        old = page.rendered_page
+        self.assertIsNotNone(old, page.status_label.text())
+        horizontal, vertical = page.preview_scroll.horizontalScrollBar(), page.preview_scroll.verticalScrollBar()
+        horizontal.setValue(55)
+        vertical.setValue(65)
+        self.assertEqual((horizontal.value(), vertical.value()), (55, 65))
+        viewport_size, paper_size = page.preview_scroll.viewport().size(), preview.size()
+        cube, mesh, norm = w.current_cube, w._heat_mesh, w._heat_mesh.norm
+        data = cube.z.copy()
+        limits = w._heat_ax.get_xlim(), w._heat_ax.get_ylim(), mesh.get_clim()
+        with patch.object(main_window, 'render_hybrid_svg', wraps=main_window.render_hybrid_svg) as render, \
+             patch.object(w, '_layout_live_plots', wraps=w._layout_live_plots) as layout, \
+             patch.object(w.canvas, 'draw', wraps=w.canvas.draw) as draw:
+            page.bar_precision_spin.lineEdit().selectAll()
+            QTest.keyClicks(page.bar_precision_spin.lineEdit(), '2')
+            QTest.keyClick(page.bar_precision_spin, Qt.Key_Return)
+            self.assertIsNone(page.rendered_page)
+            self.assertIs(preview.page, old)
+            self.assertEqual(preview.svg_bytes, old.svg_bytes)
+            self.assertFalse(preview.isEnabled())
+            self.assertFalse(page.export_svg_btn.isEnabled())
+            self.assertFalse(page.export_png_btn.isEnabled())
+            self.assertEqual(render.call_count, 0)
+            sample = page.bar_sample_label.text().split(' | ')
+            QTest.qWait(450)
+            self.assertEqual(render.call_count, 1)
+            self.assertIsNotNone(page.rendered_page, page.status_label.text())
+            self.assertNotEqual(page.rendered_page.svg_bytes, old.svg_bytes)
+            self.assertEqual(layout.call_count, 0, 'Workspace precision edits must not lay out hidden Analysis')
+            self.assertEqual(draw.call_count, 0, 'Workspace precision edits must not draw hidden Analysis')
+            self.assertIs(page.preview, preview)
+            self.assertIs(preview.renderer, renderer)
+            self.assertEqual(page.zoom_combo.currentText(), '200%')
+            self.assertEqual((horizontal.value(), vertical.value()), (55, 65))
+            self.assertEqual(page.preview_scroll.viewport().size(), viewport_size)
+            self.assertEqual(preview.size(), paper_size)
+            self.assertTrue(page.export_svg_btn.isEnabled())
+            w.plot_tabs.setCurrentIndex(0)
+            self.assertEqual(layout.call_count, 1)
+            QTest.qWait(200)
+            self.assertGreater(draw.call_count, 0)
+        self.assertEqual([label.get_text() for label in w._heat_colorbar.ax.get_xticklabels()], sample)
+        self.assertIs(w.current_cube, cube)
+        self.assertIs(w._heat_mesh, mesh)
+        self.assertIs(mesh.norm, norm)
+        self.assertEqual((w._heat_ax.get_xlim(), w._heat_ax.get_ylim(), mesh.get_clim()), limits)
+        np.testing.assert_array_equal(cube.z, data)
 
     def test_gate_enter_and_focus_out_rebuild_changed_trace_once(self):
         w = self.w
@@ -152,6 +218,7 @@ class RenderEventPerformanceTests(unittest.TestCase):
         w._start_background_job(work, lambda value: None, 'Waiting')
         with patch.object(w, '_layout_live_plots', wraps=w._layout_live_plots) as layout:
             QTest.keyClicks(w.plot_title_edit, 'Deferred title')
+            QTest.keyClick(w.plot_title_edit, Qt.Key_Return)
             QTest.qWait(350)
             self.assertEqual(layout.call_count, 0)
             w.plot_tabs.setCurrentIndex(0)

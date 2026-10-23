@@ -167,9 +167,16 @@ class ImportExistingComparisonTests(unittest.TestCase):
         graph = self.window.open_xy_comparison(target.comparison_id)
         def configure(dialog, repeat):
             item = dialog.source_tree.topLevelItem(0).child(0)
+            self.assertEqual(item.data(0, Qt.UserRole), sheet_id)
             item.setCheckState(0, Qt.Checked)
             dialog.include_existing_chk.setChecked(repeat)
-            dialog.commit_btn.click()
+            self.assertEqual(dialog.commit_btn.isEnabled(), repeat)
+            if repeat:
+                dialog.commit_btn.click()
+            else:
+                self.assertIn('already present', dialog.feedback.text())
+                self.assertIn('0 to add', dialog.summary.text())
+                dialog.reject()
         for repeat, expected in ((False, 1), (True, 2)):
             self.modal(graph.add_data_btn.click, lambda dialog: configure(dialog, repeat))
             self.assertEqual(len(target.curves), expected)
@@ -182,12 +189,20 @@ class ImportExistingComparisonTests(unittest.TestCase):
         graph = self.window.open_xy_comparison(target.comparison_id)
         page = self.window.open_workbook(book.workbook_id).sheet_pages[sheet_id]
         self.window.graph_documents.close_document(('xy', target.comparison_id, ''))
-        def choose(dialog, text):
-            self.assertIsInstance(dialog, QMessageBox)
-            self.assertEqual(dialog.defaultButton().text(), 'Skip existing')
-            next(button for button in dialog.buttons() if button.text() == text).click()
-        for choice, expected in (('Skip existing', 1), ('Cancel', 1), ('Add again', 2)):
-            self.modal(page.add_comparison_btn.click, lambda dialog: choose(dialog, choice))
+        def cancel_review():
+            def reject_repeat(dialog):
+                item = dialog.source_tree.topLevelItem(0).child(0)
+                self.assertEqual(item.data(0, Qt.UserRole), sheet_id)
+                item.setCheckState(0, Qt.Checked)
+                dialog.include_existing_chk.setChecked(True)
+                self.assertTrue(dialog.commit_btn.isEnabled())
+                dialog.reject()
+            self.modal(graph.add_data_btn.click, reject_repeat)
+        commands = self.window.workbook_commands
+        for trigger, expected in ((page.add_comparison_btn.click, 1), (cancel_review, 1),
+                                  (commands.add_again_action.trigger, 2)):
+            with patch.object(QMessageBox, 'exec', side_effect=AssertionError('Duplicates skip without a dialog')):
+                trigger()
             self.assertEqual(len(target.curves), expected)
             self.assertEqual(self.window.graph_documents._active_key, ('workbook', book.workbook_id, ''))
             self.assertIsNone(self.window.graph_documents.window_for(('xy', target.comparison_id, '')))
@@ -252,6 +267,12 @@ class ImportExistingComparisonTests(unittest.TestCase):
         path = self.folder / 'gates.dat'
         path.write_text('Energy(eV) -2.5 7\n1 10 20\n2 11 21\n3 12 22\n', encoding='utf-8')
         self.window._load_dat_file_direct(path)
+        self.window.processing_mode_combo.setCurrentIndex(
+            self.window.processing_mode_combo.findData('energy_second_derivative'))
+        self.window.processing_smooth_chk.setChecked(False)
+        self.window._on_generate_heatmap()
+        wait_jobs(self.window)
+        self.assertEqual(self.window.workspace.active.applied.mode, 'energy_second_derivative')
         original = ensure_dataset_sheet(self.window.workspace, self.window.workspace.active_dataset_id)
         target, graph = self.target()
         self.window._set_current_gate_from_index(1)
@@ -275,10 +296,11 @@ class ImportExistingComparisonTests(unittest.TestCase):
             [(original.sheet_id, 0, 2, 'processed'), (original.sheet_id, 0, 2, 'raw')])
         self.assertEqual(additions, [(original.sheet_id, 0, 2, 'raw')])
         self.assertEqual(skipped, 1)
-        self.modal(self.window._add_current_gate_comparison, lambda dialog: dialog.defaultButton().click())
+        with patch.object(QMessageBox, 'exec', side_effect=AssertionError('Duplicates skip without a dialog')):
+            self.window._add_current_gate_comparison()
         self.assertEqual(len(target.curves), 1)
-        self.modal(self.window._add_current_gate_comparison,
-            lambda dialog: next(button for button in dialog.buttons() if button.text() == 'Add again').click())
+        self.assertIn('skipped 1', self.window.statusBar().currentMessage())
+        self.window._add_current_gate_comparison(include_existing=True)
         self.assertEqual(len(target.curves), 2)
         self.assertFalse(self.errors)
 

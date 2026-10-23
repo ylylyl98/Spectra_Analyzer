@@ -439,6 +439,10 @@ class XYAnalysisPanel(QGroupBox):
     def sync(self, *_args):
         if self._disposed or self._loading:
             return
+        if self.page._appearance_edit:
+            # The page guarantees committed scientific inputs are unchanged
+            # during this synchronous presentation/draft notification.
+            return
         payload = self.page.comparison.analysis_state
         resume_action = getattr(self.page, 'resume_analysis_action', None)
         idle = self.host is not None and not self.host._project_busy() and not self.busy
@@ -619,7 +623,8 @@ class XYAnalysisPanel(QGroupBox):
 
         def work(context):
             context.check_cancelled()
-            result = detect_peaks(captured.data, captured.settings) if operation == 'find' else fit_seeds(captured.data, captured.settings, seeds)
+            result = (detect_peaks(captured.data, captured.settings) if operation == 'find' else
+                      fit_seeds(captured.data, captured.settings, seeds, check_cancelled=context.check_cancelled))
             context.check_cancelled()
             return result
 

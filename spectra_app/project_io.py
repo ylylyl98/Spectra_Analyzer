@@ -1184,10 +1184,13 @@ def workspace_digest(workspace: Workspace) -> str:
     return _digest(*_snapshot(workspace))
 
 
-def write_project(path: str | Path, workspace: Workspace) -> str:
+def write_project(path: str | Path, workspace: Workspace, *, check_cancelled=None) -> str:
     """Atomically replace a project; return only the successfully saved digest."""
+    check_cancelled = check_cancelled or (lambda: None)
+    check_cancelled()
     manifest, arrays = _snapshot(workspace)
     digest = _digest(manifest, arrays)
+    check_cancelled()
     destination = Path(path)
     temporary = None
     try:
@@ -1197,10 +1200,12 @@ def write_project(path: str | Path, workspace: Workspace) -> str:
             with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
                 archive.writestr('manifest.json', manifest)
                 for name, array in arrays.items():
+                    check_cancelled()
                     with archive.open(name, 'w', force_zip64=True) as member:
                         np.save(member, array, allow_pickle=False)
             stream.flush()
             os.fsync(stream.fileno())
+        check_cancelled()
         os.replace(temporary, destination)
     finally:
         if temporary is not None:
@@ -1249,8 +1254,10 @@ def _read_array(archive, info):
     return array
 
 
-def read_project(path: str | Path) -> Workspace:
+def read_project(path: str | Path, *, check_cancelled=None) -> Workspace:
     """Fully validate and decode a detached workspace without source-file I/O."""
+    check_cancelled = check_cancelled or (lambda: None)
+    check_cancelled()
     try:
         with zipfile.ZipFile(path, 'r') as archive:
             entries = archive.infolist()
@@ -1259,6 +1266,7 @@ def read_project(path: str | Path) -> Workspace:
             names = set()
             total = 0
             for info in entries:
+                check_cancelled()
                 if info.filename in names:
                     _fail('Archive contains duplicate members.')
                 names.add(info.filename)
@@ -1279,8 +1287,14 @@ def read_project(path: str | Path) -> Workspace:
             manifest = json.loads(archive.read(manifest_info).decode('utf-8'),
                                   object_pairs_hook=_unique_json_object,
                                   parse_constant=_invalid_json_constant)
-            arrays = {info.filename: _read_array(archive, info) for info in entries if info.filename != 'manifest.json'}
-            return _decode_workspace(manifest, arrays)
+            arrays = {}
+            for info in entries:
+                check_cancelled()
+                if info.filename != 'manifest.json':
+                    arrays[info.filename] = _read_array(archive, info)
+            workspace = _decode_workspace(manifest, arrays)
+            check_cancelled()
+            return workspace
     except ProjectFormatError:
         raise
     except (ValueError, TypeError, KeyError, IndexError, OverflowError, UnicodeError,

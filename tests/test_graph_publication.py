@@ -207,9 +207,8 @@ class GraphPublicationWorkflowTests(unittest.TestCase):
         return entries
 
     def heatmap_items(self):
-        tree = self.w.data_navigator
-        return [tree.topLevelItem(i).data(0, Qt.UserRole) for i in range(tree.topLevelItemCount())
-                if tree.topLevelItem(i).data(0, Qt.UserRole)[0] == 'heatmap']
+        return [item.data(0, Qt.UserRole) for item in self.w._navigator_items()
+                if item.data(0, Qt.UserRole)[0] == 'heatmap']
 
     def test_ordinary_mixed_import_opens_first_owner_and_preserves_prior_windows(self):
         previous = create_comparison(self.w.workspace, 'Already open')

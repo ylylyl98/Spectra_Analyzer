@@ -8,6 +8,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 from spectra_app.main_window import MainWindow
+from spectra_app.app_identity import configure_application_icon, configure_process_identity
 
 
 APP_QSS = """
@@ -36,6 +37,11 @@ QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QListWidget, QPlainTextEdit {
     min-height: 28px;
     padding: 3px 6px;
 }
+/* The native popup delegate reads selection colors from the combo box. */
+QComboBox {
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
 QStatusBar { background: #ffffff; border-top: 1px solid #d6dce3; }
 """
 
@@ -56,7 +62,9 @@ def schedule_startup_project(window: MainWindow, arguments: list[str]) -> None:
 
 
 def main() -> int:
+    configure_process_identity()
     app = QApplication(sys.argv)
+    configure_application_icon(app)
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 10))
     app.setStyleSheet(APP_QSS)

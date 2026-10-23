@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QAbstractItemView
 from spectra_app.main_window import MainWindow
@@ -17,6 +17,7 @@ from spectra_app.plot_state import active_plot_recipe
 from spectra_app.plot_presentation import ColorbarTicks, NormSpec, PlotAnnotation
 from spectra_app.plot_templates import FORMAT_TEMPLATES_KEY
 from tests.settings_helpers import isolate_settings
+from tests.background_helpers import wait_jobs
 
 APP = QApplication.instance() or QApplication([])
 
@@ -25,6 +26,7 @@ class PlotEditingWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.folder = isolate_settings(self).parent
         self.w = MainWindow()
+        self.windows = [self.w]
         self.errors = []
         self.w._show_error = self.errors.append
         self.paths = []
@@ -34,6 +36,7 @@ class PlotEditingWorkflowTests(unittest.TestCase):
                 f'{1+i/10} {-i-1} {i+1} {10*(i+1)}' for i in range(12)), encoding='utf-8')
             self.paths.append(path)
             self.w._load_dat_file_direct(path)
+            self.w.open_graph_document()
         self.a, self.b = self.w.workspace.datasets.values()
         self.w.resize(1500, 950)
         self.w.plot_tabs.setCurrentIndex(1)
@@ -41,7 +44,13 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         APP.processEvents()
 
     def tearDown(self):
-        self.w.close()
+        for window in self.windows:
+            wait_jobs(window)
+            window.close()
+            APP.processEvents()
+            window.deleteLater()
+        APP.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         APP.processEvents()
 
     def render(self):
@@ -107,7 +116,6 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         # Explicit limits copied to a regional target must fail, independently.
         self.a.view.color_scale_mode = '2'
         dialog = w.create_format_dialog('Paper')
-        self.addCleanup(dialog.close)
         self.assertFalse(dialog.copy_mapping.isChecked())
         self.assertFalse(dialog.copy_limits.isChecked())
         dialog.select_all_btn.click()
@@ -200,9 +208,9 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         self.assertIn('10T',page.svg_bytes.decode())
         self.assertNotIn('editing-handle',page.svg_bytes.decode())
         w._save_current_plot_state()
-        w.activate_dataset(self.a.dataset_id)
-        self.assertEqual(p.annotation_list.count(),0)
-        w.activate_dataset(self.b.dataset_id)
+        other_page = w.open_graph_document(self.a.dataset_id)
+        self.assertEqual(other_page.annotation_list.count(),0)
+        self.assertIs(w.open_graph_document(self.b.dataset_id), p)
         self.assertEqual(p.annotation_list.count(),1)
         p.preview.setFocus()
         QTest.keyClick(p.preview,Qt.Key_Delete)
@@ -212,7 +220,6 @@ class PlotEditingWorkflowTests(unittest.TestCase):
     def test_batch_common_folder_blank_is_rejected_and_results_are_selectable(self):
         from spectra_app.plot_dialogs import BatchExportDialog
         dialog=BatchExportDialog((self.a,self.b),self.b.dataset_id,self.w)
-        self.addCleanup(dialog.close)
         dialog.common_folder.setChecked(True)
         with self.assertRaises(ValueError):
             self.w.start_plot_batch(dialog.selected_ids(),common_folder=dialog.destination())
@@ -220,17 +227,19 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         QTest.qWait(700)
         self.assertTrue(hasattr(self.w,'create_plot_batch_results_dialog'), 'Batch details need a selectable report')
         result=self.w.create_plot_batch_results_dialog()
-        self.addCleanup(result.close)
         self.assertIn(self.export_path(self.b).name,result.report_text.toPlainText())
 
     def test_format_renderer_rejects_invalid_target_without_mutating_it(self):
         w=self.w
         w.save_plot_format('Paper')
+        # Out-of-range custom ticks are invalid. Crowded valid labels now
+        # produce an export warning while retaining the requested colorbar.
         self.a.presentation=replace(self.a.presentation,colorbar=replace(self.a.presentation.colorbar,
-            ticks={'global':ColorbarTicks((0.,.001,100.))}))
+            ticks={'global':ColorbarTicks((-20.,0.,100.))}))
         before=self.a.presentation
         results=w.apply_plot_format('Paper',[self.a.dataset_id,self.b.dataset_id])
-        self.assertFalse(results[0]['success'],'Layout failure must be a per-target format error')
+        self.assertFalse(results[0]['success'],'Invalid retained ticks must be a per-target format error')
+        self.assertIn('inside the valid color limits', results[0]['error'])
         self.assertTrue(results[1]['success'])
         self.assertEqual(self.a.presentation,before)
 
@@ -256,7 +265,8 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         self.assertEqual(nudged.target,moved.target)
         w._save_current_plot_state()
         w.close()
-        w2=MainWindow(); self.addCleanup(w2.close)
+        APP.processEvents()
+        w2=MainWindow(); self.windows.append(w2)
         w2._load_dat_file_direct(self.paths[1])
         self.assertEqual(w2.workspace.active.presentation.annotations,(nudged,))
 
@@ -340,7 +350,7 @@ class PlotEditingWorkflowTests(unittest.TestCase):
 
     def test_annotation_add_buttons_require_a_valid_page_and_block_empty_window(self):
         empty=MainWindow()
-        self.addCleanup(empty.close)
+        self.windows.append(empty)
         self.assertFalse(empty.plot_page.add_text_btn.isEnabled())
         self.assertFalse(empty.plot_page.add_arrow_btn.isEnabled())
         with self.assertRaises(ValueError):

@@ -66,15 +66,13 @@ class AnalysisNavigationTests(unittest.TestCase):
     def select(self, key):
         tree = self.w.data_navigator
         tree.clearSelection()
-        for i in range(tree.topLevelItemCount()):
-            parent = tree.topLevelItem(i)
-            for item in [parent, *(parent.child(j) for j in range(parent.childCount()))]:
-                if item.data(0, Qt.UserRole) == key:
-                    tree.setCurrentItem(item)
-                    item.setSelected(True)
-                    tree.scrollToItem(item)
-                    APP.processEvents()
-                    return item
+        for item in self.w._navigator_items():
+            if item.data(0, Qt.UserRole) == key:
+                tree.setCurrentItem(item)
+                item.setSelected(True)
+                tree.scrollToItem(item)
+                APP.processEvents()
+                return item
         self.fail(f'Missing Project item: {key}')
 
     def sheet(self, session, role='original'):

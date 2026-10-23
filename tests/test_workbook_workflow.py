@@ -255,8 +255,7 @@ class WorkbookWorkflowTests(unittest.TestCase):
         book = next(iter(w.workspace.workbooks.values()))
         workbook = w.open_workbook(book.workbook_id)
         workbook.sheet_pages[book.sheet_ids[0]].new_comparison_btn.click()
-        item = next(w.data_navigator.topLevelItem(i) for i in range(w.data_navigator.topLevelItemCount())
-                    if w.data_navigator.topLevelItem(i).data(0, Qt.UserRole)[0] == 'xy')
+        item = next(item for item in w._navigator_items() if item.data(0, Qt.UserRole)[0] == 'xy')
         w.data_navigator.setCurrentItem(item)
         with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Yes):
             w._remove_navigator_item()

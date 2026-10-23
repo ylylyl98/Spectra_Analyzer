@@ -3,6 +3,7 @@ import unittest
 from dataclasses import replace
 import numpy as np
 import importlib
+import importlib.util
 
 
 class XYAnalysisTests(unittest.TestCase):

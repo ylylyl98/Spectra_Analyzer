@@ -261,7 +261,7 @@ class OrganizationModelTests(unittest.TestCase):
         self.assertEqual(snapshot.snapshot_note, note)
         path = self.folder / 'organized.spectra'
         write_project(path, self.workspace)
-        self.assertEqual(json.loads(archive_members(path)['manifest.json'])['version'], 6)
+        self.assertEqual(json.loads(archive_members(path)['manifest.json'])['version'], 8)
         for source in self.folder.glob('*.dat'):
             source.unlink()
         loaded = read_project(path)

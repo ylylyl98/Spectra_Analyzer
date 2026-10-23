@@ -520,9 +520,14 @@ class DatasetActivationTests(unittest.TestCase):
         w._orig_radio.setChecked(True)
         w.fit_model_combo.setCurrentText('Lorentzian')
         self.paths[0].rename(self.paths[0].with_suffix('.hidden'))
+        settings_value = w._annotation_settings.value
+        def cached_settings_value(key, *args, **kwargs):
+            # Format names are live UI preferences, not dataset defaults.
+            self.assertEqual(key, 'plot/format_templates_v1', 'cached owner read defaults')
+            return settings_value(key, *args, **kwargs)
         with patch('spectra_app.main_window.load_dat_cube', side_effect=AssertionError('cached load')), \
                 patch.object(w._plot_state_store, 'load', side_effect=AssertionError('sidecar read')), \
-                patch.object(w._annotation_settings, 'value', side_effect=AssertionError('defaults read')):
+                patch.object(w._annotation_settings, 'value', side_effect=cached_settings_value):
             w.activate_dataset(a)
         self.assertIs(w.current_cube, cube)
         self.assertEqual(w.current_gate, 2)
@@ -684,7 +689,7 @@ class DatasetActivationTests(unittest.TestCase):
         w.activate_dataset(a)
         w.plot_title_edit.setText('last keystroke')
         w._save_plot_annotation('plot_title', 'last keystroke')
-        self.assertTrue(w._annotation_edit_timer.isActive())
+        self.assertTrue(w._annotation_edit_pending)
         w._schedule_view_layout()
         w._drag_peak_arr_idx, w._drag_current_x = 2, 1.5
         w._batch_delete_circle_start = (1.4, 1)
@@ -692,6 +697,7 @@ class DatasetActivationTests(unittest.TestCase):
         w._cached_d2 = (np.array([1]), np.array([2]))
         w.toolbar.push_current()
         w.activate_dataset(b)
+        self.assertFalse(w._annotation_edit_pending)
         self.assertFalse(w._annotation_edit_timer.isActive())
         self.assertFalse(w._view_layout_timer.isActive())
         self.assertIsNone(w._drag_peak_arr_idx)
@@ -724,10 +730,19 @@ class DatasetActivationTests(unittest.TestCase):
                 old_key = w._analysis_job_key()
                 w._on_fit()
                 self.assertTrue(started.wait(2))
+                callbacks = next(iter(w._background_jobs._jobs.values()))
+                with self.assertRaisesRegex(ValueError, 'Wait'):
+                    w.activate_dataset(b)
+                self.assertEqual(w.workspace.active_dataset_id, a)
+                w._cancel_background_job()
+                self.release.set()
+                wait_jobs(w)
                 w.activate_dataset(b)
                 w.activate_dataset(a)
                 self.assertNotEqual(old_key, w._analysis_job_key())
-                self.release.set()
-                wait_jobs(w)
+                if fails:
+                    callbacks[1](ValueError('stale owner error'))
+                else:
+                    callbacks[0](_fit_result(3.3))
             self.assertIs(w.fit_result, committed)
         self.assertFalse(self.errors)

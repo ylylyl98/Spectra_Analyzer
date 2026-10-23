@@ -58,8 +58,10 @@ class ProjectTreeWrapTests(unittest.TestCase):
         self.settle()
 
     def rows(self):
-        parent = self.tree.topLevelItem(0)
-        return parent, parent.child(0), self.tree.topLevelItem(1)
+        keys = [('workbook', self.book.workbook_id), ('sheet', self.sheet.sheet_id),
+                ('xy', self.comparison.comparison_id)]
+        items = {item.data(0, Qt.UserRole): item for item in self.w._navigator_items()}
+        return tuple(items[key] for key in keys)
 
     def lower_point(self, item):
         self.tree.scrollToItem(item)
@@ -105,11 +107,17 @@ class ProjectTreeWrapTests(unittest.TestCase):
 
         QTest.mouseClick(self.tree.viewport(), Qt.LeftButton, Qt.NoModifier, self.lower_point(parent))
         QTest.mouseClick(self.tree.viewport(), Qt.LeftButton, Qt.ShiftModifier, self.lower_point(comparison))
-        self.assertEqual(len(self.tree.selectedItems()), 3)
+        self.assertEqual({item.data(0, Qt.UserRole) for item in self.tree.selectedItems()
+                          if item.data(0, Qt.UserRole)[0] != 'group'},
+                         {('workbook', self.book.workbook_id), ('sheet', self.sheet.sheet_id),
+                          ('xy', self.comparison.comparison_id)})
         with patch('spectra_app.main_window.QMenu'):
             self.w._navigator_menu(self.lower_point(child))
         self.assertIs(self.tree.currentItem(), child)
-        self.assertEqual(len(self.tree.selectedItems()), 3)
+        self.assertEqual({item.data(0, Qt.UserRole) for item in self.tree.selectedItems()
+                          if item.data(0, Qt.UserRole)[0] != 'group'},
+                         {('workbook', self.book.workbook_id), ('sheet', self.sheet.sheet_id),
+                          ('xy', self.comparison.comparison_id)})
         for item, method, args in (
             (parent, 'open_workbook', (self.book.workbook_id,)),
             (child, 'open_workbook', (self.book.workbook_id, self.sheet.sheet_id)),

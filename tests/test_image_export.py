@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -72,6 +73,14 @@ class ImageExportTests(unittest.TestCase):
         window._set_view_limits_to_auto()
         window._plot_cube()
         self.windows.append(window)
+        return window
+
+    def make_graph_window(self, folder: str) -> MainWindow:
+        window = self.make_window()
+        source = Path(folder) / "heatmap.dat"
+        source.write_text("Energy(eV) 0 1\n1.0 1 2\n1.1 2 3\n1.2 3 4\n", encoding="utf-8")
+        window._load_dat_file_direct(source)
+        window.open_graph_document()
         return window
 
     def test_detached_export_uses_reference_layout_and_only_heatmap_artists(self) -> None:
@@ -220,6 +229,11 @@ class ImageExportTests(unittest.TestCase):
         for mesh, colorbar, (vmin, vmax) in zip(window._heat_meshes, window._heat_colorbars, ranges):
             mesh.set_clim(vmin, vmax)
             colorbar.mappable.set_clim(vmin, vmax)
+        # Live bars retain their saved geometry and three ticks. Give those
+        # labels room; the detached legacy export below still fits endpoints.
+        presentation = window._unregistered_session.presentation
+        window.set_plot_presentation(replace(presentation, colorbar=replace(
+            presentation.colorbar, width_in=1.2, gap_in=.5)))
         window._layout_live_plots()
         window.canvas.draw()
         live_renderer = window.canvas.get_renderer()
@@ -369,6 +383,7 @@ class ImageExportTests(unittest.TestCase):
             source = Path(tmp) / "source.dat"
             source.write_text("Energy(eV) 0 1\n1.0 1 2\n1.1 2 3\n1.2 3 4\n", encoding="utf-8")
             window._load_dat_file_direct(source)
+            window.open_graph_document()
             window.plot_title_edit.setText("Saved title")
             window._render_plot_page()
             self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
@@ -376,6 +391,9 @@ class ImageExportTests(unittest.TestCase):
             browsing_folder.mkdir()
             window.current_folder = str(browsing_folder)
             sidecar = source.with_name("source.dat.plot.json")
+            # Opening a document already saves the graph collection; require
+            # this export to recreate it from the latest title.
+            sidecar.unlink()
             self.assertFalse(sidecar.exists())
             existing = Path(tmp) / "source_Graph 1_export01.png"
             existing.write_bytes(b"preserve original export")
@@ -386,7 +404,7 @@ class ImageExportTests(unittest.TestCase):
             self.assertEqual(existing.read_bytes(), b"preserve original export")
             self.assertTrue(sidecar.is_file())
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
-            self.assertEqual(payload["version"], 4)
+            self.assertEqual(payload["version"], 6)
             self.assertEqual(payload["plot"]["graphs"][0]["plot"]["annotations"]["plot_title"], "Saved title")
             self.assertFalse((browsing_folder / "source_Graph 1_export02.png").exists())
             self.assertIn(str(output), window.statusBar().currentMessage())
@@ -399,24 +417,24 @@ class ImageExportTests(unittest.TestCase):
         self.assertTrue(window.export_png_btn.isEnabled())
 
     def test_main_window_export_uses_current_svg_without_spectrum_or_editing_handles(self) -> None:
-        window = self.make_window()
-        window._spec_ax.set_title("Spectrum-only export sentinel")
-        window._spec_ax.lines[0].set_gid("spectrum-only-line")
-        window._render_plot_page()
-        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
-        annotation = window.plot_page.add_annotation("arrow", "Formal annotation")
-        window._render_plot_page()
-        page = window.plot_page.rendered_page
-        self.assertIsNotNone(page, window.plot_page.status_label.text())
-        self.assertEqual(window.plot_page.preview.selected_id, annotation.id)
-        preview_bytes = window.plot_page.preview.svg_bytes
-        root = ET.fromstring(preview_bytes)
-        self.assertIn("Formal annotation", ''.join(root.itertext()))
-        self.assertNotIn("Spectrum-only export sentinel", ''.join(root.itertext()))
-        self.assertNotIn("spectrum-only-line", preview_bytes.decode())
-        self.assertNotIn("editing-handle", preview_bytes.decode())
-        self.assertEqual(len(root.findall('.//{http://www.w3.org/2000/svg}image')), 1)
         with tempfile.TemporaryDirectory() as tmp:
+            window = self.make_graph_window(tmp)
+            window._spec_ax.set_title("Spectrum-only export sentinel")
+            window._spec_ax.lines[0].set_gid("spectrum-only-line")
+            window._render_plot_page()
+            self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+            annotation = window.plot_page.add_annotation("arrow", "Formal annotation")
+            window._render_plot_page()
+            page = window.plot_page.rendered_page
+            self.assertIsNotNone(page, window.plot_page.status_label.text())
+            self.assertEqual(window.plot_page.preview.selected_id, annotation.id)
+            preview_bytes = window.plot_page.preview.svg_bytes
+            root = ET.fromstring(preview_bytes)
+            self.assertIn("Formal annotation", ''.join(root.itertext()))
+            self.assertNotIn("Spectrum-only export sentinel", ''.join(root.itertext()))
+            self.assertNotIn("spectrum-only-line", preview_bytes.decode())
+            self.assertNotIn("editing-handle", preview_bytes.decode())
+            self.assertEqual(len(root.findall('.//{http://www.w3.org/2000/svg}image')), 1)
             window.current_folder = tmp
             path = Path(tmp) / "heatmap_Graph 1_export01.png"
             with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), patch(
@@ -433,13 +451,13 @@ class ImageExportTests(unittest.TestCase):
                 self.assertEqual(actual.convert("RGBA").tobytes(), expected.convert("RGBA").tobytes())
 
     def test_main_window_export_action_reports_save_failure(self) -> None:
-        window = self.make_window()
-        window._render_plot_page()
-        page = window.plot_page.rendered_page
-        self.assertIsNotNone(page, window.plot_page.status_label.text())
-        errors: list[str] = []
-        window._show_error = errors.append
         with tempfile.TemporaryDirectory() as tmp:
+            window = self.make_graph_window(tmp)
+            window._render_plot_page()
+            page = window.plot_page.rendered_page
+            self.assertIsNotNone(page, window.plot_page.status_label.text())
+            errors: list[str] = []
+            window._show_error = errors.append
             window.current_folder = tmp
             existing = Path(tmp) / "heatmap_Graph 1_export01.png"
             existing.write_bytes(b"preserve original export")
@@ -451,10 +469,10 @@ class ImageExportTests(unittest.TestCase):
             self.assertEqual(export.call_args.args[1], Path(tmp) / "heatmap_Graph 1_export02.png")
             self.assertFalse((Path(tmp) / "heatmap_Graph 1_export02.png").exists())
             self.assertEqual(existing.read_bytes(), b"preserve original export")
-        self.assertTrue(errors)
-        self.assertIn("PNG", errors[-1])
-        self.assertIn("disk full", errors[-1])
-        self.assertIs(window.plot_page.rendered_page, page)
+            self.assertTrue(errors)
+            self.assertIn("PNG", errors[-1])
+            self.assertIn("disk full", errors[-1])
+            self.assertIs(window.plot_page.rendered_page, page)
 
     def test_main_window_export_action_is_guarded_without_data(self) -> None:
         window = MainWindow()
@@ -465,7 +483,7 @@ class ImageExportTests(unittest.TestCase):
         with patch("spectra_app.main_window.write_svg_png") as export:
             window._on_export_png()
         export.assert_not_called()
-        self.assertEqual(errors, ["Failed to export PNG: The formal page is not ready. Wait for the current preview."])
+        self.assertEqual(errors, ["Failed to export PNG: Open a graph document to export."])
 
 
 if __name__ == "__main__":

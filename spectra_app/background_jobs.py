@@ -54,20 +54,32 @@ class _Job(QThread):
 
 
 class BackgroundJobs(QObject):
-    """Own threads until finished; only the newest request may invoke callbacks."""
+    """Run one job at a time, retaining only the newest replacement request.
+
+    Cancellation is cooperative. A replacement waits for the owned thread to
+    finish rather than accumulating cancelled workers behind an expensive call.
+    """
     idle = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._jobs = {}
         self._current = None
+        self._pending = None
 
     @property
     def busy(self):
-        return bool(self._jobs)
+        return bool(self._jobs) or self._pending is not None
 
     def start(self, work, on_result, *, on_error=None, on_progress=None):
         self.cancel()
+        self._pending = (work, on_result, on_error, on_progress)
+        if not self._jobs:
+            self._start_pending()
+
+    def _start_pending(self):
+        work, on_result, on_error, on_progress = self._pending
+        self._pending = None
         job = _Job(work, self)
         self._jobs[job] = (on_result, on_error, on_progress)
         self._current = job
@@ -78,6 +90,7 @@ class BackgroundJobs(QObject):
         job.start()
 
     def cancel(self):
+        self._pending = None
         self._current = None
         for job in self._jobs:
             job.cancelled.set()
@@ -116,7 +129,9 @@ class BackgroundJobs(QObject):
         if job is self._current:
             self._current = None
         job.deleteLater()
-        if not self._jobs:
+        if self._pending is not None:
+            self._start_pending()
+        elif not self._jobs:
             self.idle.emit()
 
 

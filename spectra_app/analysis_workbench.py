@@ -764,8 +764,12 @@ class AnalysisWorkbenchMixin:
                         span = float(np.ptp(x)) if x.size else 0.
                         step = float(np.median(np.abs(np.diff(x)))) if x.size > 1 else 1e-6
                         baseline = float(np.nanmedian(y)) if y.size else 0.
+                        amplitude_scale = float(np.max(np.abs(y-baseline))) if y.size else 0.
+                        amplitude_scale = amplitude_scale or abs(baseline) or 1.
+                        # A manual shoulder seed can lie at the median height.
+                        amplitude_floor = max(float(np.ptp(y))*.1, amplitude_scale*1e-6) if y.size else amplitude_scale*1e-6
                         amplitudes = [seed.amplitude if seed.amplitude is not None else
-                            (1 if seed.kind == 'peak' else -1)*max(abs(float(y[np.argmin(np.abs(x-seed.position))])-baseline), float(np.ptp(y))*.1, 1e-12)
+                            (1 if seed.kind == 'peak' else -1)*max(abs(float(y[np.argmin(np.abs(x-seed.position))])-baseline), amplitude_floor)
                             for seed in seeds]
                         widths = [seed.width if seed.width is not None else max(step*2, span/40) for seed in seeds]
                         gammas = [seed.gamma if seed.gamma is not None else width for seed, width in zip(seeds, widths)]
@@ -774,7 +778,8 @@ class AnalysisWorkbenchMixin:
                         fit = fit_multi_peak(x, y, centers_hint=centers, model=model, mode='Both',
                             kinds=np.asarray([seed.kind == 'peak' for seed in seeds]), initial_amplitudes=amplitudes,
                             initial_widths=widths, initial_gammas=gammas if model == 'Voigt' else None,
-                            fixed_centers=[seed.fixed_center for seed in seeds], center_bounds=bounds)
+                            fixed_centers=[seed.fixed_center for seed in seeds], center_bounds=bounds,
+                            check_cancelled=context.check_cancelled)
                         outcome = (fit, 'fitted', '')
                     except (ValueError, RuntimeError) as exc:
                         outcome = (None, 'failed', str(exc))
@@ -1101,7 +1106,7 @@ class AnalysisWorkbenchMixin:
             provenance['y_label'] = y_label
             if fit is not None:
                 provenance.update(model=fit.model, baseline=float(fit.baseline), rmse=float(fit.rmse),
-                                  r_squared=float(fit.r_squared))
+                                  r_squared=float(fit.r_squared) if np.isfinite(fit.r_squared) else None)
             options = dict(x_label=cube.energy_label, y_label=y_label,
                            note=json.dumps(provenance, ensure_ascii=False, indent=2))
             x, y = cube.energy, cube.z[gate]

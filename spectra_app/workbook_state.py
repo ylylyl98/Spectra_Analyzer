@@ -523,7 +523,14 @@ def select_curve_additions(workspace, comparison_id, candidates, *, include_exis
     return additions, skipped
 
 
-def default_curve_label(workspace, sheet, y_column):
+def _curve_sheet_context(workspace, sheet):
+    if sheet.role == 'fit_curves':
+        cube = workspace.datasets[sheet.dataset_id].current_cube
+        return f'Fit curves · {cube.gate_label} = {cube.gate[sheet.fit_gate_idx]:g}'
+    return sheet.name
+
+
+def default_curve_label(workspace, sheet, y_column, *, disambiguate_source=True):
     """Describe the retained source and values only when creating a new curve."""
     owner = next((b.name for b in workspace.workbooks.values() if sheet.sheet_id in b.sheet_ids), 'Workbook')
     source = sheet.source_path
@@ -534,7 +541,7 @@ def default_curve_label(workspace, sheet, y_column):
         others = {s.source_path for s in workspace.sheets.values()
                   if s.source_path is not None and s.source_path.name.casefold() == source.name.casefold()
                   and _source_key(s.source_path) != _source_key(source)}
-        if others:
+        if others and disambiguate_source:
             # Shortest useful folder suffix; source paths are provenance only.
             # abspath is lexical: relative paths need a parent for display,
             # without resolving symlinks, probing files or changing provenance.
@@ -547,11 +554,7 @@ def default_curve_label(workspace, sheet, y_column):
                     break
             label += f' [{str(Path(*suffix))}]'
     if sheet.kind == 'dat' or sheet.role != 'original' or sheet.name != 'Original':
-        context = sheet.name
-        if sheet.role == 'fit_curves':
-            cube = workspace.datasets[sheet.dataset_id].current_cube
-            context = f'Fit curves · {cube.gate_label} = {cube.gate[sheet.fit_gate_idx]:g}'
-        label += f' · {context}'
+        label += f' · {_curve_sheet_context(workspace, sheet)}'
     return f'{label}: {sheet_columns(workspace, sheet)[y_column]}'
 
 

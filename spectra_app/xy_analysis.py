@@ -148,7 +148,7 @@ def detect_peaks(data, settings):
                  np.array([item[2] for item in chosen], dtype=bool))
 
 
-def fit_peaks(data, settings, peaks):
+def fit_peaks(data, settings, peaks, *, check_cancelled=None):
     settings.validate()
     if not peaks.indices.size:
         raise ValueError('Find peaks before fitting.')
@@ -156,7 +156,7 @@ def fit_peaks(data, settings, peaks):
         raise ValueError('Too few finite samples for this many peaks. Reduce maximum peaks or widen the X interval.')
     return fit_multi_peak(data.x[data.valid], data.y[data.valid], centers_hint=data.x[peaks.indices],
         model=settings.model, mode=settings.mode, linewidth_min=settings.width_min,
-        linewidth_max=settings.width_max, kinds=peaks.kinds)
+        linewidth_max=settings.width_max, kinds=peaks.kinds, check_cancelled=check_cancelled)
 
 
 def input_fingerprint(captured):
@@ -171,7 +171,7 @@ def collect_candidates(data, settings):
         sg_window=settings.sg_window, sg_polyorder=settings.sg_polyorder)
 
 
-def fit_seeds(data, settings, seeds):
+def fit_seeds(data, settings, seeds, *, check_cancelled=None):
     """Fit continuous edited centers; candidate source Y is never an amplitude seed."""
     settings.validate()
     seeds = [seed for seed in seeds if seed.enabled]
@@ -182,8 +182,9 @@ def fit_seeds(data, settings, seeds):
     width_max = settings.width_max or max(spread*2 + 1e-9, settings.width_min*2)
     width = float(np.clip(spread / max(8*len(seeds), 20), settings.width_min, width_max))
     baseline = float(np.median(y))
+    amplitude_scale = float(np.max(np.abs(y-baseline))) or abs(baseline) or 1.
     amplitudes = [seed.amplitude if seed.amplitude is not None else
-        (1 if seed.kind == 'peak' else -1)*max(abs(float(np.interp(seed.position, x, y))-baseline), 1e-6)
+        (1 if seed.kind == 'peak' else -1)*max(abs(float(np.interp(seed.position, x, y))-baseline), amplitude_scale*1e-6)
         for seed in seeds]
     return fit_multi_peak(x, y, centers_hint=np.array([seed.position for seed in seeds]),
         model=settings.model, mode='Both', linewidth_min=settings.width_min, linewidth_max=settings.width_max,
@@ -193,7 +194,8 @@ def fit_seeds(data, settings, seeds):
                         if settings.model == 'Voigt' else None),
         fixed_centers=np.array([seed.fixed_center for seed in seeds]),
         center_bounds=(np.array([seed.center_min if seed.center_min is not None else x[0] for seed in seeds]),
-                       np.array([seed.center_max if seed.center_max is not None else x[-1] for seed in seeds])))
+                       np.array([seed.center_max if seed.center_max is not None else x[-1] for seed in seeds])),
+        check_cancelled=check_cancelled)
 
 
 @dataclass

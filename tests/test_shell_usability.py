@@ -60,12 +60,10 @@ class ShellUsabilityTests(unittest.TestCase):
 
     def select(self, kind, identity):
         tree = self.w.data_navigator
-        for i in range(tree.topLevelItemCount()):
-            top = tree.topLevelItem(i)
-            for item in (top, *(top.child(j) for j in range(top.childCount()))):
-                if item.data(0, Qt.UserRole) == (kind, identity):
-                    tree.setCurrentItem(item)
-                    return item
+        for item in self.w._navigator_items():
+            if item.data(0, Qt.UserRole) == (kind, identity):
+                tree.setCurrentItem(item)
+                return item
         self.fail(f'Missing Project item: {kind} {identity}')
 
     def test_close_view_during_analysis_cannot_close_hidden_source(self):
@@ -329,8 +327,10 @@ class ShellUsabilityTests(unittest.TestCase):
         self.assertNotEqual(first.text(0), second.text(0))
         self.assertIn('left', first.text(0))
         self.assertIn('right', second.text(0))
-        self.assertFalse(first.font(0).bold())
-        self.assertTrue(second.font(0).bold())
+        self.assertFalse(first.font(0).underline())
+        self.assertTrue(second.font(0).underline())
+        self.assertFalse(first.data(0, Qt.UserRole + 1))
+        self.assertTrue(second.data(0, Qt.UserRole + 1))
         for item, book, path in zip((first, second), books, paths):
             key = ('workbook', book.workbook_id, '')
             window = w.graph_documents.window_for(key)

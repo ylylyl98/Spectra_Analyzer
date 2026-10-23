@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from io import BytesIO
+from copy import copy
 from pathlib import Path
 import json
 import math
 import re
 from uuid import uuid4
 import numpy as np
+from matplotlib import rc_context
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from PySide6.QtCore import Qt, Signal, QSignalBlocker, QMimeData, QItemSelectionModel, QSize, QEvent
@@ -18,18 +20,46 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QColorDialog, QDoubleSpinBo
     QApplication, QTabWidget, QToolBar)
 
 from .workbook_state import remove_curve, sheet_columns
-from .comparison_display import prepare_comparison
+from .comparison_display import prepare_comparison, comparison_y_label
+from .comparison_labels import comparison_legend_labels
 from .plot_icons import PLOT_STYLES, plot_icon
 from .xy_analysis_panel import XYAnalysisPanel
+from .xy_edit_history import XYEditHistory, capture_edit_state
+from .xy_preview import sample_preview_curve
 
 
-def draw_comparison(figure, workspace, comparison):
+def _update_legend(axes, workspace, comparison):
+    previous = axes.get_legend()
+    if previous is not None:
+        previous.remove()
+    drawn = {line.get_gid() for line in axes.lines}
+    labels = comparison_legend_labels(workspace, [curve for curve in comparison.curves.values()
+                                                 if curve.curve_id in drawn])
+    legend_entries = []
+    for line in axes.lines:
+        if line.get_gid() not in labels:
+            continue
+        label, automatic = labels[line.get_gid()]
+        if automatic or label and not label.startswith('_'):
+            legend_entries.append((line, label, automatic))
+    if comparison.legend_visible and legend_entries:
+        legend = axes.legend(handles=[line for line, _label, _auto in legend_entries],
+                             labels=[label for _line, label, _auto in legend_entries])
+        legend._comparison_curve_ids = [line.get_gid() for line, _label, _auto in legend_entries]
+        for (_line, _label, automatic), text in zip(legend_entries, legend.get_texts()):
+            if automatic:
+                text.set_parse_math(False)
+
+
+def draw_comparison(figure, workspace, comparison, *, preview=False):
+    """Render full resolution by default; only the interactive preview samples."""
     figure.clear()
     axes = figure.add_subplot(111)
     display = prepare_comparison(workspace, comparison)
     for item in display.curves:
         curve = item.curve
-        axes.plot(item.x, item.y, gid=curve.curve_id,
+        x, y = sample_preview_curve(item.x, item.y) if preview else (item.x, item.y)
+        axes.plot(x, y, gid=curve.curve_id,
                   label=curve.label, color=curve.color, linewidth=curve.width,
                   linestyle='None' if curve.style == 'scatter' else '-',
                   marker='None' if curve.style == 'line' else 'o', markersize=4)
@@ -41,8 +71,7 @@ def draw_comparison(figure, workspace, comparison):
                   else 'No visible samples', ha='center', va='center', transform=axes.transAxes)
     axes._comparison_display = display
     axes.grid(True, alpha=.2)
-    if comparison.legend_visible and axes.lines:
-        axes.legend()
+    _update_legend(axes, workspace, comparison)
     figure.set_layout_engine('tight')
     return axes
 
@@ -144,11 +173,16 @@ class _CurveList(QListWidget):
                 self.clearSelection()
                 event.accept()
                 return
+            if event.key() == Qt.Key_Delete:
+                self._page._remove_selected()
+                event.accept()
+                return
             super().keyPressEvent(event)
 
 
 class XYPlotPage(QWidget):
     changed = Signal()
+    historyChanged = Signal()
     analysisRequested = Signal()
     sourceRequested = Signal(str)
     addDataRequested = Signal()
@@ -158,7 +192,11 @@ class XYPlotPage(QWidget):
     def __init__(self, workspace, comparison_id):
         super().__init__()
         self.workspace, self.comparison_id = workspace, comparison_id
+        if not hasattr(self.comparison, '_edit_history'):
+            self.comparison._edit_history = XYEditHistory()
+        self._edit_history = self.comparison._edit_history
         self._syncing = False
+        self._appearance_edit = False
         self._active_curve_id = None
         self._selection_ids = set()
         self._preview_styles = []
@@ -305,6 +343,8 @@ class XYPlotPage(QWidget):
         form.addRow('Extra Y offset', self.y_offset_edit)
         self.label_edit = QLineEdit()
         self.label_edit.setAccessibleName('Curve legend text')
+        self.label_edit.setToolTip('Unchanged automatic names are shortened in the plot. '
+                                  'Custom legend text is shown as entered; full source details remain available below.')
         form.addRow('Legend text', self.label_edit)
         self.color_edit = QLineEdit()
         self.color_edit.setAccessibleName('Curve color hex')
@@ -338,7 +378,7 @@ class XYPlotPage(QWidget):
             edit.setAccessibleName(label)
             form.addRow(label, edit)
             edit.editingFinished.connect(self._graph_edited)
-            edit.textChanged.connect(self.changed)
+            edit.textChanged.connect(self._draft_changed)
         self.legend_chk = QCheckBox('Show legend')
         self.legend_chk.toggled.connect(self._graph_edited)
         form.addRow(self.legend_chk)
@@ -361,7 +401,7 @@ class XYPlotPage(QWidget):
             edit.setAccessibleName(label)
             form.addRow(label, edit)
             edit.editingFinished.connect(self._display_edited)
-            edit.textChanged.connect(self.changed)
+            edit.textChanged.connect(self._draft_changed)
         self.stack_step_edit.setToolTip('Equal Y spacing in curve list order, including hidden curves. Signed values are allowed.')
         self.reset_display_btn = QPushButton('Reset comparison display')
         self.reset_display_btn.setAccessibleName('Reset normalization, X range and all Y offsets')
@@ -384,6 +424,11 @@ class XYPlotPage(QWidget):
         self.status = QLabel()
         self.status.setWordWrap(True)
         inspector_layout.addWidget(self.status)
+        self.revert_edits_btn = QPushButton('Revert pending edits')
+        self.revert_edits_btn.setAccessibleName('Revert pending graph and curve edits')
+        self.revert_edits_btn.setToolTip('Restore the last committed editor values. Esc in an editor also reverts drafts.')
+        self.revert_edits_btn.clicked.connect(self.revert_editor)
+        inspector_layout.addWidget(self.revert_edits_btn)
         for edit in (self.name_edit, self.plot_title_edit, self.x_label_edit, self.y_label_edit, self.label_edit, self.color_edit,
                      self.x_min_edit, self.x_max_edit, self.stack_step_edit, self.y_offset_edit):
             edit.setMinimumWidth(0)
@@ -409,13 +454,13 @@ class XYPlotPage(QWidget):
         self.move_up_btn.clicked.connect(lambda: self._move_selected(-1))
         self.move_down_btn.clicked.connect(lambda: self._move_selected(1))
         self.label_edit.editingFinished.connect(self._curve_edited)
-        self.label_edit.textChanged.connect(self.changed)
+        self.label_edit.textChanged.connect(self._draft_changed)
         self.color_edit.editingFinished.connect(self._curve_edited)
-        self.color_edit.textChanged.connect(self.changed)
+        self.color_edit.textChanged.connect(self._draft_changed)
         self.width_spin.valueChanged.connect(self._curve_edited)
         self.width_spin.lineEdit().textChanged.connect(lambda: self._mark_draft(self.width_spin))
         self.y_offset_edit.editingFinished.connect(self._curve_edited)
-        self.y_offset_edit.textChanged.connect(self.changed)
+        self.y_offset_edit.textChanged.connect(self._draft_changed)
         self.color_btn.clicked.connect(self._choose_color)
         self.remove_btn.clicked.connect(self._remove_selected)
         self.source_btn.clicked.connect(self._open_source)
@@ -423,14 +468,24 @@ class XYPlotPage(QWidget):
         self.export_png_btn.clicked.connect(lambda: self._export_dialog('png'))
         self._curve_click_connection = self.canvas.mpl_connect('button_press_event', self._plot_clicked)
         self.canvas.installEventFilter(self)
+        self._ordinary_editors = (self.name_edit, self.plot_title_edit, self.x_label_edit, self.y_label_edit,
+            self.label_edit, self.color_edit, self.x_min_edit, self.x_max_edit, self.stack_step_edit,
+            self.y_offset_edit, self.width_spin, self.width_spin.lineEdit())
         for editor in [*self.inspector.findChildren(QLineEdit), self.width_spin]:
             editor.installEventFilter(self)
         self.refresh()
 
     def eventFilter(self, watched, event):
+        if (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape
+                and watched in self._ordinary_editors):
+            self.revert_editor()
+            return True
         if watched is self.canvas and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
             if self._finish_curve_action():
                 self.curve_list.clearSelection()
+            return True
+        if watched is self.canvas and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Delete:
+            self._remove_selected()
             return True
         if (watched is self.width_spin and self.width_spin in self._draft_fields
                 and event.type() in (QEvent.Hide, QEvent.Show)):
@@ -438,7 +493,7 @@ class XYPlotPage(QWidget):
             # as well as FocusOut. Section navigation must retain that draft.
             return True
         if (event.type() == QEvent.FocusOut
-                and (QApplication.focusWidget() in (self.inspector_toggle_btn, self.inspector_tabs.tabBar(),
+                and (QApplication.focusWidget() in (self.revert_edits_btn, self.inspector_toggle_btn, self.inspector_tabs.tabBar(),
                                                    self.analysis_panel.edit_interval_btn)
                      or not watched.isVisible())):
             # Native navigation receives focus before switching/hiding the
@@ -491,8 +546,127 @@ class XYPlotPage(QWidget):
         if not self._syncing:
             self._draft_fields.add(field)
 
+    def _emit_changed(self, *, appearance_only=False):
+        self._emit_notification(self.changed, appearance_only=appearance_only)
+
+    def _emit_notification(self, signal, *, appearance_only=False):
+        previous = self._appearance_edit
+        self._appearance_edit = previous or appearance_only
+        try:
+            signal.emit()
+        finally:
+            self._appearance_edit = previous
+
+    def _draft_changed(self, *_args):
+        if not self._syncing:
+            # Draft text has not changed the scientific input. Controllers may
+            # update dirty state without asking analysis to capture it again.
+            self._emit_changed(appearance_only=True)
+
     def _selected_ids(self):
         return {item.data(Qt.UserRole) for item in self.curve_list.selectedItems()}
+
+    def _capture_edit(self):
+        return capture_edit_state(self.comparison), (self._active_curve_id, tuple(self._selected_ids()))
+
+    def _record_edit(self, label, before, *, retained_analysis=None):
+        after = self._capture_edit()
+        if self._edit_history.record(label, before[0], after[0], before_selection=before[1],
+                                     after_selection=after[1], retained_analysis=retained_analysis):
+            self._emit_notification(self.historyChanged,
+                                    appearance_only=self._edit_history.undo_stack[-1].appearance_only)
+
+    def can_undo(self):
+        return self._edit_history.available(self.workspace, self.comparison)
+
+    def can_redo(self):
+        return self._edit_history.available(self.workspace, self.comparison, redo=True)
+
+    def undo(self):
+        return self._history_step()
+
+    def redo(self):
+        return self._history_step(redo=True)
+
+    def _history_step(self, *, redo=False):
+        if not self._finish_curve_action():
+            return False
+        history = self._edit_history
+        if not history.available(self.workspace, self.comparison, redo=redo):
+            self._emit_notification(self.historyChanged, appearance_only=True)
+            return False
+        source, destination = (history.redo_stack, history.undo_stack) if redo else (history.undo_stack, history.redo_stack)
+        command = source.pop()
+        retained = command.retained_analysis
+        restore_analysis = (not redo and retained is not None and retained[2] is not None
+                            and self.comparison.analysis_state is retained[2])
+        redo_retained_analysis = (redo and retained is not None
+                                  and self.comparison.analysis_state is retained[1])
+        command.apply(self.comparison, redo=redo)
+        destination.append(command)
+        self._draft_fields.clear()
+        if command.structural:
+            active_id, selected_ids = command.after_selection if redo else command.before_selection
+            self._active_curve_id = active_id
+        self.refresh(appearance_only=command.appearance_only)
+        if command.structural:
+            with QSignalBlocker(self.curve_list):
+                for row in range(self.curve_list.count()):
+                    item = self.curve_list.item(row)
+                    item.setSelected(item.data(Qt.UserRole) in selected_ids)
+                    if item.data(Qt.UserRole) == active_id:
+                        self.curve_list.setCurrentItem(item, QItemSelectionModel.NoUpdate)
+            self._selection_changed()
+        if redo and retained is not None:
+            command.retained_analysis = (retained[0], retained[1],
+                                        self.comparison.analysis_state if redo_retained_analysis else None)
+        if restore_analysis:
+            self._restore_removed_analysis(retained)
+        self.status.clear()
+        self._emit_notification(self.historyChanged, appearance_only=command.appearance_only)
+        self._emit_changed(appearance_only=command.appearance_only)
+        return True
+
+    def _restore_removed_analysis(self, retained):
+        progress, payload, _removal_payload = retained
+        if progress is None:
+            return
+        # Recheck source bytes, mapping and scientific interval. A deleted or
+        # changed source must never acquire a fit from an earlier document state.
+        from .xy_analysis import capture_input
+        try:
+            current = capture_input(self.workspace, self.comparison, progress.captured.curve_id,
+                                    progress.captured.settings)
+        except (ValueError, KeyError, IndexError):
+            return
+        if current.key != progress.captured.key:
+            return
+        self.comparison.analysis_state = payload
+        panel = self.analysis_panel
+        if panel._activated:
+            panel.progress = copy(progress)
+            panel._publish_progress()
+            panel.sync()
+            self.render()
+
+    def revert_editor(self):
+        """Discard every uncommitted draft without mutating document state."""
+        self._draft_fields.clear()
+        self._syncing = True
+        try:
+            comparison = self.comparison
+            for edit, value in ((self.name_edit, comparison.name), (self.plot_title_edit, comparison.plot_title),
+                                (self.x_label_edit, comparison.x_label), (self.y_label_edit, comparison.y_label)):
+                edit.setText(value)
+            self.legend_chk.setChecked(comparison.legend_visible)
+            self._load_display_controls()
+            self._load_curve_controls()
+        finally:
+            self._syncing = False
+        self._draft_fields.clear()
+        self.status.clear()
+        self._update_display_status()
+        self._emit_changed(appearance_only=True)
 
     def _source_text(self, curve):
         sheet = self.workspace.sheets[curve.sheet_id]
@@ -513,12 +687,12 @@ class XYPlotPage(QWidget):
         pixmap.fill(QColor(curve.color))
         item.setIcon(QIcon(pixmap))
 
-    def refresh(self):
+    def refresh(self, *, appearance_only=False):
         # A controller refresh must not erase unfinished (including invalid) text.
         if (self._active_curve_id in self.comparison.curves and self._draft_fields
                 and self.has_pending_project_edits()):
             self.refresh_sources()
-            self.render()
+            self.render(appearance_only=appearance_only)
             return
         current_id = self._active_curve_id
         selected_ids = self._selected_ids()
@@ -552,9 +726,9 @@ class XYPlotPage(QWidget):
             self._syncing = False
         self._load_curve_controls()
         self._draft_fields.clear()
-        self._selection_changed()
+        self._selection_changed(sync_analysis=not appearance_only)
         self.curve_list.verticalScrollBar().setValue(scroll)
-        self.render()
+        self.render(appearance_only=appearance_only)
 
     def refresh_sources(self):
         """Refresh ownership/deletion metadata without touching pending graph drafts."""
@@ -574,13 +748,32 @@ class XYPlotPage(QWidget):
             self.source_label.setText(self._source_text(curve)[1])
         self._selection_changed()
 
-    def render(self):
-        self.axes = draw_comparison(self.figure, self.workspace, self.comparison)
-        self.analysis_panel.draw_overlays(self.axes)
+    def render(self, *, appearance_only=False):
+        if appearance_only and hasattr(self, 'axes'):
+            # Restore preview emphasis before recording the new ordinary styles.
+            for _cid, artist, style in self._preview_styles:
+                artist.set(**style)
+            for line in self.axes.lines:
+                curve = self.comparison.curves.get(line.get_gid())
+                if curve is not None:
+                    line.set(color=curve.color, linewidth=curve.width, label=curve.label,
+                             linestyle='None' if curve.style == 'scatter' else '-',
+                             marker='None' if curve.style == 'line' else 'o', markersize=4)
+                elif line.get_gid() == 'xy-analysis-peaks' and self.analysis_panel.captured is not None:
+                    curve = self.comparison.curves.get(self.analysis_panel.captured.curve_id)
+                    if curve is not None:
+                        line.set_color(curve.color)
+            display = self.axes._comparison_display
+            display.y_label = comparison_y_label(self.comparison)
+            self.axes.set(title=self.comparison.plot_title, xlabel=self.comparison.x_label, ylabel=display.y_label)
+            _update_legend(self.axes, self.workspace, self.comparison)
+        else:
+            self.axes = draw_comparison(self.figure, self.workspace, self.comparison, preview=True)
+            self.analysis_panel.draw_overlays(self.axes)
+            self.toolbar.update()
         self._capture_preview_styles()
         self._apply_selection_highlight()
         self._update_display_status(self._draft_error())
-        self.toolbar.update()
         self.canvas.draw_idle()
 
     def _capture_preview_styles(self):
@@ -597,11 +790,11 @@ class XYPlotPage(QWidget):
                         dict(alpha=line.get_alpha())))
         legend = self.axes.get_legend()
         if legend is not None:
-            labeled = [line for line in lines if not line.get_label().startswith('_')]
-            for line, handle, text in zip(labeled, legend.legend_handles, legend.get_texts()):
-                self._preview_styles.append((line.get_gid(), handle, dict(alpha=handle.get_alpha(),
+            for curve_id, handle, text in zip(legend._comparison_curve_ids,
+                                              legend.legend_handles, legend.get_texts()):
+                self._preview_styles.append((curve_id, handle, dict(alpha=handle.get_alpha(),
                     linewidth=handle.get_linewidth(), markersize=handle.get_markersize(), zorder=handle.get_zorder())))
-                self._preview_styles.append((line.get_gid(), text,
+                self._preview_styles.append((curve_id, text,
                     dict(alpha=text.get_alpha(), fontweight=text.get_fontweight())))
 
     def _apply_selection_highlight(self, *_args):
@@ -696,14 +889,17 @@ class XYPlotPage(QWidget):
             self._update_display_status(error)
             self.changed.emit()
             return
+        before = self._capture_edit()
         changed = self._commit_display()
         self.status.clear()
         self._update_display_status()
         if changed:
+            self._record_edit('Comparison display', before)
             self.render()
             self.changed.emit()
 
     def _reset_display(self):
+        before = self._capture_edit()
         comparison = self.comparison
         comparison.normalization, comparison.stack_step = 'none', 0.0
         comparison.x_range_mode, comparison.x_range = 'all', None
@@ -716,6 +912,8 @@ class XYPlotPage(QWidget):
         finally:
             self._syncing = False
         self.status.setText(self._draft_error())
+        self._draft_fields.difference_update((self.x_min_edit, self.x_max_edit, self.stack_step_edit, self.y_offset_edit))
+        self._record_edit('Reset comparison display', before)
         self.render()
         self.changed.emit()
 
@@ -766,6 +964,7 @@ class XYPlotPage(QWidget):
             self.status.setText(error)
             self._update_display_status(error)
             return
+        before = self._capture_edit()
         comparison = self.comparison
         name = self.name_edit.text().strip()
         renamed = comparison.name != name
@@ -775,13 +974,15 @@ class XYPlotPage(QWidget):
         comparison.plot_title = self.plot_title_edit.text()
         comparison.legend_visible = self.legend_chk.isChecked()
         self._draft_fields.difference_update((self.name_edit, self.plot_title_edit, self.x_label_edit, self.y_label_edit))
-        changed = self._commit_display() or changed
+        display_changed = self._commit_display()
+        changed = display_changed or changed
         self.status.clear()
         self._update_display_status()
         if changed:
-            self.render()
+            self.render(appearance_only=not display_changed)
         if changed or renamed:
-            self.changed.emit()
+            self._record_edit('Graph settings', before)
+            self._emit_changed(appearance_only=not display_changed)
 
     def _curve_edited(self, *_args):
         curve = self._selected()
@@ -793,13 +994,16 @@ class XYPlotPage(QWidget):
             self.status.setText(error)
             self._update_display_status(error)
             return
+        before = self._capture_edit()
         width = self._edited_width(curve)
         offset = self._number(self.y_offset_edit, 'extra Y offset')
+        offset_changed = curve.y_offset != offset
         changed = (curve.label, curve.color, curve.width, curve.y_offset) != (self.label_edit.text(), color, width, offset)
         curve.label, curve.color, curve.width, curve.y_offset = self.label_edit.text(), color, width, offset
         self._update_selection_context()
         self._draft_fields.difference_update((self.label_edit, self.color_edit, self.y_offset_edit, self.width_spin))
-        changed = self._commit_display() or changed
+        display_changed = self._commit_display()
+        changed = display_changed or changed
         self._displayed_width = self.width_spin.value()
         with QSignalBlocker(self.curve_list):
             for row in range(self.curve_list.count()):
@@ -810,8 +1014,9 @@ class XYPlotPage(QWidget):
         self.status.clear()
         self._update_display_status()
         if changed:
-            self.render()
-            self.changed.emit()
+            self._record_edit('Curve settings', before)
+            self.render(appearance_only=not (offset_changed or display_changed))
+            self._emit_changed(appearance_only=not (offset_changed or display_changed))
 
     def _visibility_changed(self, item):
         if not self._syncing:
@@ -821,7 +1026,9 @@ class XYPlotPage(QWidget):
                 with QSignalBlocker(self.curve_list):
                     item.setCheckState(Qt.Checked if curve.visible else Qt.Unchecked)
                 return
+            before = self._capture_edit()
             curve.visible = visible
+            self._record_edit('Curve visibility', before)
             self.render()
             self.changed.emit()
 
@@ -836,7 +1043,7 @@ class XYPlotPage(QWidget):
             return False
         return True
 
-    def _selection_changed(self):
+    def _selection_changed(self, *, sync_analysis=True):
         if self._syncing:
             return
         selected = self._selected_ids()
@@ -853,7 +1060,8 @@ class XYPlotPage(QWidget):
         for action in (self.show_selected_action, self.hide_selected_action, self.only_selected_action):
             action.setEnabled(count > 0)
         self.show_all_action.setEnabled(bool(self.comparison.curves))
-        self.analysis_panel.sync()
+        if sync_analysis:
+            self.analysis_panel.sync()
         self._apply_selection_highlight()
 
     def _update_selection_context(self):
@@ -887,6 +1095,7 @@ class XYPlotPage(QWidget):
             self._apply_batch_style(ids, 'width', width)
 
     def _apply_batch_style(self, ids, field, value):
+        before = self._capture_edit()
         changed = False
         for curve_id in ids:
             curve = self.comparison.curves[curve_id]
@@ -894,13 +1103,15 @@ class XYPlotPage(QWidget):
                 setattr(curve, field, value)
                 changed = True
         if changed:
-            self.refresh()
-            self.changed.emit()
+            self._record_edit('Selected curve ' + field, before)
+            self.refresh(appearance_only=True)
+            self._emit_changed(appearance_only=True)
 
     def _batch_visibility(self, mode):
         ids = self._selected_ids()
         if (not ids and mode != 'all') or not self._finish_curve_action():
             return
+        before = self._capture_edit()
         changed = False
         for curve in self.comparison.curves.values():
             if mode in ('only', 'all') or curve.curve_id in ids:
@@ -908,6 +1119,7 @@ class XYPlotPage(QWidget):
                 changed = changed or curve.visible != visible
                 curve.visible = visible
         if changed:
+            self._record_edit('Curve visibility', before)
             self.refresh()
             self.changed.emit()
 
@@ -925,8 +1137,10 @@ class XYPlotPage(QWidget):
     def _set_curve_order(self, order):
         curves = self.comparison.curves
         if order != list(curves):
+            before = self._capture_edit()
             # The existing project format writes curves.values() in this order.
             self.comparison.curves = {curve_id: curves[curve_id] for curve_id in order}
+            self._record_edit('Curve order', before)
             self.refresh()
             self.changed.emit()
         return True
@@ -1001,8 +1215,15 @@ class XYPlotPage(QWidget):
     def _remove_selected(self):
         curve = self._selected()
         if curve and self._finish_curve_action():
+            before = self._capture_edit()
+            progress = self.analysis_panel.progress
+            retained = ((copy(progress), self.comparison.analysis_state)
+                        if progress is not None and progress.captured.curve_id == curve.curve_id else None)
             remove_curve(self.workspace, self.comparison_id, curve.curve_id)
             self.refresh()
+            if retained is not None:
+                retained = (*retained, self.comparison.analysis_state)
+            self._record_edit('Remove curve', before, retained_analysis=retained)
             self.changed.emit()
 
     def _open_source(self):
@@ -1020,24 +1241,39 @@ class XYPlotPage(QWidget):
         """Check a pending draft without committing it during batch preflight."""
         error = self._draft_error()
         if error:
+            if self._draft_error_field is not None:
+                self._draft_error_field.setFocus(Qt.OtherFocusReason)
+            self.status.setText(error)
+            self._update_display_status(error)
             raise ValueError(error)
 
     def _draft_error(self):
+        self._draft_error_field = None
         name = self.name_edit.text().strip()
         if not name or '\x00' in name:
+            self._draft_error_field = self.name_edit
             return 'Enter a nonempty graph name.'
-        if any('\x00' in edit.text() for edit in (self.plot_title_edit, self.x_label_edit, self.y_label_edit, self.label_edit)):
-            return 'Labels cannot contain null characters.'
+        for edit in (self.plot_title_edit, self.x_label_edit, self.y_label_edit, self.label_edit):
+            if '\x00' in edit.text():
+                self._draft_error_field = edit
+                return f'{edit.accessibleName()} cannot contain null characters.'
         if self._selected() is not None:
             if not re.fullmatch(r'#[0-9a-fA-F]{6}', self.color_edit.text().strip()):
+                self._draft_error_field = self.color_edit
                 return 'Use a six-digit color such as #1f77b4.'
             if not self.width_spin.hasAcceptableInput():
+                self._draft_error_field = self.width_spin
                 return 'Enter a valid positive line width.'
         try:
             self._display_values()
             if self._selected() is not None:
                 self._number(self.y_offset_edit, 'extra Y offset')
         except ValueError as exc:
+            message = str(exc).lower()
+            self._draft_error_field = next((edit for label, edit in (
+                ('x minimum', self.x_min_edit), ('x maximum', self.x_max_edit),
+                ('stack step', self.stack_step_edit), ('extra y offset', self.y_offset_edit))
+                if label in message), None)
             return str(exc)
         return ''
 
@@ -1060,24 +1296,31 @@ class XYPlotPage(QWidget):
 
     def svg_bytes(self):
         self.finish_editor()
-        figure = Figure(figsize=(7, 5), dpi=150)
-        draw_comparison(figure, self.workspace, self.comparison)
-        output = BytesIO()
-        figure.savefig(output, format='svg')
+        # Copy and Export produce identical bytes for an unchanged graph.
+        with rc_context({'svg.hashsalt': 'spectra-xy-page-v1'}):
+            figure = Figure(figsize=(7, 5), dpi=150)
+            draw_comparison(figure, self.workspace, self.comparison)
+            output = BytesIO()
+            figure.savefig(output, format='svg', transparent=True, facecolor='none',
+                           edgecolor='none', metadata={'Date': None})
         return output.getvalue()
 
     def export(self, path, *, overwrite=False):
-        self.finish_editor()
         path = Path(path)
         extension = path.suffix.lower().lstrip('.')
         if extension not in ('svg', 'png'):
             raise ValueError('Comparison exports support SVG or PNG.')
-        figure = Figure(figsize=(7, 5), dpi=150)
-        draw_comparison(figure, self.workspace, self.comparison)
-        output = BytesIO()
-        figure.savefig(output, format=extension, dpi=150)
+        if extension == 'svg':
+            data = self.svg_bytes()
+        else:
+            self.finish_editor()
+            figure = Figure(figsize=(7, 5), dpi=150)
+            draw_comparison(figure, self.workspace, self.comparison)
+            output = BytesIO()
+            figure.savefig(output, format=extension, dpi=150)
+            data = output.getvalue()
         with path.open('wb' if overwrite else 'xb') as handle:
-            handle.write(output.getvalue())
+            handle.write(data)
         return path
 
     def _export_dialog(self, extension):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Callable, Literal
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -242,6 +242,7 @@ def fit_multi_peak(
     initial_gammas: np.ndarray | None = None,
     fixed_centers: bool | np.ndarray = False,
     center_bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> FitResult:
     """Fit signed components plus a constant baseline to every finite X/Y pair.
 
@@ -255,7 +256,14 @@ def fit_multi_peak(
     Fixed centers are excluded from optimizer variables and returned exactly.
     center_bounds is a (lower, upper) pair of scalars or per-component arrays,
     intersected with the data interval and peak_move_limit when specified.
+
+    Optimization uses centered, scaled Y values internally; all public seeds,
+    components and results retain the input Y units. R-squared is NaN for a
+    constant signal, where explained variance is undefined. check_cancelled may
+    raise to stop fitting before, during, or immediately after optimization.
     """
+    if check_cancelled is not None:
+        check_cancelled()
     xv = np.asarray(x, float).ravel()
     yv = np.asarray(y, float).ravel()
     centers = np.asarray(centers_hint, float).ravel().copy()
@@ -275,7 +283,12 @@ def fit_multi_peak(
     xrange = xmax-xmin
     if xrange <= 0:
         raise ValueError('Fitting requires a nonzero X interval.')
-    baseline0 = float(np.median(yv))
+    y_offset = float(np.median(yv))
+    y_scale = float(np.max(np.abs(yv-y_offset)))
+    if y_scale == 0.:
+        y_scale = abs(y_offset) or 1.
+    scaled_y = (yv-y_offset)/y_scale
+    baseline0 = 0.
     for name, value in (('linewidth_min', linewidth_min), ('linewidth_max', linewidth_max),
                         ('peak_move_limit', peak_move_limit)):
         if not np.isfinite(value) or value < 0:
@@ -304,9 +317,11 @@ def fit_multi_peak(
         if kind_values.size != n:
             raise ValueError('kinds must contain one flag per component.')
         signs = np.where(kind_values, 1., -1.)
-    amplitudes = seed_array(initial_amplitudes, 'initial_amplitudes', np.array([
-        signs[i]*max(abs(float(yv[np.argmin(np.abs(xv-c))]-baseline0)), 1e-6)
-        for i, c in enumerate(centers)]))
+    default_amplitudes = np.array([
+        signs[i]*max(abs(float(scaled_y[np.argmin(np.abs(xv-c))])), 1e-6)
+        for i, c in enumerate(centers)])
+    amplitudes = (default_amplitudes if initial_amplitudes is None else
+                  seed_array(initial_amplitudes, 'initial_amplitudes', default_amplitudes)/y_scale)
     if np.any(amplitudes*signs < 0):
         raise ValueError('Initial amplitude signs must agree with the peak/dip kinds.')
     widths = seed_array(initial_widths, 'initial_widths', np.full(n, width0))
@@ -347,10 +362,10 @@ def fit_multi_peak(
     parameter_lower[:, 2:], parameter_upper[:, 2:] = lw_min, lw_max
     free_mask = np.ones_like(parameters, dtype=bool)
     free_mask[:, 1] = ~fixed
-    baseline_margin = max(float(np.max(np.abs(yv-baseline0)))*2., 1e-6)
+    baseline_margin = max(float(np.max(np.abs(scaled_y)))*2., 1e-6)
     p0 = np.r_[baseline0, parameters[free_mask]]
-    lower = np.r_[np.min(yv)-baseline_margin, parameter_lower[free_mask]]
-    upper = np.r_[np.max(yv)+baseline_margin, parameter_upper[free_mask]]
+    lower = np.r_[np.min(scaled_y)-baseline_margin, parameter_lower[free_mask]]
+    upper = np.r_[np.max(scaled_y)+baseline_margin, parameter_upper[free_mask]]
     if xv.size <= p0.size:
         raise ValueError(f'Fitting needs more valid samples than free parameters ({p0.size}).')
 
@@ -360,26 +375,34 @@ def fit_multi_peak(
         return values
 
     def model_fn(xarr: np.ndarray, *p: float) -> np.ndarray:
+        if check_cancelled is not None:
+            check_cancelled()
         return np.full_like(xarr, p[0], dtype=float) + np.sum([
             fn(xarr, *component) for component in unpack(np.asarray(p))], axis=0)
 
     popt, _ = curve_fit(
         model_fn,
         xv,
-        yv,
+        scaled_y,
         p0=p0,
         bounds=(lower, upper),
         maxfev=int(maxfev),
     )
-    y_fit = model_fn(xv, *popt)
+    if check_cancelled is not None:
+        check_cancelled()
+    scaled_fit = model_fn(xv, *popt)
     fitted = unpack(popt)
-    comps = np.asarray([fn(xv, *component) for component in fitted], dtype=float)
-    residual = np.asarray(yv - y_fit, dtype=float)
-    rmse = float(np.sqrt(np.nanmean(residual * residual)))
-    ss_res = float(np.nansum(residual * residual))
-    y_mean = float(np.nanmean(yv))
-    ss_tot = float(np.nansum((yv - y_mean) * (yv - y_mean)))
-    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 1e-30 else 1.0
+    comps = np.asarray([fn(xv, *component) for component in fitted], dtype=float)*y_scale
+    baseline = y_offset + float(popt[0])*y_scale
+    y_fit = baseline + np.sum(comps, axis=0)
+    fitted[:, 0] *= y_scale
+    # Dimensionless residual sums avoid squaring physical values that may
+    # underflow or overflow merely because the caller changed signal units.
+    residual = scaled_y-scaled_fit
+    rmse = float(np.sqrt(np.mean(residual*residual))*y_scale)
+    ss_res = float(np.sum(residual*residual))
+    ss_tot = float(np.sum((scaled_y-np.mean(scaled_y))**2))
+    r_squared = 1.0-ss_res/ss_tot if ss_tot > 0. else float('nan')
     return FitResult(
         model=model,
         x=np.asarray(xv, dtype=float),
@@ -388,7 +411,7 @@ def fit_multi_peak(
         centers=fitted[:, 1].copy(),
         amplitudes=fitted[:, 0].copy(),
         widths=fitted[:, 2].copy(),
-        baseline=float(popt[0]),
+        baseline=baseline,
         rmse=rmse,
         r_squared=float(r_squared),
         sigmas=fitted[:, 2].copy() if model == 'Voigt' else None,

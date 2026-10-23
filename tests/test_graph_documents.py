@@ -10,7 +10,7 @@ from unittest.mock import patch
 from PySide6.QtCore import QEvent, Qt, QPoint, QPointF, QRect
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMdiArea, QMessageBox
+from PySide6.QtWidgets import QApplication, QMdiArea, QMessageBox, QStyle, QWidget
 
 from spectra_app.main_window import MainWindow
 from spectra_app.graph_documents import GraphDocuments
@@ -82,6 +82,68 @@ class GraphDocumentTests(unittest.TestCase):
         self.assertTrue(w.free_graphs_action.isChecked())
         self.assertFalse(w.tabbed_graphs_action.isChecked())
 
+    def test_restored_layout_adapts_once_after_final_free_or_tabbed_layout(self):
+        key, closed = ('owner', 'open'), ('owner', 'closed')
+        records = [{'key': list(key), 'open': True, 'rect': [99999, -500, 560, 390]},
+                   {'key': list(closed), 'open': False, 'rect': [55, 65, 380, 270]}]
+        for mode in ('free', 'tabbed'):
+            with self.subTest(mode=mode):
+                area = GraphDocuments(lambda key: True, lambda key: True)
+                try:
+                    area.cache_page(key, QWidget())
+                    area.resize(800, 600)
+                    if mode == 'free':
+                        area.show()
+                        APP.processEvents()
+                    metadata = {'mode': mode, 'documents': records,
+                                'active': list(key), 'stacking': [list(key)]}
+                    area.restore_workspace(metadata, lambda key: key[1])
+                    area.show()
+                    area.resize(400, 300)
+                    APP.processEvents()
+                    window = area.window_for(key)
+                    if mode == 'tabbed':
+                        self.assertTrue(window.isMaximized())
+                        self.assertEqual(area.workspace_snapshot((key, closed))['documents'], records)
+                        area.free_view()
+                        area.resize(360, 280)
+                        APP.processEvents()
+                    title = QRect(window.geometry())
+                    title.setHeight(window.style().pixelMetric(QStyle.PM_TitleBarHeight, None, window))
+                    reachable = area.viewport().rect().intersected(title)
+                    self.assertGreaterEqual(reachable.width(), 120)
+                    self.assertEqual(reachable.height(), title.height())
+                    self.assertEqual(window.size().toTuple(), (560, 390))
+                    self.assertEqual(area.workspace_snapshot((key, closed))['documents'], records)
+                    self.assertIsNone(area.window_for(closed))
+                    # Once restoration settles, even a deliberately offscreen
+                    # user position remains under the user's control on resize.
+                    manual = QRect(600, 45, 560, 390)
+                    window.setGeometry(manual)
+                    area.resize(320, 260)
+                    APP.processEvents()
+                    self.assertEqual(window.geometry(), manual)
+                    if mode == 'free':
+                        # A candidate layout's queued adaptation must not move
+                        # the runtime geometry reinstated by a failed load.
+                        parked = area.park()
+                        area.restore(parked)
+                        area.restore_workspace(metadata, lambda key: key[1])
+                        area.restore(parked)
+                        APP.processEvents()
+                        self.assertEqual(area.window_for(key).geometry(), manual)
+                        # Resetting before the next event-loop turn also ends
+                        # the pending adaptation before new user positioning.
+                        area.restore_workspace(metadata, lambda key: key[1])
+                        area.reset_layout()
+                        area.window_for(key).setGeometry(manual)
+                        APP.processEvents()
+                        self.assertEqual(area.window_for(key).geometry(), manual)
+                finally:
+                    area.close()
+                    area.deleteLater()
+                    APP.sendPostedEvents(None, QEvent.DeferredDelete)
+
     def test_shared_commands_follow_active_owner_with_stable_host(self):
         w = self.window
         first = self.open()
@@ -105,6 +167,7 @@ class GraphDocumentTests(unittest.TestCase):
         self.assertFalse(first.command_bar.isVisible())
 
     def test_scrolled_workspace_stores_document_coordinates_and_keeps_dragged_layout(self):
+        self.window.open_graph_document()
         area = GraphDocuments(lambda key: True, lambda key: True)
         area.resize(600, 450)
         area.show()
@@ -209,7 +272,9 @@ class GraphDocumentTests(unittest.TestCase):
                 w.open_project(saved)
         w.plot_tabs.setCurrentWidget(w.graph_documents)
         self.assertEqual(w.graph_documents.subWindowList(), [])
-        self.assertFalse(w.graph_command_host.isVisible())
+        self.assertTrue(w.graph_command_host.isVisible())
+        self.assertTrue(w.workspace_command_context.isVisible())
+        self.assertEqual(w.workspace_command_context.text(), 'Open a Workbook or graph from Project.')
 
     def test_graphs_retain_pages_bytes_and_zoom_across_tab_and_tile_switches(self):
         w = self.window

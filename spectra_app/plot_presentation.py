@@ -180,8 +180,8 @@ class ColorbarPresentation(_Record):
     frame_gap_in: float = .025
     show_extensions: bool = False
     label_format: str = 'auto'
-    significant_digits: int = 4
-    decimal_places: int = 0
+    significant_digits: int = 2
+    decimal_places: int = 2
     scientific_style: str = 'e'
     trim_trailing_zeros: bool = True
     ticks: dict[str, ColorbarTicks] = field(default_factory=dict)

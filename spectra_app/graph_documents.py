@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, Signal
-from PySide6.QtWidgets import QLabel, QMdiArea, QMdiSubWindow, QTabBar, QWidget
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtWidgets import QLabel, QMdiArea, QMdiSubWindow, QTabBar, QWidget, QVBoxLayout, QToolButton
 from .workbook_state import document_record_key, encode_document_key
 
 
@@ -51,6 +51,9 @@ class GraphDocuments(QMdiArea):
         self._active_key = None
         self.initial_view = True
         self._restore_pending = False
+        self._restore_timer = QTimer(self)
+        self._restore_timer.setSingleShot(True)
+        self._restore_timer.timeout.connect(self._restore_visible_rectangles)
         self._changing = False
         self._input_filter = _GraphInputFilter(self)
         self.setViewMode(QMdiArea.SubWindowView)
@@ -61,21 +64,51 @@ class GraphDocuments(QMdiArea):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setAccessibleName('Workspace documents')
-        self._empty = QLabel('No document views open. Open a Workbook or graph from the Project tree.', self.viewport())
-        self._empty.setAlignment(Qt.AlignCenter)
-        self._empty.setWordWrap(True)
-        self._empty.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._empty = QWidget(self.viewport())
+        layout = QVBoxLayout(self._empty)
+        layout.addStretch()
+        message = QLabel('Open a Workbook or graph from Project, or start with data files.')
+        message.setAlignment(Qt.AlignCenter)
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        self.empty_import_button = QToolButton()
+        self.empty_open_button = QToolButton()
+        self.empty_recent_button = QToolButton()
+        for button in (self.empty_import_button, self.empty_open_button, self.empty_recent_button):
+            button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            layout.addWidget(button, 0, Qt.AlignHCenter)
+        self.empty_recent_button.setText('Recent projects')
+        self.empty_recent_button.setPopupMode(QToolButton.InstantPopup)
+        guidance = QLabel('Data: DAT, CSV, TSV, TXT and XY tables. Projects: .spectra and .spextra.')
+        guidance.setWordWrap(True)
+        guidance.setAlignment(Qt.AlignCenter)
+        layout.addWidget(guidance)
+        layout.addStretch()
         self.subWindowActivated.connect(self._window_activated)
+
+    def set_start_actions(self, import_action, open_action, recent_menu):
+        self.empty_import_button.setDefaultAction(import_action)
+        self.empty_open_button.setDefaultAction(open_action)
+        self.empty_recent_button.setMenu(recent_menu)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._empty.setGeometry(self.viewport().rect())
+        self._schedule_restore_placement()
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._schedule_restore_placement()
+
+    def _schedule_restore_placement(self):
+        if self._restore_pending and self.isVisible() and self.viewMode() == QMdiArea.SubWindowView:
+            self._restore_timer.start(0)
+
+    def _restore_visible_rectangles(self):
         # A project can load before the main window is shown. Reachability is
-        # a display adaptation, not a user edit to the saved normal rectangle.
-        if self._restore_pending and self.viewMode() == QMdiArea.SubWindowView:
+        # a display adaptation after dock/command layout settles, not a user edit
+        # to the saved normal rectangle or an arrangement on every later resize.
+        if self._restore_pending and self.isVisible() and self.viewMode() == QMdiArea.SubWindowView:
             with self._change():
                 for key, window in self._windows.items():
                     if not window.isMaximized() and not window.isMinimized():
@@ -281,6 +314,8 @@ class GraphDocuments(QMdiArea):
 
     def park(self):
         """Keep cached pages alive while a candidate project is installed."""
+        self._restore_timer.stop()
+        self._restore_pending = False
         state = (self._pages.copy(), [(window.key, window.windowTitle(), self._document_rectangle(window))
                  for window in self.subWindowList(QMdiArea.StackingOrder)], self.viewMode(),
                  self._active_key, {key: QRect(rect) for key, rect in self._normal_rects.items()},
@@ -293,6 +328,8 @@ class GraphDocuments(QMdiArea):
         return state
 
     def restore(self, state):
+        self._restore_timer.stop()
+        self._restore_pending = False
         pages, windows, mode, active_key, rectangles, initial_view = state
         with self._change():
             self._pages.update(pages)
@@ -350,11 +387,10 @@ class GraphDocuments(QMdiArea):
             self.verticalScrollBar().setValue(0)
             for key, window in self._windows.items():
                 self._place_window(window, self._normal_rects[key], clamp=self._restore_pending)
-            if self.isVisible():
-                self._restore_pending = False
             self.setActiveSubWindow(self._windows.get(self._active_key))
         self.layoutChanged.emit()
         self.workspaceChanged.emit()
+        self._schedule_restore_placement()
 
     def tile_graphs(self):
         self.free_view()
@@ -405,8 +441,10 @@ class GraphDocuments(QMdiArea):
             self.setActiveSubWindow(self._windows.get(self._active_key))
             self._empty.setVisible(not self._windows)
         self.layoutChanged.emit()
+        self._schedule_restore_placement()
 
     def reset_layout(self):
+        self._restore_timer.stop()
         self._normal_rects.clear()
         self._active_key = None
         self.initial_view = True

@@ -146,7 +146,8 @@ class DialogUsabilityTests(unittest.TestCase):
         page.preview.snapshot = HeatmapSnapshot([10., 20.], [1., 3.], [[1., 2.], [3., 4.]],
             x_label='Energy (eV)', y_label='Gate (V)')
         page.rendered_page = SimpleNamespace(axes_bounds=(.1, .1, .8, .8),
-            display_x_limits=(10., 20.), display_y_limits=(1., 3.), figure_size_in=(6., 4.))
+            display_x_limits=(10., 20.), display_y_limits=(1., 3.), figure_size_in=(6., 4.),
+            warnings=())
         page.preview.page = page.rendered_page
         page.select_annotation(item.id)
         before = page.preview.annotation_point(item)

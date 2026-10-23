@@ -56,6 +56,8 @@ class AnalysisPlotStyleTests(unittest.TestCase):
         for dimensions in ((2.4, 1.2), (1.2, 2.4)):
             w.set_plot_presentation(replace(w.workspace.active.presentation,
                                            frame_width_in=dimensions[0], frame_height_in=dimensions[1]))
+            # Source graph editing defers the hidden live canvas layout.
+            w._layout_live_plots()
             self.assert_frame_ratio(dimensions[0] / dimensions[1])
 
     def test_valid_presentation_updates_artists_without_changing_science_or_view(self):

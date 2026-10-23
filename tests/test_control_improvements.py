@@ -25,6 +25,7 @@ class ControlImprovementTests(unittest.TestCase):
     def setUp(self):
         self.folder = isolate_settings(self).parent
         self.w = _window(np.ones((121, 101)), gates=np.arange(121) * 1.25)
+        self.w._base_cube = self.w.current_cube
         self.w.peak_indices = np.array([50])
         self.w._peak_gate_idx = 0
         self.w.batch_peak_map = {0: np.array([50]), 1: np.array([50])}
@@ -126,10 +127,12 @@ class ControlImprovementTests(unittest.TestCase):
                 w._on_fit()
                 self.assertEqual(snapshot_key.call_count, 0)
             self.assertEqual(len(w._background_jobs._jobs), 1)
+            self.assertIsNone(w._background_jobs._pending)
             w._set_current_gate_from_index(1, update_plot=True)
             self.assertTrue(w.fit_btn.isEnabled())
             w._on_fit()
-            self.assertEqual(len(w._background_jobs._jobs), 2)
+            self.assertEqual(len(w._background_jobs._jobs), 1)
+            self.assertIsNotNone(w._background_jobs._pending)
             self.release.set()
             wait_jobs(w)
         self.assertIn(1, w.batch_fit_result_map)
@@ -208,26 +211,32 @@ class ControlImprovementTests(unittest.TestCase):
         self.assertFalse(w.processing_smooth_chk.isEnabled())
         self.assertFalse(w.processing_window_spin.isEnabled())
         w.current_cube = replace(w.current_cube, photon_energy=w.current_cube.energy.copy())
+        w._base_cube = w.current_cube
         w.processing_mode_combo.setCurrentIndex(1)
-        self.assertIn('Generate', w.processing_status_label.text())
+        self.assertIn('choose Apply processing', w.processing_status_label.text())
         self.assertTrue(w.processing_window_spin.isEnabled())
         w.processing_window_spin.setValue(201)
         self.assertIn('101', w.processing_status_label.text())
         w._on_generate_heatmap()
-        self.assertIn('Generating', w.processing_status_label.text())
+        self.assertIn('Applying processing', w.processing_status_label.text())
         wait_jobs(w)
         self.assertIn('Applied: D²', w.processing_status_label.text())
-        self.assertNotIn('needs Generate', w.processing_status_label.text())
+        self.assertNotIn('Pending:', w.processing_status_label.text())
         w.processing_window_spin.setValue(21)
-        self.assertIn('needs Generate', w.processing_status_label.text())
+        self.assertIn('choose Apply processing', w.processing_status_label.text())
         w.processing_smooth_chk.setChecked(False)
         self.assertFalse(w.processing_window_spin.isEnabled())
         w.processing_mode_combo.setCurrentIndex(0)
+        self.assertIn('Pending: Original', w.processing_status_label.text())
+        w.generate_heatmap_btn.click()
+        wait_jobs(w)
         self.assertIn('Applied: Original', w.processing_status_label.text())
+        self.assertIs(w.current_cube, w._base_cube)
 
     def test_typed_even_sg_is_rejected_without_changing_trace_or_peaks(self):
         w = self.w
         w.current_cube = replace(w.current_cube, photon_energy=w.current_cube.energy.copy())
+        w._base_cube = w.current_cube
         before = w.current_cube
         w.processing_mode_combo.setCurrentIndex(1)
         self.type_number(w.processing_window_spin, '20')
@@ -360,6 +369,7 @@ class ControlImprovementTests(unittest.TestCase):
 
     def test_batch_export_rejects_empty_and_unusable_common_folder_in_dialog(self):
         session = DatasetSession(dataset_id='a', source_path=self.folder / 'data.dat')
+        session.active_graph.published = True
         dialog = BatchExportDialog([session], 'a')
         self.addCleanup(dialog.close)
         button = dialog.buttons.button(QDialogButtonBox.Ok)

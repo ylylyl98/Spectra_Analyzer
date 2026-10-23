@@ -1,5 +1,6 @@
 """Reusable candidate pools retain scientific coordinates and filter reversibly."""
 import importlib
+import importlib.util
 import json
 import unittest
 from dataclasses import replace

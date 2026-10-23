@@ -385,7 +385,7 @@ class SharedFrameQtTests(unittest.TestCase):
         w._load_dat_file_direct(self.folder / 'scan.dat')
         self.assertFalse(w.isVisible())
         np.testing.assert_allclose(self.logical_frame(), np.array([2.9, 2.8])*96, atol=1)
-        w.resize(1500, 960); w.show(); QTest.qWait(350)
+        w.resize(1500, 960); w.show(); w.plot_tabs.setCurrentIndex(0); QTest.qWait(350)
         self.assertEqual(w.plot_tabs.currentIndex(), 0)
         self.assertEqual(w.plot_page.display_scale, 1.)
         initial = self.logical_frame()
@@ -500,6 +500,7 @@ class SharedFrameQtTests(unittest.TestCase):
 
     def test_sidecar_counts_restore_and_legacy_auto_never_uses_other_owner(self):
         w = self.window
+        w.open_graph_document()
         w.plot_page.set_zoom('100%')
         a = w.workspace.active
         p = replace(a.presentation, axis=AxisPresentation(x_major_count=7, y_major_count=5,
@@ -511,10 +512,12 @@ class SharedFrameQtTests(unittest.TestCase):
         w.set_plot_presentation(replace(p, frame_width_in=None, frame_height_in=None))
         w._render_plot_page(); old = w.plot_page.rendered_page
         self.assertIsNotNone(old)
+        w.plot_tabs.setCurrentIndex(0)
         np.testing.assert_allclose(self.logical_frame(), np.array(old.plot_size_in)*96, atol=1)
         bpath = self.folder / 'other.dat'
         bpath.write_text('Energy(eV) 0 1\n1 1 2\n2 3 4', encoding='utf-8')
         w._load_dat_file_direct(bpath)
+        w.plot_page.set_zoom('100%')
         w.set_plot_presentation(replace(w.workspace.active.presentation,
                                         frame_width_in=None, frame_height_in=None))
         w.plot_page.rendered_page = old

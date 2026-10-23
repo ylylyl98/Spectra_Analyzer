@@ -167,14 +167,20 @@ class SelectionHighlightTests(unittest.TestCase):
             *self.page.axes.transData.transform((.5, 1.5)), button=1))
         self.assertEqual(self.selected_ids(), set())
 
-    def test_escape_preserves_editor_drafts_and_rejects_invalid_list_drafts(self):
+    def test_editor_escape_reverts_draft_and_list_escape_keeps_validation_guard(self):
         self.click_row(2)
         self.page.color_edit.setText('invalid')
-        QTest.keyClick(self.page.color_edit, Qt.Key_Escape)
         QTest.keyClick(self.page.curve_list, Qt.Key_Escape)
         self.assertEqual(self.selected_ids(), {self.curves[2].curve_id})
         self.assertEqual(self.page.color_edit.text(), 'invalid')
         self.assert_highlight([2])
+        QTest.keyClick(self.page.color_edit, Qt.Key_Escape)
+        self.assertEqual(self.page.color_edit.text(), self.curves[2].color)
+        self.assertEqual(self.selected_ids(), {self.curves[2].curve_id})
+        self.assert_highlight([2])
+        QTest.keyClick(self.page.curve_list, Qt.Key_Escape)
+        self.assertEqual(self.selected_ids(), set())
+        self.assert_highlight([])
 
 
 class AnalysisSelectionIsolationTests(unittest.TestCase):

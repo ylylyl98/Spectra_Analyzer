@@ -32,6 +32,7 @@ class HeatmapPageGrowthTests(unittest.TestCase):
         path.write_text(f'# Signal: PL\nEnergy(eV) {-extent} 0 {extent}\n' + '\n'.join(
             f'{1+i/10} {i+1} {2*i+2} {3*i+3}' for i in range(13)), encoding='utf-8')
         self.w._load_dat_file_direct(path)
+        self.w.open_graph_document()
         return path, self.w.workspace.active
 
     def render(self, key=None):
@@ -41,7 +42,7 @@ class HeatmapPageGrowthTests(unittest.TestCase):
         return target.rendered_page
 
     def test_fresh_dat_wide_and_scientific_gate_labels_expand_only_paper(self):
-        for extent in (1000, 100000):
+        for extent in (10000, 100000):
             with self.subTest(extent=extent):
                 path, session = self.load(str(extent), extent)
                 original = session.presentation
@@ -92,7 +93,7 @@ class HeatmapPageGrowthTests(unittest.TestCase):
         self.assertEqual(self.render().figure_size_in, page.figure_size_in)
 
     def test_inactive_tiled_graph_growth_does_not_change_active_owner(self):
-        _, first = self.load('inactive', 1000)
+        _, first = self.load('inactive', 10000)
         key = (first.dataset_id, first.active_graph_id)
         target = self.w.plot_page
         _, active = self.load('active', 1)
@@ -183,22 +184,27 @@ class HeatmapPageGrowthTests(unittest.TestCase):
         self.assertEqual(session.presentation, original)
         self.assertIsNone(self.w.plot_page.rendered_page)
 
-    def test_regional_gradient_does_not_cover_scientific_gate_offset(self):
+    def test_scientific_gate_overlap_warns_without_moving_fixed_regional_bars(self):
         self.load('regional-offset', 100000)
         self.w.color_scale_combo.setCurrentIndex(self.w.color_scale_combo.findData('3'))
+        p = self.w.workspace.active.presentation
+        self.w.set_plot_presentation(replace(p, colorbar=replace(p.colorbar, alignment='left', frame_gap_in=0.)))
         audit = svg_export._audit_layout
         checked = []
-        def audit_gradient_clearance(figure):
-            audit(figure)
+        def audit_fixed_gradient(figure):
+            warnings = audit(figure)
             offset = figure.axes[0].yaxis.get_offset_text()
             self.assertTrue(offset.get_text())
             bounds = offset.get_window_extent(figure.canvas.get_renderer())
-            self.assertFalse(any(bounds.overlaps(axis.get_window_extent()) for axis in figure.axes[1:]),
-                             'A regional gradient covers the scientific Gate multiplier.')
+            self.assertTrue(any(bounds.overlaps(axis.get_window_extent()) for axis in figure.axes[1:]))
+            self.assertTrue(warnings)
             checked.append(True)
-        with patch.object(svg_export, '_audit_layout', side_effect=audit_gradient_clearance):
+            return warnings
+        with patch.object(svg_export, '_audit_layout', side_effect=audit_fixed_gradient):
             page = self.render()
         self.assertTrue(checked)
+        self.assertTrue(page.warnings)
+        np.testing.assert_allclose([bar[1] for bar in page.colorbar_bounds.values()], page.axes_bounds[1]+page.axes_bounds[3])
         np.testing.assert_allclose(page.plot_size_in, (2.9, 2.8), atol=1e-12)
 
 
@@ -214,7 +220,7 @@ class PreparedHeatmapTests(unittest.TestCase):
 
     def test_unlocked_paper_grows_only_required_dimension_and_strict_renderer_stays_strict(self):
         snapshot = self.snapshot()
-        original = PlotPresentation(aspect_locked=False)
+        original = PlotPresentation(width_in=3.2, aspect_locked=False)
         with self.assertRaisesRegex(ValueError, 'frame does not fit'):
             svg_export.render_hybrid_svg(snapshot, original)
         resolved, page = self.prepare(snapshot, original)
@@ -237,7 +243,7 @@ class PreparedHeatmapTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '40'):
             self.prepare(self.snapshot(), PlotPresentation(frame_width_in=40.))
 
-    def test_regional_headers_reflow_without_frame_or_font_changes(self):
+    def test_regional_headers_keep_one_fixed_strip_when_paper_grows(self):
         snapshot = HeatmapSnapshot(x=np.linspace(1., 2.2, 12), y=[-1., 0., 1.],
             z=np.arange(36).reshape(3, 12), x_limits=(1., 2.2), y_limits=(-1., 1.),
             x_label='Photon Energy (eV)', y_label='Gate', signal_label='d²(ΔR/R)/dE² (arb. units)',
@@ -253,6 +259,12 @@ class PreparedHeatmapTests(unittest.TestCase):
             self.assertEqual(replace(resolved, width_in=original.width_in,
                                      height_in=original.height_in), original)
             self.assertEqual(len(page.colorbar_bounds), 3)
+            bars = np.array(list(page.colorbar_bounds.values())) * (*page.figure_size_in, *page.figure_size_in)
+            frame = np.array(page.axes_bounds) * (*page.figure_size_in, *page.figure_size_in)
+            np.testing.assert_allclose(bars[:, 1], frame[1]+frame[3]+original.colorbar.frame_gap_in)
+            np.testing.assert_allclose(bars[:, 2], original.colorbar.width_in)
+            np.testing.assert_allclose(bars[:, 3], original.colorbar.height_in)
+            np.testing.assert_allclose(np.diff(bars[:, 0]), original.colorbar.width_in+original.colorbar.gap_in)
             self.assertEqual(svg_export.render_hybrid_svg(snapshot, resolved).svg_bytes, page.svg_bytes)
 
 

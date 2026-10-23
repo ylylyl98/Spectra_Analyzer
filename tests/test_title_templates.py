@@ -9,6 +9,7 @@ from PIL import Image
 from PySide6.QtWidgets import QApplication
 from spectra_app.main_window import MainWindow
 from spectra_app.image_export import _build_heatmap_export_figure
+from spectra_app.plot_state import active_plot_recipe
 from tests.settings_helpers import isolate_settings
 
 _APP = QApplication.instance() or QApplication([])
@@ -55,6 +56,7 @@ class TitleWorkflowTests(unittest.TestCase):
     def tearDown(self):
         for window in self.windows:
             window.close()
+            _APP.processEvents()
     def window(self):
         window = MainWindow()
         self.windows.append(window)
@@ -105,6 +107,7 @@ class TitleWorkflowTests(unittest.TestCase):
         w._load_dat_file_direct(p)
         self.assertEqual(w._heat_ax.get_title(), 'OtherK: 8T / E=18V')
         w.close()
+        _APP.processEvents()
         restored = self.window()
         self.assertEqual(restored.title_preset_combo.currentText(), 'My group')
         restored._load_dat_file_direct(self.dat(NAME.replace('85deg', '175deg')))
@@ -129,8 +132,10 @@ class TitleWorkflowTests(unittest.TestCase):
         w.y_axis_name_edit.setText('Legacy bias')
         w.cmap_combo.setCurrentText('viridis')
         w.close()
+        _APP.processEvents()
         sidecar = w._plot_state_store.path_for(p)
         payload = json.loads(sidecar.read_text(encoding='utf-8'))
+        payload['plot'] = active_plot_recipe(payload['plot'])
         payload['version'] = 1
         payload['plot'].pop('title_settings', None)
         # v1 predates both title templates and saved processing recipes.
@@ -144,6 +149,7 @@ class TitleWorkflowTests(unittest.TestCase):
         loaded, notice = w._plot_state_store.load(p, source_fingerprint(p))
         self.assertEqual(notice, '')
         migrated_fields = ('title_settings', 'processing', 'norm', 'presentation', 'color_region_limits')
+        loaded = active_plot_recipe(loaded)
         self.assertEqual({k:v for k,v in loaded.items() if k not in migrated_fields}, original)
         self.assertEqual(loaded['title_settings']['manual_override'], '')
         self.assertEqual(loaded['processing'], {
@@ -159,28 +165,27 @@ class TitleWorkflowTests(unittest.TestCase):
         self.assertEqual(restored._heat_ax.get_title(), '')
         self.assertEqual(restored.cmap_combo.currentText(), 'viridis')
         self.assertEqual(restored.title_preset_combo.currentText(), 'Manual')
-    def test_export_keeps_generated_literal_title_and_saves_v3(self):
+    def test_export_keeps_generated_literal_title_and_saves_current_collection(self):
         w = self.window()
         self.select_builtin(w)
         p = self.dat()
         w._load_dat_file_direct(p)
         fig = _build_heatmap_export_figure(w.figure, selected_axes=(w._heat_ax, w._heat_colorbar.ax))
         self.assertIn('E=18V 8T K', [t.get_text() for t in fig.texts])
+        w.open_graph_document()
         w._render_plot_page()
         page = w.plot_page.rendered_page
         self.assertIsNotNone(page, w.plot_page.status_label.text())
         self.assertIn('E=18V 8T K', ''.join(ET.fromstring(page.svg_bytes).itertext()))
-        with patch.object(w, '_show_error', side_effect=AssertionError('PNG export must succeed')):
-            w._on_export_png()
-        output = p.with_name(p.stem + '_export01.png')
+        output = w.export_plot_page('png')
         self.assertTrue(output.is_file())
         with Image.open(output) as image:
             metadata = json.loads(image.info['SpectraAnalyzer'])
         self.assertEqual(metadata['plot_title'], 'E=18V 8T K')
         self.assertEqual(metadata['source_path'], str(p))
         payload = json.loads(w._plot_state_store.path_for(p).read_text(encoding='utf-8'))
-        self.assertEqual(payload['version'], 3)
-        self.assertEqual(payload['plot']['annotations']['plot_title'], 'E=18V 8T K')
+        self.assertEqual(payload['version'], 6)
+        self.assertEqual(active_plot_recipe(payload['plot'])['annotations']['plot_title'], 'E=18V 8T K')
 
     def test_template_override_never_pins_future_title_or_global_manual_default(self):
         w = self.window()
@@ -198,6 +203,7 @@ class TitleWorkflowTests(unittest.TestCase):
         w._load_dat_file_direct(first)
         self.assertEqual(w._heat_ax.get_title(), 'Only this DAT')
         w.close()
+        _APP.processEvents()
         restarted = self.window()
         restarted._load_dat_file_direct(first)
         self.assertEqual(restarted._heat_ax.get_title(), 'Only this DAT')
@@ -211,6 +217,7 @@ class TitleWorkflowTests(unittest.TestCase):
         w._load_dat_file_direct(p)
         w.plot_title_edit.clear()
         w.close()
+        _APP.processEvents()
         w._annotation_settings.clear()
         restarted = self.window()
         restarted._load_dat_file_direct(p)
@@ -224,6 +231,7 @@ class TitleWorkflowTests(unittest.TestCase):
         p = self.dat()
         w._load_dat_file_direct(p)
         w.close()
+        _APP.processEvents()
         sidecar = w._plot_state_store.path_for(p)
         original = json.loads(sidecar.read_text(encoding='utf-8'))
         from spectra_app.plot_state import source_fingerprint
@@ -234,7 +242,7 @@ class TitleWorkflowTests(unittest.TestCase):
                 lambda title: title['preset'].update(angle_map={'85': 123}),
                 lambda title: title.update(extra=True)):
             payload = json.loads(json.dumps(original))
-            mutation(payload['plot']['title_settings'])
+            mutation(active_plot_recipe(payload['plot'])['title_settings'])
             sidecar.write_text(json.dumps(payload), encoding='utf-8')
             loaded, notice = w._plot_state_store.load(p, source_fingerprint(p))
             self.assertIsNone(loaded)

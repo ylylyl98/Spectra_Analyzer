@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGroupBox, QLabel
 
@@ -25,6 +25,7 @@ class FitWidthLabelTests(unittest.TestCase):
         self.w = _window(np.vstack([y, y]))
         self.errors = []
         self.w._show_error = self.errors.append
+        self.w.plot_tabs.setCurrentIndex(0)
         self.w._sidebar_tabs.setCurrentWidget(self.w._analysis_sidebar_scroll)
         self.w._analysis_tabs.setCurrentIndex(1)
         self.w.show()
@@ -70,7 +71,7 @@ class FitWidthLabelTests(unittest.TestCase):
     def test_inline_fit_conversions_do_not_overlap_editors_at_default_sidebar_width(self):
         w = self.w
         w.resize(1320, 850)
-        w._main_splitter.setSizes([390, w._main_splitter.width() - 390])
+        w.resizeDocks([w.dat_details_dock], [390], Qt.Horizontal)
         QTest.qWait(30)
         self.assertGreaterEqual(w._sidebar_tabs.width(), 350)
         self.assertLessEqual(w._sidebar_tabs.width(), 400)

@@ -81,6 +81,8 @@ class FitGraphCreationTests(TestCase):
         for curve in curves:
             color = np.array([int(curve.color[i:i+2], 16) for i in (1, 3, 5)])
             self.assertGreater(np.count_nonzero(np.all(np.abs(pixels.astype(int)-color) < 3, axis=2)), 2)
+        # Release the offscreen platform's QMimeData before QApplication teardown.
+        self.addCleanup(APP.clipboard().clear)
         self.w.copy_graph_svg()
         clipboard = bytes(APP.clipboard().mimeData().data('image/svg+xml'))
         for curve in curves: self.assertIn(curve.curve_id.encode(), clipboard)

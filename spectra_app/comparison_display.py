@@ -7,6 +7,19 @@ import numpy as np
 from .workbook_state import Curve, resolve_curve, validate_comparison_display
 
 
+_NORMALIZATION_LABELS = {'none': 'Original Y', 'maxabs': 'Y / max |Y|', 'minmax': 'Min–max Y (0–1)'}
+
+
+def comparison_y_label(comparison):
+    annotations = []
+    if comparison.normalization != 'none':
+        annotations.append(_NORMALIZATION_LABELS[comparison.normalization])
+    if comparison.stack_step or any(curve.y_offset for curve in comparison.curves.values()):
+        annotations.append('display offsets')
+    return (f'{comparison.y_label}\n({"; ".join(annotations)})'.lstrip()
+            if annotations else comparison.y_label)
+
+
 @dataclass
 class DisplayCurve:
     curve: Curve
@@ -98,7 +111,7 @@ def prepare_comparison(workspace, comparison):
         shown_y[valid] = np.where(finite, values, np.nan)
         displayed.append(DisplayCurve(curve, shown_x, shown_y))
 
-    normalization = {'none': 'Original Y', 'maxabs': 'Y / max |Y|', 'minmax': 'Min–max Y (0–1)'}[comparison.normalization]
+    normalization = _NORMALIZATION_LABELS[comparison.normalization]
     range_text = {'all': 'All X', 'common': 'Common overlap of visible curves',
                   'manual': 'Manual X'}[mode]
     if limits is not None:
@@ -110,13 +123,6 @@ def prepare_comparison(workspace, comparison):
     if not displayed and not notices:
         notices.append('No visible curves with usable samples.')
     description = f'Data X interval: {range_text} · {normalization}'
-    annotations = []
-    if comparison.normalization != 'none':
-        annotations.append(normalization)
     if comparison.stack_step or any(curve.y_offset for curve in comparison.curves.values()):
-        annotations.append('display offsets')
         description += f' · Stack step {comparison.stack_step:g}'
-    y_label = comparison.y_label
-    if annotations:
-        y_label = f'{y_label}\n({"; ".join(annotations)})'.lstrip()
-    return ComparisonDisplay(displayed, limits, notices, description, y_label)
+    return ComparisonDisplay(displayed, limits, notices, description, comparison_y_label(comparison))

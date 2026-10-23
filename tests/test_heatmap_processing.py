@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from spectra_app.dat_io import DataCube
 from spectra_app.main_window import MainWindow
+from spectra_app.plot_state import active_plot_recipe
 from spectra_app.processing import energy_second_derivative
 from spectra_app.signal_titles import RAW_LABEL
 from tests.background_helpers import wait_jobs
@@ -165,8 +166,9 @@ class HeatmapProcessingTests(unittest.TestCase):
             expected = energy_second_derivative(window._base_cube.photon_energy, window._base_cube.z,
                                                 smooth=False, window_length=11)
             window.close()
+            _APP.processEvents()
             payload = json.loads(window._plot_state_store.path_for(path).read_text(encoding="utf-8"))
-            self.assertEqual(payload["plot"]["processing"], {
+            self.assertEqual(active_plot_recipe(payload["plot"])["processing"], {
                 "mode": "energy_second_derivative", "smooth": False, "window_length": 11,
                 "original_signal_title": RAW_LABEL,
             })
@@ -179,6 +181,8 @@ class HeatmapProcessingTests(unittest.TestCase):
             self.assertFalse(restored.processing_smooth_chk.isChecked())
             self.assertEqual(restored.processing_window_spin.value(), 11)
 
+            payload["plot"] = active_plot_recipe(payload["plot"])
+            payload["version"] = 3
             payload["plot"].pop("processing")
             window._plot_state_store.path_for(path).write_text(json.dumps(payload), encoding="utf-8")
             legacy = MainWindow()
@@ -203,9 +207,10 @@ class HeatmapProcessingTests(unittest.TestCase):
                 window.processing_mode_combo.findData("energy_second_derivative"))
             window._on_generate_heatmap()
             wait_jobs(window)
+            window.open_graph_document()
             window._render_plot_page()
-            window._on_export_png()
-            with Image.open(path.with_name("quadratic_export01.png")) as image:
+            exported = window.export_plot_page('png')
+            with Image.open(exported) as image:
                 metadata = json.loads(image.info["SpectraAnalyzer"])
             self.assertEqual(metadata["processing"], "energy_second_derivative")
             self.assertTrue(metadata["processing_smooth"])
@@ -260,6 +265,7 @@ class HeatmapProcessingTests(unittest.TestCase):
             window._on_generate_heatmap()
             wait_jobs(window)
             window.close()
+            _APP.processEvents()
             restored = MainWindow()
             self.windows.append(restored)
             restored._load_dat_file_direct(path)

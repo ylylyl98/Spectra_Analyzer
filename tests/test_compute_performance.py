@@ -136,7 +136,7 @@ class ComputePerformanceTests(unittest.TestCase):
         self.assertIs(w.fit_result, old)
         self.assertEqual(self.errors, ['numeric failure'])
 
-    def test_dataset_switch_and_return_rejects_pending_processing_result_and_error(self):
+    def test_dataset_switch_is_guarded_and_cancel_rejects_processing_result_and_error(self):
         w = self.w
         folder = isolate_settings(self).parent
         ids = []
@@ -163,10 +163,14 @@ class ComputePerformanceTests(unittest.TestCase):
                 with patch.object(main_window, 'energy_second_derivative', side_effect=compute):
                     self.request()
                     self.assertTrue(started.wait(1))
-                    w.activate_dataset(ids[1])
-                    w.activate_dataset(ids[0])
+                    with self.assertRaisesRegex(ValueError, 'current operation'):
+                        w.activate_dataset(ids[1])
+                    self.assertEqual(w.workspace.active_dataset_id, ids[0])
+                    w._cancel_background_job()
                     self.release.set()
                     wait_jobs(w)
+                    w.activate_dataset(ids[1])
+                    w.activate_dataset(ids[0])
                 self.assertIs(w.current_cube, original)
                 self.assertIs(w.fit_result, old)
         self.assertEqual(self.errors, [])

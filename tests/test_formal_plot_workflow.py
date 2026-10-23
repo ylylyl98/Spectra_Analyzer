@@ -65,6 +65,7 @@ class FormalPlotWorkflowTests(unittest.TestCase):
         p.set_zoom('200%')
         self.assertEqual(p.dimensions_label.text(), summary)
         self.assertEqual(p.preview.svg_bytes, page.svg_bytes)
+        w.open_graph_document()
         png = w.export_plot_page('png')
         with Image.open(png) as image:
             self.assertEqual(image.size, tuple(round(value * 301) for value in page.figure_size_in))
@@ -156,13 +157,13 @@ class FormalPlotWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(page, self.window.plot_page.status_label.text())
         return page
 
-    def test_v4_roundtrip_and_legacy_defaults_preserve_old_view(self):
+    def test_current_roundtrip_and_legacy_defaults_preserve_old_view(self):
         w = self.window
         self.assertTrue(hasattr(w.workspace.active, 'presentation'), 'DatasetSession needs formal presentation state')
         w.set_plot_presentation(replace(w.workspace.active.presentation, width_in=4.2, aspect_locked=False))
         w._save_current_plot_state()
         payload = json.loads(w._plot_state_store.path_for(self.paths[0]).read_text(encoding='utf-8'))
-        self.assertEqual(payload['version'], 4)
+        self.assertEqual(payload['version'], 6)
         self.assertEqual(active_plot_recipe(payload['plot'])['presentation']['width_in'], 4.2)
         for version in (1, 2):
             old = dict(active_plot_recipe(payload['plot']))
@@ -175,8 +176,10 @@ class FormalPlotWorkflowTests(unittest.TestCase):
             self.assertEqual(migrated['presentation']['width_in'], 3.3)
         loaded, notice = w._plot_state_store.load(self.paths[0], w._loaded_source_fingerprint)
         self.assertEqual(notice, '')
-        self.assertEqual(loaded['presentation']['width_in'], 4.2)
+        self.assertEqual(active_plot_recipe(loaded)['presentation']['width_in'], 4.2)
         self.assertFalse({'svg_bytes', 'activation_epoch', 'z', 'science_revision'} & set(payload['plot']))
+        for graph in payload['plot']['graphs']:
+            self.assertFalse({'svg_bytes', 'activation_epoch', 'z', 'science_revision'} & set(graph['plot']))
 
     def test_v3_rejects_malformed_norm_and_presentation_before_restore(self):
         recipe = self.window._current_plot_state()
@@ -264,6 +267,7 @@ class FormalPlotWorkflowTests(unittest.TestCase):
             w.plot_page.set_zoom('200%')
             self.assertIs(w.plot_page.rendered_page, page)
             self.assertEqual(w.plot_page.rendered_page.svg_bytes, page.svg_bytes)
+        w.open_graph_document()
         svg = w.export_plot_page('svg')
         self.assertEqual(svg.read_bytes(), page.svg_bytes)
         png = w.export_plot_page('png')

@@ -29,6 +29,7 @@ class PlotStateRecallTests(unittest.TestCase):
     def tearDown(self):
         for window in self.windows:
             window.close()
+            _APP.processEvents()
 
     def make_dat(self, name):
         path = self.directory / name
@@ -95,6 +96,7 @@ class PlotStateRecallTests(unittest.TestCase):
         window._load_dat_file_direct(self.a)
         self.assert_recalled(window)
         window.close()
+        _APP.processEvents()
         restored = self.window()
         restored._load_dat_file_direct(self.a)
         self.assert_recalled(restored)
@@ -108,6 +110,7 @@ class PlotStateRecallTests(unittest.TestCase):
         wait_for_background_jobs(window)
         self.configure(window)
         window.close()
+        _APP.processEvents()
         restored = self.window()
         with patch("spectra_app.image_export.PLOT_FONT_SIZE", 14):
             restored._load_dat_file_direct(self.a)
@@ -179,6 +182,7 @@ class PlotStateRecallTests(unittest.TestCase):
         window._load_dat_file_direct(self.a)
         self.configure(window)
         window.close()
+        _APP.processEvents()
         sidecar = self.a.with_name(self.a.name + ".plot.json")
         self.assertTrue(sidecar.is_file())
         destination = self.directory / "copied" / self.a.name
@@ -252,6 +256,7 @@ class PlotStateRecallTests(unittest.TestCase):
         window._load_dat_file_direct(self.a)
         self.configure(window)
         window.close()
+        _APP.processEvents()
         path = window._plot_state_store.path_for(self.a)
         original = json.loads(path.read_text(encoding="utf-8"))
         for mutation in (lambda data: data.update(version=99),
@@ -268,6 +273,7 @@ class PlotStateRecallTests(unittest.TestCase):
                 self.assertFalse(restored.xmin_lock.isChecked())
                 self.assertIn("ignored", restored.statusBar().currentMessage())
                 restored.close()
+                _APP.processEvents()
 
     def test_regional_color_scale_round_trips_and_old_sidecar_defaults_to_global(self):
         window = self.window()
@@ -275,6 +281,7 @@ class PlotStateRecallTests(unittest.TestCase):
         self.configure_regional(window)
         saved_boundaries = [spin.value() for spin in window.region_boundary_spins[:2]]
         window.close()
+        _APP.processEvents()
         restored = self.window()
         restored._load_dat_file_direct(self.a)
         self.assertEqual(restored.color_scale_combo.currentData(), "3")

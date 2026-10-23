@@ -1,0 +1,27 @@
+Spectra Analyzer bundles unmodified third-party Python and Qt runtime libraries.
+The upstream copyright notices and license texts are included with each
+distribution's .dist-info metadata inside the _internal-VERSION directory.
+CPython's license is included at licenses/python/LICENSE.txt.
+
+Qt for Python (PySide6 and Shiboken6) and the Qt libraries are dynamically loaded
+from the _internal-VERSION directory. LGPL-3.0.txt and GPL-3.0.txt are included
+under licenses. The libraries can be replaced with compatible builds; the
+portable distribution uses the same unpacked runtime layout as the installer.
+
+Upstream projects and source repositories:
+  CPython: https://www.python.org/ and https://github.com/python/cpython
+  Qt: https://www.qt.io/ and https://code.qt.io/cgit/qt/
+  Qt for Python: https://doc.qt.io/qtforpython-6/
+    https://code.qt.io/cgit/pyside/pyside-setup.git/
+  NumPy: https://numpy.org/ and https://github.com/numpy/numpy
+  SciPy: https://scipy.org/ and https://github.com/scipy/scipy
+  Matplotlib: https://matplotlib.org/ and https://github.com/matplotlib/matplotlib
+  Pillow: https://python-pillow.org/ and https://github.com/python-pillow/Pillow
+
+Exact runtime versions appear in the bundled distribution metadata and the
+build-manifest.json retained with the release build evidence. Further dependency
+notices, including BLAS/LAPACK and font licenses, accompany their upstream files.
+
+Spectra Analyzer source and release downloads:
+  https://github.com/ylylyl98/Spectra_Analyzer
+  https://github.com/ylylyl98/Spectra_Analyzer/releases

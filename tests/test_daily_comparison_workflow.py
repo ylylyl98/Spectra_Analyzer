@@ -159,9 +159,7 @@ class DailyComparisonTests(unittest.TestCase):
         self.w._refresh_data_navigator()
         tree = self.w.data_navigator
         def item(key):
-            items = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
-            items += [parent.child(i) for parent in list(items) for i in range(parent.childCount())]
-            return next(i for i in items if i.data(0, Qt.UserRole) == key)
+            return next(i for i in self.w._navigator_items() if i.data(0, Qt.UserRole) == key)
         tree.setCurrentItem(item(('workbook', book.workbook_id)))
         originals = [s for s in book.sheet_ids if self.w.workspace.sheets[s].role == 'original']
         self.assertEqual(self.w._selected_sheet_ids(), originals)

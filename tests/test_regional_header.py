@@ -1,5 +1,6 @@
 import unittest
 import os
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -54,6 +55,9 @@ class RegionalHeaderTests(unittest.TestCase):
         try:
             window = fixture.make_window(title="p3 8T 0.5TG-BG=0")
             window.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
+            presentation = (window.workspace.active or window._unregistered_session).presentation
+            window.set_plot_presentation(replace(presentation, colorbar=replace(
+                presentation.colorbar, width_in=1.2, gap_in=.5)))
             for count in (2, 3):
                 window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData(str(count)))
                 for mesh, limits in zip(window._heat_meshes, ((-89000, 60000), (-2500, 2400), (-0.006, 0.008))):
@@ -64,11 +68,15 @@ class RegionalHeaderTests(unittest.TestCase):
                     window.canvas.draw()
                     renderer = window.canvas.get_renderer()
                     title = window._heat_ax.title
-                    gap = (title.get_window_extent(renderer).y0 - window._heat_ax.get_window_extent(renderer).y1) / window.figure.dpi
-                    self.assertAlmostEqual(gap, 0.04)
+                    title_box = title.get_window_extent(renderer)
+                    frame_box = window._heat_ax.get_window_extent(renderer)
+                    self.assertTrue(frame_box.contains(title_box.x0, title_box.y0))
+                    self.assertTrue(frame_box.contains(title_box.x1, title_box.y1))
+                    saved = (window.workspace.active or window._unregistered_session).presentation
+                    scale = 96 * window._analysis_display_scale() * window.canvas.device_pixel_ratio / window.figure.dpi
                     for bar in window._heat_colorbars:
                         bar_gap = (bar.ax.get_window_extent(renderer).y0 - window._heat_ax.get_window_extent(renderer).y1) / window.figure.dpi
-                        self.assertAlmostEqual(bar_gap, 0.04)
+                        self.assertAlmostEqual(bar_gap, saved.colorbar.frame_gap_in * scale)
                     labels = [title, window._heat_signal_label, window._heat_ax.yaxis.get_offset_text()]
                     labels += [tick for bar in window._heat_colorbars for tick in bar.ax.get_xticklabels()]
                     boxes = [label.get_window_extent(renderer) for label in labels if label.get_text()]

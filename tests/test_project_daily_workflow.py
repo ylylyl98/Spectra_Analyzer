@@ -6,12 +6,13 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QMimeData, QPoint, QPointF, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from spectra_app.main_window import MainWindow
 from spectra_app.dataset_state import detached_graph_session
 from spectra_app.plot_dialogs import PlotTargetsDialog
+from spectra_app.disclosure import reveal_editor
 from tests.settings_helpers import isolate_settings
 from tests.background_helpers import wait_jobs
 from tests.test_workflow import _fit_result
@@ -42,10 +44,22 @@ class ProjectDailyWorkflowTests(unittest.TestCase):
 
     def tearDown(self):
         for window in self.windows:
-            wait_jobs(window)
-            with patch.object(window, '_confirm_project_discard', return_value=True):
+            self.wait_idle(window)
+            with patch.object(window, '_confirm_project_discard_async',
+                              side_effect=lambda continuation: continuation()):
                 window.close()
+                APP.processEvents()
             window.deleteLater()
+        APP.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        APP.processEvents()
+
+    def wait_idle(self, window):
+        deadline = time.monotonic() + 8
+        while (window._project_io_jobs.busy or window._background_jobs.busy) and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertFalse(window._project_io_jobs.busy or window._background_jobs.busy,
+                         'asynchronous project operation timed out')
         APP.processEvents()
 
     def window(self):
@@ -58,11 +72,14 @@ class ProjectDailyWorkflowTests(unittest.TestCase):
     def saved(self, suffix='.spectra'):
         window = self.window()
         window._load_dat_file_direct(self.paths[0])
+        window.open_graph_document()
         path = window.save_project(self.folder / ('daily' + suffix))
         return window, path
 
     def settle(self):
         QTest.qWait(240)
+        for window in self.windows:
+            self.wait_idle(window)
         APP.processEvents()
 
     def drop(self, window, paths):
@@ -72,6 +89,7 @@ class ProjectDailyWorkflowTests(unittest.TestCase):
         window.dragEnterEvent(enter)
         event = QDropEvent(QPointF(4, 4), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
         window.dropEvent(event)
+        self.wait_idle(window)
         return enter, event
 
     def test_recent_success_persistence_dedup_bounds_and_clear(self):
@@ -87,6 +105,7 @@ class ProjectDailyWorkflowTests(unittest.TestCase):
         self.assertIn(first.name, actions[0].text())
         self.assertEqual(actions[0].toolTip(), str(first))
         actions[0].trigger()
+        self.wait_idle(restarted)
         self.assertEqual(restarted._project_path, first)
         restarted._recent_projects_menu.actions()[-1].trigger()
         again = self.window()
@@ -228,6 +247,16 @@ print(json.dumps({'exit': result, 'path': str(windows[0]._project_path), 'errors
         baseline = w.workspace.active.presentation
         w.set_plot_presentation(replace(baseline, text_pt=baseline.text_pt + 1))
         self.settle()
+        grown = w.workspace.active.presentation
+        self.assertGreater(grown.height_in, baseline.height_in)
+        self.assertTrue(w.isWindowModified())
+        self.assertTrue(w.undo_edit())
+        self.settle()
+        self.assertEqual(w.workspace.active.presentation, baseline)
+        self.assertFalse(w.isWindowModified())
+        self.assertTrue(w.redo_edit())
+        self.settle()
+        self.assertEqual(w.workspace.active.presentation, grown)
         self.assertTrue(w.isWindowModified())
         self.assertTrue(w.undo_edit())
         self.settle()
@@ -256,6 +285,71 @@ print(json.dumps({'exit': result, 'path': str(windows[0]._project_path), 'errors
         self.settle()
         self.assertFalse(w.isWindowModified())
 
+    def test_delayed_inactive_page_growth_stays_in_its_own_undo_command(self):
+        w, path = self.saved()
+        first = w.workspace.active
+        baseline = first.presentation
+        history = w._history_for(first)
+        count = len(history.undo_stack)
+        with patch.object(w, '_schedule_plot_page_render'):
+            w.set_plot_presentation(replace(baseline, text_pt=baseline.text_pt + 1))
+            w._plot_render_timer.stop()
+            w._load_dat_file_direct(self.paths[1])
+            w.open_graph_document()
+            active = w.workspace.active
+            active_presentation = active.presentation
+            w._render_plot_page((first.dataset_id, first.active_graph_id))
+        grown = first.presentation
+        self.assertGreater(grown.height_in, baseline.height_in)
+        self.assertIs(w.workspace.active, active)
+        self.assertEqual(active.presentation, active_presentation)
+        self.assertEqual(len(history.undo_stack), count + 1,
+                         'Preparing an inactive page must not create a render operation')
+        w.open_graph_document(first.dataset_id)
+        self.assertTrue(w.undo_edit())
+        self.assertEqual(first.presentation, baseline)
+        self.assertTrue(w.redo_edit())
+        w._render_plot_page()
+        self.assertEqual(first.presentation, grown)
+
+    def test_delayed_growth_and_newer_palette_undo_restore_saved_presentation(self):
+        w, path = self.saved()
+        baseline = w.workspace.active.presentation
+        history = w._history_for(w.workspace.active)
+        count = len(history.undo_stack)
+        with patch.object(w, '_schedule_plot_page_render'):
+            w.set_plot_presentation(replace(baseline, text_pt=baseline.text_pt + 1))
+            w._plot_render_timer.stop()
+            w.cmap_combo.setCurrentIndex(w.cmap_combo.findData('plasma'))
+            w._plot_render_timer.stop()
+            w._render_plot_page()
+            self.assertGreater(w.workspace.active.presentation.height_in, baseline.height_in)
+            self.assertEqual(len(history.undo_stack), count + 2)
+            self.assertTrue(w.undo_edit())
+            w._render_plot_page()
+            self.assertEqual(w.workspace.active.presentation.text_pt, baseline.text_pt + 1)
+            self.assertTrue(w.undo_edit())
+            w._render_plot_page()
+        self.settle()
+        self.assertEqual(w.workspace.active.presentation, baseline)
+        self.assertFalse(w.isWindowModified())
+
+    def test_presentation_redo_before_first_render_keeps_paper_reversible(self):
+        w, path = self.saved()
+        baseline = w.workspace.active.presentation
+        with patch.object(w, '_schedule_plot_page_render'):
+            w.set_plot_presentation(replace(baseline, text_pt=baseline.text_pt + 1))
+            w._plot_render_timer.stop()
+            self.assertTrue(w.undo_edit())
+            self.assertTrue(w.redo_edit())
+            w._render_plot_page()
+            self.assertGreater(w.workspace.active.presentation.height_in, baseline.height_in)
+            self.assertTrue(w.undo_edit())
+            w._render_plot_page()
+        self.settle()
+        self.assertEqual(w.workspace.active.presentation, baseline)
+        self.assertFalse(w.isWindowModified())
+
     def test_rows_search_navigation_and_annotation_selection_stay_clean(self):
         w, path = self.saved()
         w.imported_dataset_rows_spin.setValue(12)
@@ -279,12 +373,15 @@ print(json.dumps({'exit': result, 'path': str(windows[0]._project_path), 'errors
             APP.setFont(QFont('Segoe UI', 10))
             APP.setStyleSheet(APP_QSS)
             w, path = self.saved()
+            w._sidebar_tabs.setCurrentWidget(w._data_sidebar_scroll)
+            reveal_editor(w.imported_dataset_rows_spin)
             w.show()
             for width in (1320, 1000):
                 w.resize(width, 850 if width == 1320 else 680)
                 self.settle()
                 spin = w.imported_dataset_rows_spin
                 viewport = w._sidebar_tabs.widget(0).viewport()
+                self.assertTrue(spin.isVisible())
                 point = spin.mapTo(viewport, QPoint(0, 0))
                 self.assertGreaterEqual(point.x(), 0)
                 self.assertLessEqual(point.x() + spin.width(), viewport.width())
@@ -298,7 +395,6 @@ print(json.dumps({'exit': result, 'path': str(windows[0]._project_path), 'errors
         for path in self.paths:
             w._load_dat_file_direct(path)
         dialog = PlotTargetsDialog(w.workspace.datasets.values(), w.workspace.active_dataset_id, w)
-        self.addCleanup(dialog.deleteLater)
         items = [dialog.targets.item(index) for index in range(2)]
         self.assertIn('first', items[0].text())
         self.assertIn('second', items[1].text())
@@ -311,7 +407,6 @@ print(json.dumps({'exit': result, 'path': str(windows[0]._project_path), 'errors
         from spectra_app.plot_templates import capture_format
         template = capture_format(w.workspace.active, 'daily labels')
         formatted = ApplyFormatDialog(w.workspace.datasets.values(), w.workspace.active_dataset_id, template, w)
-        self.addCleanup(formatted.deleteLater)
         for dataset_id in w.workspace.datasets:
             self.assertNotIn(dataset_id, formatted.preview_text.toPlainText())
             for label in formatted.findChildren(type(w.imported_dataset_label)):
@@ -448,8 +543,8 @@ print(json.dumps({'exit': result, 'path': str(windows[0]._project_path), 'errors
         self.assertEqual(runtime_workspace_stamp(restored, {}), before)
         old_z = w.workspace.active.current_cube.z
         self.assertIn(id(old_z), cache)
-        w.workspace.datasets.clear()
-        w.workspace.active_dataset_id = None
+        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Discard):
+            self.assertTrue(w.new_project())
         runtime_workspace_stamp(w.workspace, cache)
         self.assertEqual(cache, {})
 

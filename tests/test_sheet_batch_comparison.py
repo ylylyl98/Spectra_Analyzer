@@ -49,11 +49,12 @@ class SheetBatchComparisonTests(unittest.TestCase):
         return books, sheets
 
     def tree_items(self, tree):
-        for i in range(tree.topLevelItemCount()):
-            parent = tree.topLevelItem(i)
-            yield parent
-            for j in range(parent.childCount()):
-                yield parent.child(j)
+        def descendants(parent):
+            for i in range(parent.childCount()):
+                item = parent.child(i)
+                yield item
+                yield from descendants(item)
+        yield from descendants(tree.invisibleRootItem())
 
     def navigator_item(self, key):
         return next(item for item in self.tree_items(self.window.data_navigator) if item.data(0, Qt.UserRole) == key)
@@ -107,7 +108,10 @@ class SheetBatchComparisonTests(unittest.TestCase):
         click(sheets[2], Qt.ShiftModifier)
         click(sheets[3], Qt.ControlModifier)
         click(sheets[4], Qt.ControlModifier)
-        self.assertEqual(len(tree.selectedItems()), 5, 'Navigator must support Ctrl/Shift across Workbooks')
+        self.assertEqual({item.data(0, Qt.UserRole) for item in tree.selectedItems()
+                          if item.data(0, Qt.UserRole)[0] != 'group'},
+                         {('sheet', sheet.sheet_id) for sheet in sheets},
+                         'Navigator must support Ctrl/Shift across Workbooks')
         self.assertFalse(self.window.graph_documents.keys(), 'Sources need not be opened')
         def configure(dialog):
             self.assertEqual(list(dialog.selected_mappings()), [sheet.sheet_id for sheet in sheets])

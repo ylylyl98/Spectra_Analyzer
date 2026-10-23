@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 
 
@@ -30,6 +32,7 @@ def _local_polynomial_second_derivative(
     values: np.ndarray,
     window_length: int,
     polyorder: int,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> np.ndarray:
     """Differentiate local fits, reusing coordinate weights across finite rows."""
     effective_window = min(window_length, energy.size)
@@ -41,6 +44,8 @@ def _local_polynomial_second_derivative(
     target = np.zeros(effective_order + 1)
     target[2] = 2.0
     for index in range(energy.size):
+        if check_cancelled is not None:
+            check_cancelled()
         start = max(0, min(index - effective_window // 2, energy.size - effective_window))
         stop = start + effective_window
         offset = energy[start:stop] - energy[index]
@@ -76,6 +81,7 @@ def energy_second_derivative(
     smooth: bool = True,
     window_length: int = 21,
     polyorder: int = 3,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> np.ndarray:
     """Compute the second energy derivative for rows of a 2D spectrum.
 
@@ -97,12 +103,17 @@ def energy_second_derivative(
         window that fits and reduce the order when necessary (minimum two).
         Segments shorter than three points return NaN. Edge fits use the
         first/last full window, matching SG interpolation on uniform grids.
+    check_cancelled:
+        Optional cooperative cancellation callback. Called before processing,
+        between finite segments and between local polynomial fits.
 
     Returns
     -------
     numpy.ndarray
         A new floating-point array with the same shape as ``z``.
     """
+    if check_cancelled is not None:
+        check_cancelled()
     energy_array = np.asarray(energy, dtype=float)
     if energy_array.ndim != 1:
         raise ValueError("energy must be a 1D array")
@@ -138,20 +149,26 @@ def energy_second_derivative(
     if complete_rows.size:
         segments[(0, work_energy.size)] = complete_rows.tolist()
     for row_index in np.flatnonzero(~finite.all(axis=1)):
+        if check_cancelled is not None:
+            check_cancelled()
         boundaries = np.flatnonzero(np.diff(np.r_[False, finite[row_index], False]))
         for start, stop in boundaries.reshape(-1, 2):
             if stop - start >= 3:
                 segments.setdefault((int(start), int(stop)), []).append(int(row_index))
 
     for (start, stop), rows in segments.items():
+        if check_cancelled is not None:
+            check_cancelled()
         segment_energy = work_energy[start:stop]
         segment_values = work_values[rows, start:stop]
         if smooth:
             derivative = _local_polynomial_second_derivative(
-                segment_energy, segment_values, window_length, polyorder
+                segment_energy, segment_values, window_length, polyorder, check_cancelled
             )
         else:
             derivative = _quadratic_second_derivative(segment_energy, segment_values)
         result[rows, start:stop] = derivative
 
+    if check_cancelled is not None:
+        check_cancelled()
     return result[:, ::-1] if descending else result

@@ -26,6 +26,7 @@ class OriginInteractionTests(unittest.TestCase):
         self.path.write_text('Energy(eV) 0 1 2\n' + '\n'.join(
             f'{1+i/10} {i+1} {2*(i+1)} {3*(i+1)}' for i in range(12)))
         self.w._load_dat_file_direct(self.path)
+        self.w.open_graph_document()
         self.w.resize(1250, 900)
         self.w.plot_tabs.setCurrentWidget(self.w.graph_documents)
         self.w.show()
@@ -219,7 +220,8 @@ class OriginInteractionTests(unittest.TestCase):
     def test_shared_menus_import_shortcut_and_native_text_copy(self):
         w, p = self.w, self.w.plot_page
         self.assertTrue(hasattr(w, '_graph_command_actions'), 'Shared File/Edit/View commands are missing')
-        self.assertEqual([action.text().replace('&','') for action in w.menuBar().actions()], ['File','Edit','View'])
+        self.assertEqual([action.text().replace('&','') for action in w.menuBar().actions()],
+                         ['File', 'Edit', 'View', 'Analysis', 'Help'])
         self.assertEqual(p.copy_graph_btn.text(), 'Copy SVG')
         self.assertEqual(w._graph_command_actions['copy_graph'].text(), 'Copy Graph as SVG')
         extra = self.folder / 'shortcut.dat'
@@ -255,7 +257,9 @@ class OriginInteractionTests(unittest.TestCase):
         w.plot_title_edit.setFocus()
         QTest.keyClick(w.plot_title_edit, Qt.Key_R, Qt.ControlModifier)
         self.assertEqual(tuple(w._heat_ax.get_xlim()), (1.2,1.5))
+        self.render()
         p.preview.setFocus()
+        self.assertTrue(p.preview.hasFocus())
         QTest.keyClick(p.preview, Qt.Key_R, Qt.ControlModifier)
         self.assertLess(w._heat_ax.get_xlim()[0], 1.2)
         self.assertGreater(w._heat_ax.get_xlim()[1], 1.5)

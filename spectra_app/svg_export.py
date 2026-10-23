@@ -63,6 +63,7 @@ class RenderedPage:
     # Visible semantic objects in normalized page coordinates (left, bottom,
     # width, height). Runtime-only; old comparison fixtures remain compatible.
     object_bounds: dict[str, tuple[tuple[float, float, float, float], ...]] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
 
 
 def build_color_norm(spec: NormSpec, limits: tuple[float, float]):
@@ -528,22 +529,17 @@ def _layout(figure, ax, snapshot, presentation, bars):
     numeric = FontProperties(family=[presentation.font_family, 'DejaVu Sans'], size=presentation.numeric_pt)
     colorbar = presentation.colorbar
     for bar in bars:
-        labels, positions = bar['ticks'][1:]
+        labels = bar['ticks'][1]
         label_widths = [_text_width(renderer, label, numeric) for label in labels]
         bar['tick_half_widths'] = [value / 2 for value in label_widths]
-        # All three labels are centered at their actual norm positions. This
-        # permits a short bar without changing noncentral custom tick values.
-        minimum = max((label_widths[0]/2 + label_widths[1]/2 + .025) / max(positions[1]-positions[0], 1e-12),
-                      (label_widths[2]/2 + label_widths[1]/2 + .025) / max(positions[2]-positions[1], 1e-12))
-        if bar['label']:
-            minimum = max(minimum, _text_width(renderer, bar['label'], font))
-        bar['width'] = max(colorbar.width_in, minimum)
-    if colorbar.visible:
-        # Endpoint labels and optional caps can extend beyond the frame, but
-        # must remain within the paper. Reserve their measured page margins.
+        bar['width'] = colorbar.width_in
+    if colorbar.visible and presentation.frame_width_in is None:
+        # Explicit Auto uses all remaining room, including header margins.
         right = max(right, max(bar['tick_half_widths'][-1] for bar in bars) + .015,
                     .075 if colorbar.show_extensions else 0)
         left = max(left, max(bar['tick_half_widths'][0] for bar in bars) + .015)
+    # Fixed frames use axis margins only. Header overflow is measured against
+    # that anchor below, so fitting label edits cannot move or resample data.
     available = width - left - right
     if available <= 0:
         raise ValueError('Page layout has no space for labels and heatmap.')
@@ -555,35 +551,12 @@ def _layout(figure, ax, snapshot, presentation, bars):
     if snapshot.norm.kind == 'log':
         signal += _wrap('Nonpositive / missing: gray', width - .08, renderer, font)
     header_line_count = len(signal)
-    def between_bars(previous, current):
-        return max(colorbar.gap_in, previous['tick_half_widths'][-1] + current['tick_half_widths'][0] + .025)
-
     def row_width(row):
-        return sum(bar['width'] for bar in row) + sum(between_bars(a, b) for a, b in zip(row, row[1:]))
+        return sum(bar['width'] for bar in row) + colorbar.gap_in * (len(row)-1)
 
-    def bar_rows(capacity, *, anchored=False):
-        result = []
-        current, occupied = [], 0.
-        for bar in bars if colorbar.visible else ():
-            if bar['width'] > capacity:
-                # A fixed frame is centered in the available page area. Its
-                # left/right header anchor gains half of any extra page width.
-                extra = (2 if anchored else 1) * (bar['width'] - capacity)
-                raise _PageSizeRequired(
-                    f"Colorbar {bar['id']} tick layout does not fit the page; enlarge the page or shorten tick labels.",
-                    width + extra, height)
-            required = bar['width'] + (between_bars(current[-1], bar) if current else 0)
-            if current and occupied + required > capacity:
-                result.append(current)
-                current, occupied = [], 0.
-                required = bar['width']
-            current.append(bar)
-            occupied += required
-        if current:
-            result.append(current)
-        return result
-
-    rows = bar_rows(available)
+    # The configured bars form one fixed strip. Text can require more paper or
+    # an overlap warning, but cannot change bar size, spacing or arrangement.
+    rows = [bars] if colorbar.visible else []
     bar_height = colorbar.height_in
     # Numeric labels sit above the gradient. Region names get their own row
     # above those labels, leaving the frame-to-gradient gap independent.
@@ -617,49 +590,12 @@ def _layout(figure, ax, snapshot, presentation, bars):
             return frame_left
         return frame_left + (frame_width-occupied)/2
 
-    # A short frame or a long stacked header can move the frame's right edge
-    # inward. Reflow regional bars against that actual anchor, not page width.
-    offset = ax.yaxis.get_offset_text()
-    offset_box = offset.get_window_extent(renderer) if offset.get_visible() and offset.get_text() else None
-    for _ in range(len(bars)+3):
+    plot_left, plot_bottom, frame_width, frame_height = frame_geometry(inline)
+    if inline:
+        signal_right = row_left_at(rows[0], plot_left, frame_width) - rows[0][0]['tick_half_widths'][0] - .025
+        if signal_right - _text_width(renderer, signal[0], font) < .04:
+            inline = False
         plot_left, plot_bottom, frame_width, frame_height = frame_geometry(inline)
-        # A regional bar can extend left of the frame and cover the scientific
-        # multiplier. Reserve its measured height only where the bottom bar
-        # row actually crosses that text; right-only headers keep their gap.
-        if rows and offset_box is not None:
-            offset_left = plot_left + (offset_box.x0-box.x0)/72
-            offset_right = plot_left + (offset_box.x1-box.x0)/72
-            bar_left = row_left_at(rows[-1], plot_left, frame_width)
-            required_gap = colorbar.frame_gap_in
-            cap = .035 if colorbar.show_extensions else 0.
-            for index, bar in enumerate(rows[-1]):
-                if bar_left-cap < offset_right and bar_left+bar['width']+cap > offset_left:
-                    required_gap = max(required_gap, top_axis + .01)
-                bar_left += bar['width'] + (between_bars(bar, rows[-1][index+1])
-                                           if index+1 < len(rows[-1]) else 0)
-            if required_gap > header_gap:
-                header_gap = required_gap
-                continue
-        if inline:
-            signal_right = row_left_at(rows[0], plot_left, frame_width) - rows[0][0]['tick_half_widths'][0] - .025
-            if signal_right - _text_width(renderer, signal[0], font) < .04:
-                inline = False
-                continue
-        if not rows:
-            break
-        first_half = max(bar['tick_half_widths'][0] for bar in bars)
-        last_half = max(bar['tick_half_widths'][-1] for bar in bars)
-        if colorbar.alignment == 'right':
-            capacity = plot_left + frame_width - .04 - first_half
-        elif colorbar.alignment == 'left':
-            capacity = width - .04 - plot_left - last_half
-        else:
-            center = plot_left + frame_width/2
-            capacity = 2*min(center-.04-first_half, width-.04-center-last_half)
-        if all(row_width(row) <= capacity + 1e-9 for row in rows):
-            break
-        rows = bar_rows(min(capacity, available), anchored=True)
-        inline = False
     base_header = max(top_axis + .06, header_gap + len(rows) * row_height if rows else 0)
     ax.set_position([plot_left/width, plot_bottom/height, frame_width/width, frame_height/height])
     frame_top = plot_bottom + frame_height
@@ -667,9 +603,19 @@ def _layout(figure, ax, snapshot, presentation, bars):
     for row in reversed(rows):
         row_left = row_left_at(row, plot_left, frame_width)
         row_right = row_left + row_width(row)
-        if row_left - row[0]['tick_half_widths'][0] < .015 or row_right + row[-1]['tick_half_widths'][-1] > width-.015+1e-9:
-            shortage = max(.015 - (row_left-row[0]['tick_half_widths'][0]),
-                           row_right + row[-1]['tick_half_widths'][-1] - (width-.015))
+        cap = .035 if colorbar.show_extensions else 0.
+        header_left, header_right = row_left-cap, row_right+cap
+        bar_left = row_left
+        for bar in row:
+            # Custom interior ticks can extend farther than either endpoint,
+            # including ticks on bars in the middle of a regional strip.
+            for position, half_width in zip(bar['ticks'][2], bar['tick_half_widths']):
+                tick_center = bar_left + position*bar['width']
+                header_left = min(header_left, tick_center-half_width)
+                header_right = max(header_right, tick_center+half_width)
+            bar_left += bar['width'] + colorbar.gap_in
+        if header_left < .015 or header_right > width-.015+1e-9:
+            shortage = max(.015-header_left, header_right-(width-.015))
             raise _PageSizeRequired(
                 'Colorbar header does not fit the page beside the requested frame; enlarge the page or shorten labels.',
                 width + 2*shortage, height)
@@ -679,7 +625,7 @@ def _layout(figure, ax, snapshot, presentation, bars):
                             ha='center', va='bottom', fontsize=presentation.text_pt, parse_math=False,
                             gid=f"colorbar-label-{bar['id']}")
             bar['bounds'] = (row_left/width, cursor/height, bar['width']/width, bar_height/height)
-            row_left += bar['width'] + (between_bars(bar, row[index+1]) if index+1 < len(row) else 0)
+            row_left += bar['width'] + colorbar.gap_in
         cursor += row_height
     cursor = max(cursor, frame_top + base_header)
     if inline:
@@ -812,6 +758,8 @@ def _audit_layout(figure):
     page = figure.bbox
     # Ignore intentionally clipped data labels; require all page/axis/header text to fit.
     texts = list(figure.texts)
+    colorbar_text = {text for text in figure.texts
+                     if (text.get_gid() or '').startswith('colorbar-label-')}
     for axis in figure.axes:
         if not axis.get_visible():
             continue
@@ -821,23 +769,31 @@ def _audit_layout(figure):
                 # Only the ticks that Matplotlib actually draws inside view limits.
                 for tick in coordinate._update_ticks():
                     texts.extend([tick.label1, tick.label2])
+                    if axis is not figure.axes[0]:
+                        colorbar_text.update((tick.label1, tick.label2))
     boxes = []
     for text in texts:
         if not text.get_visible() or not text.get_text():
             continue
         bounds = text.get_window_extent(renderer)
         if min(bounds.x0-page.x0, bounds.y0-page.y0, page.x1-bounds.x1, page.y1-bounds.y1) < -.1:
-            raise ValueError('Page layout clips a label; enlarge the page or shorten text.')
+            raise ValueError('Page layout clips a label; enlarge the page, reduce precision or font size, or shorten text.')
         boxes.append((text, bounds))
+    colorbar_overlap = False
     for index, (text, bounds) in enumerate(boxes):
         for other, other_bounds in boxes[index+1:]:
             if bounds.overlaps(other_bounds):
+                if text in colorbar_text or other in colorbar_text:
+                    colorbar_overlap = True
+                    continue
                 raise ValueError(f'Page layout overlaps labels {text.get_text()!r} and {other.get_text()!r}; enlarge the page.')
     offset = figure.axes[0].yaxis.get_offset_text()
     if offset.get_visible() and offset.get_text():
         bounds = offset.get_window_extent(renderer)
         if any(bounds.overlaps(axis.get_window_extent(renderer)) for axis in figure.axes[1:]):
-            raise ValueError('Page layout overlaps the coordinate multiplier and a colorbar.')
+            colorbar_overlap = True
+    return (('Colorbar text overlaps nearby content. Reduce number precision or font size, or adjust colorbar width and spacing.',)
+            if colorbar_overlap else ())
 
 
 def _semantic_object_bounds(figure, ax, bars):
@@ -916,8 +872,8 @@ def prepare_heatmap_page(snapshot: HeatmapSnapshot, presentation: PlotPresentati
     """
     renderer = renderer or render_hybrid_svg
     resolved = presentation
-    # Layout can discover inline-header reflow and regional-bar stacking after
-    # satisfying a frame shortage. Bound the measured refinements explicitly.
+    # Layout can discover header shortages after satisfying a frame shortage.
+    # Bound the measured paper refinements explicitly.
     for attempt in range(8):
         try:
             return resolved, renderer(snapshot, resolved)
@@ -1023,12 +979,14 @@ def render_hybrid_svg(snapshot: HeatmapSnapshot, presentation: PlotPresentation)
         _add_annotations(ax, snapshot, presentation)
         _fit_default_tick_density(figure, ax, presentation)
         _align_heatmap_corner_tick_labels(ax, figure.canvas.get_renderer())
-        _audit_layout(figure)
+        warnings = _audit_layout(figure)
         _update_heatmap_tick_contrast(ax, figure.canvas.get_renderer())
         object_bounds = _semantic_object_bounds(figure, ax, bars)
         output = BytesIO()
+        # Only page/axes patches are transparent; data and annotation colors
+        # retain their own alpha. Preview/PNG still composite onto white paper.
         figure.savefig(output, format='svg', dpi=presentation.heatmap_dpi, bbox_inches=None,
-                       facecolor='white', metadata={'Date': None})
+                       transparent=True, facecolor='none', edgecolor='none', metadata={'Date': None})
         root = ET.fromstring(output.getvalue())
         _replace_colorbar_gradients(root, bars, figure_size)
         title_group = root.find(".//s:g[@id='page-title-overlay']", _NS)
@@ -1077,7 +1035,7 @@ def render_hybrid_svg(snapshot: HeatmapSnapshot, presentation: PlotPresentation)
                         missing_count=int(np.count_nonzero(visible_mask & np.isnan(snapshot.z))), header_line_count=header_lines,
                         valid_count=int(valid_color_values(snapshot.z[visible_mask], snapshot.norm).size),
                         heatmap_dpi=presentation.heatmap_dpi, font_family=presentation.font_family,
-                        object_bounds=object_bounds)
+                        object_bounds=object_bounds, warnings=warnings or ())
 
 
 def _output_path(path: str | Path, suffix: str) -> Path:

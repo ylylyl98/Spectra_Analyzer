@@ -1,0 +1,24 @@
+# Runtime versions validated for the 2026-10-23 Windows build (CPython 3.14 x64).
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.65.0
+kiwisolver==1.5.1
+matplotlib==3.11.1
+numpy==2.5.3
+packaging==26.3
+pillow==12.3.0
+pyparsing==3.3.2
+PySide6==6.11.2
+PySide6_Addons==6.11.2
+PySide6_Essentials==6.11.2
+python-dateutil==2.9.0.post0
+scipy==1.18.1
+shiboken6==6.11.2
+six==1.17.0
+# Build tools live in a dedicated environment, never the app's .venv.
+PyInstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+setuptools==84.2.1

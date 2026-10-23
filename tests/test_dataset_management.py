@@ -59,8 +59,11 @@ class DatasetManagementTests(unittest.TestCase):
     def tearDown(self):
         for window in self.windows:
             wait_jobs(window)
-            with patch.object(window, '_confirm_project_discard', return_value=True):
+            with patch.object(window, '_confirm_project_discard_async',
+                              side_effect=lambda continuation: continuation()):
                 window.close()
+                # Close approval schedules a second close on the GUI event loop.
+                APP.processEvents()
             window.deleteLater()
         APP.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)

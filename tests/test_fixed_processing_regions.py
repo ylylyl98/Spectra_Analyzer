@@ -127,6 +127,29 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         self.assertEqual(w._processing_mode, "original")
         self.assertEqual(w._color_scale_mode, "2")
 
+    def test_unfixed_new_import_uses_one_bar_and_recall_preserves_explicit_regions(self):
+        w = self.window()
+        regional = self.source('regional')
+        w._load_dat_file_direct(regional)
+        w.open_graph_document()
+        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData('3'))
+        w.fix_regions_chk.setChecked(False)
+        saved_edges = list(w._color_region_boundaries)
+        saved_limits = [mesh.get_clim() for mesh in w._heat_meshes]
+        self.assertEqual(w._save_current_plot_state(), '')
+        w._load_dat_file_direct(self.source('fresh'))
+        self.assertEqual(w._color_scale_mode, 'global')
+        self.assertEqual(len(w._heat_colorbars), 1)
+        self.assertEqual(w._color_region_boundaries, [])
+        w.close()
+        restored = self.window()
+        restored._load_dat_file_direct(regional)
+        self.assertFalse(restored.fix_regions_chk.isChecked())
+        self.assertEqual(restored._color_scale_mode, '3')
+        self.assertEqual(len(restored._heat_colorbars), 3)
+        np.testing.assert_allclose(restored._color_region_boundaries, saved_edges)
+        np.testing.assert_allclose([mesh.get_clim() for mesh in restored._heat_meshes], saved_limits)
+
     def test_count_fix_does_not_carry_edges(self):
         w = self.window()
         w._load_dat_file_direct(self.source("a"))

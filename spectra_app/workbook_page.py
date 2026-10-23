@@ -1,10 +1,10 @@
 """Read-only virtual numeric Sheets and retained per-Sheet plotting choices."""
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal, QSignalBlocker
-from PySide6.QtGui import QKeySequence, QShortcut, QFont
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QToolBar,
-    QLabel, QListWidget, QListWidgetItem, QPushButton, QTabWidget, QTableView, QVBoxLayout, QWidget, QSizePolicy, QToolButton, QMenu)
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, Qt, Signal, QSignalBlocker
+from PySide6.QtGui import QKeySequence, QShortcut, QFont, QFontMetrics
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QHeaderView, QToolBar,
+    QLabel, QListWidget, QListWidgetItem, QPushButton, QTabWidget, QTableView, QVBoxLayout, QWidget, QSizePolicy, QToolButton, QMenu, QStyle)
 
 from .workbook_state import sheet_columns, sheet_column_values, sheet_shape, sheet_numeric_columns, set_sheet_mapping
 from .plot_icons import PLOT_STYLES, plot_icon
@@ -161,8 +161,70 @@ def _column_letter(column):
     return letters
 
 
+class _SheetHeaderView(QHeaderView):
+    columnsChosen = Signal()
+
+    def __init__(self, parent):
+        super().__init__(Qt.Horizontal, parent)
+        self._choosing_columns = False
+        self._fitting_columns = False
+        self._manual_columns = set()
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+        self.sectionPressed.connect(self._section_pressed)
+        self.sectionResized.connect(self._section_resized)
+
+    def _section_pressed(self, _column):
+        # Qt emits sectionPressed for selection, but not for a resize handle.
+        self._choosing_columns = True
+
+    def mouseReleaseEvent(self, event):
+        choosing = self._choosing_columns and event.button() == Qt.LeftButton
+        self._choosing_columns = False
+        super().mouseReleaseEvent(event)
+        if choosing:
+            # sectionClicked is not emitted after dragging across columns.
+            self.columnsChosen.emit()
+
+    def _section_resized(self, column, _old_size, _new_size):
+        if not self._fitting_columns:
+            self._manual_columns.add(column)
+
+    def fit_columns(self, *_):
+        font = QFont(self.font())
+        font.setBold(True)
+        metrics = QFontMetrics(font)
+        margin = self.style().pixelMetric(QStyle.PM_HeaderMargin, None, self)
+        self._fitting_columns = True
+        try:
+            for column in range(self.count()):
+                if column not in self._manual_columns:
+                    # Native header metrics include label, bold font and style
+                    # margins, without inspecting any of the table's data rows.
+                    text = self.model().headerData(column, Qt.Horizontal) or ''
+                    width = metrics.horizontalAdvance(text) + 2 * margin
+                    self.resizeSection(column, max(self.defaultSectionSize(), self.sectionSizeHint(column), width))
+        finally:
+            self._fitting_columns = False
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange):
+            self.fit_columns()
+
+
 class _SheetTableView(QTableView):
     columnsChosen = Signal()
+
+    def __init__(self):
+        super().__init__()
+        header = _SheetHeaderView(self)
+        self.setHorizontalHeader(header)
+        header.columnsChosen.connect(self.columnsChosen)
+
+    def selectAll(self):
+        super().selectAll()
+        self.columnsChosen.emit()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Space and event.modifiers() == Qt.ControlModifier:
@@ -205,7 +267,7 @@ class SheetTableModel(QAbstractTableModel):
             return int(Qt.AlignRight | Qt.AlignVCenter)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole:
+        if role in (Qt.DisplayRole, Qt.ToolTipRole):
             if orientation == Qt.Vertical:
                 return str(section + 1)
             prefix = '▶ ' if section == self.gate_column else ''
@@ -301,7 +363,8 @@ class SheetPage(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
-        self.table.horizontalHeader().setDefaultSectionSize(125)
+        self.model.headerDataChanged.connect(self.table.horizontalHeader().fit_columns)
+        self.model.modelReset.connect(self.table.horizontalHeader().fit_columns)
         self.table.verticalHeader().setDefaultSectionSize(24)
         layout.addWidget(self.table, 1)
         self.status = QLabel('Select column headers for Y · Ctrl/Shift adds columns · right-click a header to set X · Ctrl+C copies cells')
@@ -317,7 +380,6 @@ class SheetPage(QWidget):
         self.add_comparison_btn.clicked.connect(lambda: self.comparisonRequested.emit(sheet_id, self.target_combo.currentData()))
         self.table.selectionModel().currentColumnChanged.connect(self._column_selected)
         self.table.horizontalHeader().sectionClicked.connect(self._header_selected)
-        self.table.horizontalHeader().sectionClicked.connect(self._columns_chosen)
         self.table.columnsChosen.connect(self._columns_chosen)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self._header_menu)
