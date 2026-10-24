@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
+from . import dat_io
 from .background_jobs import DatImportError, LoadRequest, prepare_dat
-from .dat_io import matrix_layout_reason
 from .dataset_state import initialize_dataset
 from .plot_state import source_fingerprint
 from .xy_io import XYTable, parse_xy
@@ -50,25 +50,29 @@ def prepare_data_batch(requests, defaults, context, *, preferred_kinds=None):
         context.report(f'Reading data {index}/{len(requests)}: {path.name}…')
         try:
             fingerprint = source_fingerprint(path)
+            tables, option_errors, session = {}, {}, None
+            layout = None
             try:
-                reason = matrix_layout_reason(path)
-            except ValueError:
+                layout = dat_io._read_dat_layout(path)
+                reason = layout[-1]
+            except ValueError as exc:
                 reason = ''
+                option_errors['dat'] = str(exc)
             kind = (preferred_kinds or {}).get(str(path), 'dat' if reason else 'xy')
             if kind not in ('dat', 'xy'):
                 raise ValueError('Choose XY table or Gate matrix.')
-            tables, option_errors, session = {}, {}, None
             try:
                 tables['xy'] = parse_xy(path.read_text(encoding='utf-8-sig'), source_path=path)
             except (OSError, ValueError) as exc:
                 option_errors['xy'] = str(exc)
             context.check_cancelled()
-            try:
-                prepared = prepare_dat(request, context)
-                session = initialize_dataset(path, prepared, defaults)
-                tables['dat'] = cube_table(session.base_cube, path)
-            except (OSError, ValueError) as exc:
-                option_errors['dat'] = str(exc)
+            if layout is not None:
+                try:
+                    prepared = prepare_dat(request, context, _layout=layout)
+                    session = initialize_dataset(path, prepared, defaults)
+                    tables['dat'] = cube_table(session.base_cube, path)
+                except (OSError, ValueError) as exc:
+                    option_errors['dat'] = str(exc)
             if source_fingerprint(path) != fingerprint:
                 raise ValueError('Source content changed while preparing. Import it again.')
             if kind not in tables:

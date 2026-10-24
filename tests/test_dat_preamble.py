@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
-from spectra_app.dat_io import load_dat_cube
+from spectra_app.dat_io import load_dat_cube, matrix_layout_reason
 
 
 class DatPreambleTests(unittest.TestCase):
@@ -39,6 +39,43 @@ class DatPreambleTests(unittest.TestCase):
                 self.assertEqual(cube.z.shape, (3, 3))
                 np.testing.assert_array_equal(cube.gate, [-5, 0, 5])
                 np.testing.assert_array_equal(cube.z[:, 0], [0, 0, 0])
+
+    def test_delimited_headers_preserve_spaced_axis_labels(self):
+        for separator in ("\t", ","):
+            with self.subTest(separator=separator):
+                cube = self.load_text("\n".join(separator.join(row) for row in (
+                    ("Photon energy(eV)", "2", "-1"),
+                    ("1.7", "20", "10"),
+                    ("1.6", "40", "30"),
+                )))
+                self.assertEqual(cube.x_detection_source, "header label")
+                self.assertEqual(cube.x_detection_note, "Detected from x-axis header 'Photon energy(eV)'.")
+                self.assertEqual(cube.x_original_type, "ev")
+                np.testing.assert_array_equal(cube.gate, [-1, 2])
+                np.testing.assert_array_equal(cube.energy, [1.6, 1.7])
+                np.testing.assert_array_equal(cube.z, [[30, 10], [40, 20]])
+
+    def test_spaced_header_requires_complete_finite_numeric_gate_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "incomplete.dat"
+            for separator in ("\t", ","):
+                for last_gate in ("missing", "nan", "inf"):
+                    with self.subTest(separator=separator, last_gate=last_gate):
+                        path.write_text("\n".join(separator.join(row) for row in (
+                            ("Photon energy(eV)", "-1", last_gate),
+                            ("1.6", "10", "20"), ("1.7", "30", "40"),
+                        )), encoding="utf-8")
+                        self.assertFalse(matrix_layout_reason(path))
+
+    def test_numeric_rows_keep_mixed_whitespace_tab_comma_separators(self):
+        cube = self.load_text(
+            "Energy(eV)\t-1\t1\n"
+            "1.6 10\t20\n"
+            "1.7,30 40\n"
+        )
+        np.testing.assert_array_equal(cube.gate, [-1, 1])
+        np.testing.assert_array_equal(cube.energy, [1.6, 1.7])
+        np.testing.assert_array_equal(cube.z, [[10, 30], [20, 40]])
 
     def test_zero_gate_header_without_full_preamble_preserves_rows(self):
         for middle in ("0\t1\t0\t0", "0\t0\t0\t0"):

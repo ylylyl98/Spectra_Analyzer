@@ -2,6 +2,7 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from pathlib import Path
+from dataclasses import fields
 import tempfile
 import unittest
 from threading import Event
@@ -10,9 +11,12 @@ from unittest.mock import patch
 import numpy as np
 
 from spectra_app import dat_io
-from spectra_app.background_jobs import JobContext, LoadRequest
+from spectra_app.background_jobs import CancelledError, JobContext, LoadRequest
 from spectra_app.data_import import prepare_data_batch
+from spectra_app.dataset_state import (AnalysisControls, DatasetDefaults, FixedRecipe,
+                                      ProcessingState, ViewState)
 from spectra_app.main_window import MainWindow
+from spectra_app.plot_state import PlotStateStore, source_fingerprint
 from spectra_app.workbook_state import create_comparison
 from spectra_app.xy_import_dialog import XYImportDialog
 from PySide6.QtCore import QEvent, QPoint, Qt
@@ -49,6 +53,120 @@ class ContentDetectionTests(unittest.TestCase):
             for prefix in ('', 'Title 0 0\n0 0 0\n'):
                 path.write_text(prefix + '0 -1 1\n500 10 20\n501 30 40\n502 50 60\n')
                 self.assertTrue(dat_io.matrix_layout_reason(path))
+
+
+class UnifiedParseReuseTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.folder = Path(directory.name)
+        self.path = self.folder / 'matrix.csv'
+        self.path.write_text('Wavelength(nm),2,-1\n600,20,10\n500,40,30\n')
+        self.defaults = DatasetDefaults(ViewState(), AnalysisControls(),
+            {group: FixedRecipe() for group in ('processing', 'regions', 'region_edges')}, {})
+        self.context = JobContext(Event(), lambda _: None)
+
+    def prepare(self, request=None, **kwargs):
+        return prepare_data_batch([request or LoadRequest(self.path, None, ('viridis',))],
+                                  self.defaults, self.context, **kwargs)
+
+    def assert_cube_equal(self, actual, expected):
+        for field in fields(expected):
+            with self.subTest(cube_field=field.name):
+                np.testing.assert_equal(getattr(actual, field.name), getattr(expected, field.name))
+
+    def test_batch_reads_dat_layout_once_and_retains_both_complete_interpretations(self):
+        expected = dat_io.load_dat_cube(self.path)
+        with patch.object(dat_io, '_read_dat_layout', wraps=dat_io._read_dat_layout) as reader:
+            entries, errors = self.prepare()
+        self.assertFalse(errors)
+        entry, = entries
+        self.assertEqual(entry.kind, 'dat')
+        self.assertEqual(set(entry.tables), {'xy', 'dat'})
+        self.assertEqual(entry.tables['xy'].column_names, ['Wavelength(nm)', '2', '-1'])
+        np.testing.assert_equal(entry.tables['xy'].data, [[600, 20, 10], [500, 40, 30]])
+        np.testing.assert_equal(entry.tables['dat'].data,
+                                [[1240 / 600, 10, 20], [1240 / 500, 30, 40]])
+        self.assert_cube_equal(entry.session.base_cube, expected)
+        self.assertEqual(entry.session.loaded_fingerprint, source_fingerprint(self.path))
+        self.assertEqual(reader.call_count, 1)
+
+    def test_valid_xy_tables_keep_original_order_and_do_not_retry_failed_dat_parse(self):
+        for source, expected, names in (
+                ('3 10 20\n1 30 40\n', [[3, 10, 20], [1, 30, 40]],
+                 ['Column 1', 'Column 2', 'Column 3']),
+                ('"Signal","X"\n"10","2"\n"20","1"\n', [[10, 2], [20, 1]], ['Signal', 'X']),
+                ('X,Y\n3,10\n1,NA\n', [[3, 10], [1, np.nan]], ['X', 'Y'])):
+            with self.subTest(source=source):
+                self.path.write_text(source)
+                with patch.object(dat_io, '_read_dat_layout', wraps=dat_io._read_dat_layout) as reader:
+                    entries, errors = self.prepare()
+                self.assertFalse(errors)
+                entry, = entries
+                self.assertEqual(entry.kind, 'xy')
+                np.testing.assert_equal(entry.table.data, expected)
+                self.assertEqual(entry.table.column_names, names)
+                if source.startswith('"'):
+                    self.assertEqual(set(entry.tables), {'xy'})
+                    self.assertIn('No numeric matrix rows', entry.option_errors['dat'])
+                self.assertEqual(reader.call_count, 1)
+
+    def test_source_change_after_first_layout_read_rejects_reused_layout(self):
+        original = dat_io._read_dat_layout
+        def changed(path):
+            layout = original(path)
+            with path.open('a') as stream:
+                stream.write('400,50,60\n')
+            return layout
+        with patch.object(dat_io, '_read_dat_layout', side_effect=changed) as reader:
+            entries, errors = self.prepare()
+        self.assertFalse(entries)
+        self.assertEqual([error.path for error in errors], [self.path])
+        self.assertIn('Source content changed while preparing', errors[0].reason)
+        self.assertEqual(reader.call_count, 1)
+
+    def test_saved_axis_is_applied_to_raw_layout_and_recall_controls_remain_effective(self):
+        saved_cube = dat_io.load_dat_cube(self.path, x_axis_override='pixel')
+        recipe = ViewState().plot_recipe(saved_cube, ProcessingState())
+        PlotStateStore().save(self.path, source_fingerprint(self.path), recipe)
+        for recall, colormaps, expected_override in (
+                (True, ('viridis',), 'pixel'), (False, ('viridis',), 'mev'),
+                (True, ('magma',), 'mev')):
+            with self.subTest(recall=recall, colormaps=colormaps):
+                request = LoadRequest(self.path, 'mev', colormaps, recall=recall)
+                expected = dat_io.load_dat_cube(self.path, x_axis_override=expected_override)
+                with patch.object(dat_io, '_read_dat_layout', wraps=dat_io._read_dat_layout) as reader:
+                    entries, errors = self.prepare(request)
+                self.assertFalse(errors)
+                entry, = entries
+                self.assertEqual(entry.kind, 'dat')
+                self.assert_cube_equal(entry.session.base_cube, expected)
+                np.testing.assert_equal(entry.tables['xy'].data, [[600, 20, 10], [500, 40, 30]])
+                if colormaps == ('magma',):
+                    self.assertIn('colormap is unavailable', entry.session.initialization_notice)
+                self.assertEqual(reader.call_count, 1)
+
+    def test_cancelled_preparation_propagates_and_missing_invalid_errors_stay_ordered(self):
+        self.context._cancelled.set()
+        with self.assertRaises(CancelledError):
+            self.prepare()
+        self.context._cancelled.clear()
+        original = dat_io._read_dat_layout
+        def cancelled(path):
+            layout = original(path)
+            self.context._cancelled.set()
+            return layout
+        with patch.object(dat_io, '_read_dat_layout', side_effect=cancelled):
+            with self.assertRaises(CancelledError):
+                self.prepare()
+        self.context._cancelled.clear()
+        invalid, missing = self.folder / 'invalid.csv', self.folder / 'missing.dat'
+        invalid.write_text('no numeric rows')
+        entries, errors = prepare_data_batch(
+            [LoadRequest(path, None, ('viridis',)) for path in (missing, self.path, invalid)],
+            self.defaults, self.context)
+        self.assertEqual([entry.path for entry in entries], [self.path])
+        self.assertEqual([error.path for error in errors], [missing, invalid])
 
 
 class UnifiedImportGuards(unittest.TestCase):

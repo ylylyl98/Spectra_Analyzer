@@ -230,13 +230,13 @@ class BackgroundIOTests(unittest.TestCase):
         self.window._on_generate_heatmap()
         wait_until(lambda: not self.window._background_jobs.busy)
         outgoing = self.window.current_cube
-        original = background_jobs.load_dat_cube
+        original = background_jobs._cube_from_dat_layout
         started, release = threading.Event(), threading.Event()
         def blocked(*args, **kwargs):
             started.set()
             release.wait(5)
             return original(*args, **kwargs)
-        with patch.object(background_jobs, "load_dat_cube", blocked):
+        with patch.object(background_jobs, "_cube_from_dat_layout", blocked):
             self.window._import_data_files([other])
             self.assertTrue(started.wait(1))
             self.assertTrue(self.window._dat_import_pending)

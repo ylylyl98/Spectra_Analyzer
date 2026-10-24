@@ -517,7 +517,7 @@ def _layout(figure, ax, snapshot, presentation, bars):
     width, height = presentation.width_in, presentation.height_in
     if min(width, height) < .8:
         raise ValueError('Page layout is too small for heatmap and labels.')
-    figure.canvas.draw()
+    figure.draw_without_rendering()
     renderer = figure.canvas.get_renderer()
     _align_heatmap_corner_tick_labels(ax, renderer)
     box, tight = ax.get_window_extent(renderer), ax.get_tightbbox(renderer)
@@ -705,7 +705,7 @@ def _fit_default_tick_density(figure, ax, presentation):
             continue
         for count in (6, 5, 4, 3, 2, 1):
             coordinate.set_major_locator(MaxNLocator(nbins=count, min_n_ticks=2))
-            figure.canvas.draw()
+            figure.draw_without_rendering()
             renderer = figure.canvas.get_renderer()
             boxes = [tick.label1.get_window_extent(renderer) for tick in coordinate._update_ticks()
                      if tick.label1.get_visible() and tick.label1.get_text()]
@@ -753,7 +753,7 @@ def _replace_colorbar_gradients(root, bars, figure_size):
 
 
 def _audit_layout(figure):
-    figure.canvas.draw()
+    figure.draw_without_rendering()
     renderer = figure.canvas.get_renderer()
     page = figure.bbox
     # Ignore intentionally clipped data labels; require all page/axis/header text to fit.

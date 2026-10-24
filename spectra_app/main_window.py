@@ -5143,32 +5143,64 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 raise ValueError('Select at least one Gate column for the Heatmap.')
             self._finish_current_document()
             session = self.workspace.datasets[sheet.dataset_id]
-            self.activate_dataset(session.dataset_id)
+            # Capture the outgoing controls before changing even a same-DAT
+            # graph alias. The incoming activation can then project its final
+            # source and view once, using the normal owner/job lifecycle.
+            self._finish_graph_editors()
+            notice = self._save_current_plot_state()
+            previous_dataset_id = self.workspace.active_dataset_id
+            previous_graph_id = session.active_graph_id
             # A repeated command opens its exact source scope; existing graph visuals are retained.
             graph = next((graph for graph in session.graphs.values()
                           if graph.source_mode == sheet.mode and graph.gate_indices == gates), None)
-            if graph is None:
-                base_name = f'{sheet.name} Heatmap'
-                name, count = base_name, 2
-                while any(graph.name == name for graph in session.graphs.values()):
-                    name, count = f'{base_name} {count}', count + 1
-                graph = session.create_graph(name)
-                graph.source_mode, graph.gate_indices = sheet.mode, gates
-                cube = graph_cube(session)
-                view = graph.view
-                view.x_limits = (float(np.min(cube.energy)), float(np.max(cube.energy)))
-                lo, hi = float(np.min(cube.gate)), float(np.max(cube.gate))
-                if lo == hi:
-                    lo, hi = lo - .5, hi + .5
-                view.y_limits = (lo, hi)
-                for field, value in zip(('xmin', 'xmax', 'ymin', 'ymax'), (*view.x_limits, *view.y_limits)):
-                    view.bounds[field], view.locks[field] = value, False
-                if view.signal_title_auto:
-                    view.annotations['signal_title'] = graph_signal_label(session)
-                refresh_graph_colors(graph, cube, unlock=True)
-            graph.published = True
-            session.activate_graph(graph.graph_id)
-            self._project_selected_graph(session)
+            created = graph is None
+            published = graph.published if graph is not None else False
+            try:
+                if created:
+                    base_name = f'{sheet.name} Heatmap'
+                    name, count = base_name, 2
+                    while any(graph.name == name for graph in session.graphs.values()):
+                        name, count = f'{base_name} {count}', count + 1
+                    graph = session.create_graph(name)
+                    graph.source_mode, graph.gate_indices = sheet.mode, gates
+                    cube = graph_cube(session)
+                    view = graph.view
+                    view.x_limits = (float(np.min(cube.energy)), float(np.max(cube.energy)))
+                    lo, hi = float(np.min(cube.gate)), float(np.max(cube.gate))
+                    if lo == hi:
+                        lo, hi = lo - .5, hi + .5
+                    view.y_limits = (lo, hi)
+                    for field, value in zip(('xmin', 'xmax', 'ymin', 'ymax'), (*view.x_limits, *view.y_limits)):
+                        view.bounds[field], view.locks[field] = value, False
+                    if view.signal_title_auto:
+                        view.annotations['signal_title'] = graph_signal_label(session)
+                    refresh_graph_colors(graph, cube, unlock=True)
+                graph.published = True
+                session.activate_graph(graph.graph_id)
+                self.activate_dataset(session.dataset_id, capture_outgoing=False)
+            except Exception:
+                session.activate_graph(previous_graph_id)
+                if graph is not None:
+                    graph.published = published
+                    if created:
+                        del session.graphs[graph.graph_id]
+                if self.workspace.active_dataset_id == session.dataset_id:
+                    self._activate_dataset(previous_dataset_id, capture_outgoing=False)
+                if created and graph is not None:
+                    key = (session.dataset_id, graph.graph_id)
+                    self.graph_documents.discard(key)
+                    self._graph_revisions.pop(key, None)
+                raise
+            if graph.analysis is not None:
+                self._project_selected_graph(session)
+                if notice:
+                    self.statusBar().showMessage(self.statusBar().currentMessage() + ' — ' + notice)
+            else:
+                self._refresh_document_titles()
+                incoming_notice = self._save_current_plot_state()
+                self._refresh_project_modified()
+                self.statusBar().showMessage(f'Active: {session.source_path.name} — {graph.name}'
+                    + (f' — {notice}' if notice else '') + (f' — {incoming_notice}' if incoming_notice else ''))
             self._select_graph_page(session, show=True)
             self.plot_tabs.setCurrentWidget(self.graph_documents)
             self._on_plot_tab_changed(self.plot_tabs.currentIndex())

@@ -1,15 +1,18 @@
 """Observable contracts of the detached formal page and its final SVG bytes."""
 import importlib
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import numpy as np
+from matplotlib.figure import Figure
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
@@ -46,6 +49,32 @@ class HybridSvgTests(unittest.TestCase):
                        signal_label='d²(ΔR/R)/dE² (a. u.)', color_limits=(-2., 4.), cmap='RdBu_r')
         options.update(kwargs)
         return records.HeatmapSnapshot(**options)
+
+    def test_measurement_skips_agg_paint_without_changing_complete_svg_or_geometry(self):
+        snapshot = self.snapshot()
+        presentation = records.PlotPresentation()
+        # Reproduce the previous measurement path as an exact output reference.
+        with patch.object(Figure, 'draw_without_rendering', lambda figure: figure.canvas.draw()):
+            reference = export.render_hybrid_svg(snapshot, presentation)
+        with ExitStack() as stack:
+            for name in ('_layout', '_fit_default_tick_density', '_audit_layout'):
+                measure = getattr(export, name)
+                def without_canvas_paint(figure, *args, _measure=measure):
+                    renderer = figure.canvas.get_renderer()
+                    with ExitStack() as primitives:
+                        for primitive in ('draw_quad_mesh', 'draw_path', 'draw_text'):
+                            primitives.enter_context(patch.object(renderer, primitive,
+                                side_effect=AssertionError('Measurement rasterized the page')))
+                        return _measure(figure, *args)
+                stack.enter_context(patch.object(export, name, side_effect=without_canvas_paint))
+            page = export.render_hybrid_svg(snapshot, presentation)
+        self.assertEqual(page.svg_bytes, reference.svg_bytes)
+        self.assertEqual(page.axes_bounds, reference.axes_bounds)
+        self.assertEqual(page.colorbar_bounds, reference.colorbar_bounds)
+        self.assertEqual(page.plot_size_in, reference.plot_size_in)
+        self.assertEqual(page.figure_size_in, reference.figure_size_in)
+        self.assertEqual(page.object_bounds, reference.object_bounds)
+        self.assertEqual(page.valid_count, snapshot.z.size)
 
     def test_snapshot_copies_arrays_and_preserves_source_mask(self):
         source = np.ma.array([[1., 2.], [3., 4.]], mask=[[False, True], [False, False]])

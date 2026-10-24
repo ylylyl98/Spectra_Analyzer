@@ -12,6 +12,7 @@ from unittest.mock import patch
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from spectra_app.app_version import APP_VERSION
 from spectra_app.main_window import MainWindow
 from spectra_app.update_ui import UpdateController
 from spectra_app.updates import ReleaseClient, VerifiedInstaller
@@ -71,7 +72,7 @@ class UpdateUiTests(unittest.TestCase):
         action.trigger()
         controller = self.window._update_controller
         self.wait(lambda: not controller.busy)
-        self.assertIn('0.1.0', controller.dialog.current_version.text())
+        self.assertIn(APP_VERSION, controller.dialog.current_version.text())
         self.assertIn('up to date', controller.dialog.status.text())
         self.assertTrue(controller.dialog.isVisible())
 

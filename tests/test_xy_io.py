@@ -4,10 +4,38 @@ import unittest
 
 import numpy as np
 
-from spectra_app.xy_io import XYParseError, load_xy, parse_xy
+from spectra_app.xy_io import XYParseError, _strip_comment, load_xy, parse_xy
 
 
 class XYIOTests(unittest.TestCase):
+    def test_comment_free_lines_do_not_scan_characters(self):
+        class CountedLine(str):
+            indexed_reads = 0
+
+            def __getitem__(self, key):
+                self.indexed_reads += 1
+                return super().__getitem__(key)
+
+        for source in ('', '1.25\t' * 1024, '  波长\u2003强度  ',
+                       '"Count ""adjusted"", signal",X'):
+            with self.subTest(source=source[:40]):
+                line = CountedLine(source)
+                self.assertIs(_strip_comment(line), line)
+                self.assertEqual(line.indexed_reads, 0)
+
+    def test_comment_free_quoted_and_unicode_tables_keep_values_and_labels(self):
+        for source, names in (
+                ('\ufeff"计数 ""校准"", 信号", λ / nm \n"10","2"\n20,NA\n',
+                 ['计数 "校准", 信号', 'λ / nm']),
+                ('"Count ""adjusted"""\t波长\n10\t2\n20\t\n',
+                 ['Count "adjusted"', '波长']),
+                ('  强度\u2003波长  \n 10\u20032 \n20\u2003NA\n', ['强度', '波长'])):
+            with self.subTest(source=source):
+                result = parse_xy(source)
+                self.assertEqual(result.column_names, names)
+                self.assertTrue(result.has_header)
+                np.testing.assert_equal(result.data, [[10, 2], [20, np.nan]])
+
     def test_headers_comments_missing_values_and_order(self):
         result = parse_xy('# measurement\nSignal,X,Other\n10,2,\n20,1,3e-2 # note\n')
         self.assertEqual(result.column_names, ['Signal', 'X', 'Other'])

@@ -8,7 +8,7 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from .dat_io import load_dat_cube, list_dat_files
+from .dat_io import _cube_from_dat_layout, load_dat_cube, list_dat_files
 from .plot_state import PlotStateStore, source_fingerprint
 
 
@@ -143,7 +143,7 @@ class LoadRequest:
     recall: bool = True
 
 
-def prepare_dat(request: LoadRequest, context: JobContext):
+def prepare_dat(request: LoadRequest, context: JobContext, *, _layout=None):
     context.report(f"Reading {request.path.name}…")
     fingerprint = source_fingerprint(request.path)
     context.check_cancelled()
@@ -155,7 +155,8 @@ def prepare_dat(request: LoadRequest, context: JobContext):
         saved_plot = None
         notice = "Saved plot settings ignored: the colormap is unavailable."
     override = saved_plot["axis_override"] if saved_plot else request.override
-    cube = load_dat_cube(request.path, x_axis_override=override)
+    cube = (load_dat_cube(request.path, x_axis_override=override) if _layout is None else
+            _cube_from_dat_layout(request.path, _layout, x_axis_override=override))
     context.check_cancelled()
     if source_fingerprint(request.path) != fingerprint:
         raise ValueError("DAT content changed while loading. Please load it again.")

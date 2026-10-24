@@ -426,12 +426,34 @@ class SheetPage(QWidget):
         self.mapping_controls.setVisible(checked)
         self.mapping_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
 
+    def _selected_whole_columns(self):
+        rows = self.model.rowCount()
+        if not rows:
+            return []
+        intervals = {}
+        # All valid Sheet cells are selectable, so range coverage is sufficient.
+        # Qt's selectedColumns() instead queries flags for every selected cell.
+        for span in self.table.selectionModel().selection():
+            for column in range(span.left(), span.right() + 1):
+                intervals.setdefault(column, []).append((span.top(), span.bottom()))
+        columns = []
+        for column, ranges in sorted(intervals.items()):
+            covered = 0
+            for top, bottom in sorted(ranges):
+                if top > covered:
+                    break
+                covered = max(covered, bottom + 1)
+                if covered >= rows:
+                    columns.append(column)
+                    break
+        return columns
+
     def _columns_chosen(self, *_):
         if self._syncing:
             return
         sheet = self.workspace.sheets[self.sheet_id]
-        ys = sorted(index.column() for index in self.table.selectionModel().selectedColumns()
-                    if index.column() != sheet.x_column and index.column() in self.numeric_columns)
+        ys = [column for column in self._selected_whole_columns()
+              if column != sheet.x_column and column in self.numeric_columns]
         if not ys:
             return  # X-only or cleared selection retains the Sheet's intended Ys.
         self._syncing = True
@@ -447,7 +469,7 @@ class SheetPage(QWidget):
         column = header.logicalIndexAt(point)
         if column < 0:
             return
-        selected = {index.column() for index in self.table.selectionModel().selectedColumns()}
+        selected = set(self._selected_whole_columns())
         if column not in selected:
             self.table.selectColumn(column)
             self._columns_chosen()

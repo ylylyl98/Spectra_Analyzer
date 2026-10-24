@@ -8,10 +8,12 @@ from unittest.mock import patch
 import numpy as np
 from PySide6.QtCore import QEvent, QMimeData, QPointF, Qt, QUrl
 from PySide6.QtGui import QDropEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem
 
 from spectra_app.background_jobs import JobContext, LoadRequest
 from spectra_app.data_import import prepare_data_batch
+from spectra_app.dataset_state import graph_cube
 from spectra_app.main_window import MainWindow
 from spectra_app.workbook_state import (create_comparison, ensure_dataset_sheet,
     set_sheet_mapping, sheet_values)
@@ -120,6 +122,51 @@ class AutomaticImportTests(unittest.TestCase):
         self.assertEqual(w._sheet_owner(identity).workbook_id, owner)
         np.testing.assert_equal(sheet_values(w.workspace, identity), values)
         self.assertFalse(w.workspace.comparisons)
+
+    def test_spaced_dat_headers_auto_import_and_select_all_heatmaps_keep_every_gate(self):
+        gates = np.linspace(6, -6, 301)
+        energy = np.array([1.8, 1.7, 1.6])
+        paths, expected = [], {}
+        for number in range(2):
+            values = np.arange(903).reshape(3, 301) + number * 1000
+            text = 'Photon energy(eV)\t' + '\t'.join(map(str, gates)) + '\n'
+            text += '\n'.join('\t'.join(map(str, row)) for row in np.column_stack((energy, values)))
+            path = self.file(f'spaced-{number}.dat', text)
+            paths.append(path)
+            expected[path] = values[::-1, ::-1].T
+        ordinary = self.file('ordinary.dat', 'x signal temperature\n3 10 20\n1 30 40\n')
+        w = self.window
+        with patch.object(XYImportDialog, 'exec', side_effect=AssertionError('unexpected import review')):
+            w._import_data_files([*paths, ordinary])
+            wait_jobs(w)
+        w.show()
+        for path in paths:
+            with self.subTest(path=path.name):
+                sheet = next(s for s in w.workspace.sheets.values() if s.source_path == path)
+                self.assertEqual(sheet.kind, 'dat')
+                session = w.workspace.datasets[sheet.dataset_id]
+                self.assertEqual(session.base_cube.x_detection_source, 'header label')
+                self.assertEqual(session.base_cube.x_detection_note,
+                                 "Detected from x-axis header 'Photon energy(eV)'.")
+                page = w.open_workbook(w._sheet_owner(sheet.sheet_id).workbook_id,
+                                       sheet.sheet_id).tabs.currentWidget()
+                set_sheet_mapping(w.workspace, sheet.sheet_id, 0, [1])
+                page.refresh()
+                page.table.setFocus()
+                QTest.keyClick(page.table, Qt.Key_A, Qt.ControlModifier)
+                APP.processEvents()
+                self.assertEqual(sheet.y_columns, list(range(1, 302)))
+                self.assertTrue(w.workbook_commands.heatmap_action.isEnabled())
+                w.workbook_commands.heatmap_action.trigger()
+                self.assertEqual(session.active_graph.gate_indices, list(range(301)))
+                cube = graph_cube(session)
+                np.testing.assert_allclose(cube.gate, gates[::-1])
+                np.testing.assert_array_equal(cube.energy, energy[::-1])
+                np.testing.assert_array_equal(cube.z, expected[path])
+        sheet = next(s for s in w.workspace.sheets.values() if s.source_path == ordinary)
+        self.assertEqual(sheet.kind, 'xy')
+        np.testing.assert_array_equal(sheet.data, [[3, 10, 20], [1, 30, 40]])
+        self.assertFalse(self.errors)
 
     def test_optional_shared_action_reviews_type_mapping_and_cancel_without_publication(self):
         w = self.window

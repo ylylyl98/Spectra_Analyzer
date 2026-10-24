@@ -3,6 +3,7 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from dataclasses import replace
+from copy import deepcopy
 from types import SimpleNamespace
 import threading
 import unittest
@@ -16,6 +17,8 @@ from PySide6.QtWidgets import QApplication
 
 from spectra_app import main_window, svg_export
 from spectra_app.main_window import MainWindow
+from spectra_app.plot_snapshot import snapshot_dataset
+from spectra_app.workbook_state import ensure_dataset_sheet
 from tests.settings_helpers import isolate_settings
 from tests.background_helpers import wait_jobs
 
@@ -42,6 +45,162 @@ class RenderEventPerformanceTests(unittest.TestCase):
     def settle(self):
         for _ in range(8):
             APP.processEvents()
+
+    def test_sheet_heatmap_projects_final_source_once_and_reuses_its_view(self):
+        w = self.w
+        session = w.workspace.active
+        raw_buffer = session.base_cube.z
+        raw = raw_buffer.copy()
+        w._replace_current_data(replace(session.current_cube, z=raw * 3),
+                                mode='energy_second_derivative', smooth=False, window_length=5)
+        processed = session.current_cube.z.copy()
+        original = ensure_dataset_sheet(w.workspace, session.dataset_id, 'original')
+        processed_sheet = ensure_dataset_sheet(w.workspace, session.dataset_id, 'processed')
+        retained = None
+        for sheet in (original, processed_sheet, original):
+            sheet.y_columns = [1, 3]
+            book = w._sheet_owner(sheet.sheet_id)
+            w.open_workbook(book.workbook_id, sheet.sheet_id)
+            projected = []
+            plot = w._plot_cube
+            def observe():
+                projected.append((session.active_graph_id, session.active_graph.source_mode,
+                                  deepcopy(session.active_graph.gate_indices)))
+                return plot()
+            with patch.object(w, '_plot_cube', side_effect=observe):
+                w.workbook_commands.heatmap_action.trigger()
+            graph = session.active_graph
+            self.assertEqual(projected, [(graph.graph_id, sheet.mode, [0, 2])])
+            self.assertEqual(w.graph_documents._active_key, (session.dataset_id, graph.graph_id))
+            expected = raw if sheet.mode == 'raw' else processed
+            np.testing.assert_array_equal(snapshot_dataset(session).z, expected[[0, 2]])
+            np.testing.assert_array_equal(w._heat_mesh.get_array(), expected[[0, 2]])
+            if sheet is original:
+                if retained is None:
+                    w.xmin_spin.setValue(1.25)
+                    w.plot_title_edit.setText('Retained raw graph')
+                    w._finish_graph_editors()
+                    retained = deepcopy(graph)
+                else:
+                    self.assertEqual(graph, retained)
+                    self.assertEqual(w._heat_ax.get_xlim()[0], 1.25)
+                    self.assertEqual(w._heat_ax.get_title(), 'Retained raw graph')
+            w._render_plot_page()
+            self.assertEqual(w.plot_page.rendered_page.owner_token, w._plot_owner_token())
+            self.assertEqual(w.plot_page.expected_owner, w._plot_owner_token())
+            self.assertTrue(w.export_png_btn.isEnabled())
+        self.assertIs(session.base_cube.z, raw_buffer)
+        np.testing.assert_array_equal(session.base_cube.z, raw)
+        np.testing.assert_array_equal(session.current_cube.z, processed)
+
+    def test_cross_dataset_heatmap_commits_outgoing_draft_before_choosing_target(self):
+        w = self.w
+        outgoing = w.workspace.active
+        target_path = self.folder / 'target.dat'
+        target_path.write_text('Energy(eV) 10 20 30\n' + '\n'.join(
+            f'{3+i/100} {i+2} {i+3} {i+4}' for i in range(100)))
+        w._load_dat_file_direct(target_path)
+        target = w.workspace.active
+        sheet = ensure_dataset_sheet(w.workspace, target.dataset_id)
+        sheet.y_columns = [1, 3]
+        w.open_graph_document(outgoing.dataset_id)
+        w.plot_title_edit.setText('Outgoing draft')
+        projected = []
+        plot = w._plot_cube
+        def observe():
+            projected.append((w.workspace.active_dataset_id, w.workspace.active.active_graph_id))
+            return plot()
+        with patch.object(w, '_plot_cube', side_effect=observe):
+            graph = w._quick_sheet_plot(sheet.sheet_id, 'heatmap')
+        self.assertEqual(projected, [(target.dataset_id, graph.graph_id)])
+        self.assertEqual(outgoing.view.annotations['plot_title'], 'Outgoing draft')
+        self.assertEqual(target.view.annotations['plot_title'], '')
+        np.testing.assert_allclose(w._heat_ax.get_xlim(), [3., 3.99])
+        np.testing.assert_allclose(w._heat_ax.get_ylim(), [10., 30.])
+        self.assertEqual(w.graph_documents._active_key, (target.dataset_id, graph.graph_id))
+        w._render_plot_page()
+        self.assertEqual(w.plot_page.rendered_page.owner_token, w._plot_owner_token())
+
+    def test_heatmap_incoming_failure_restores_existing_graph_and_live_owner(self):
+        w = self.w
+        session = w.workspace.active
+        sheet = ensure_dataset_sheet(w.workspace, session.dataset_id)
+        sheet.y_columns = [1, 3]
+        previous = deepcopy(session.active_graph)
+        key = w._document_key()
+        limits = w._heat_ax.get_xlim(), w._heat_ax.get_ylim()
+        restore = w.restore_dataset_controls
+        errors = []
+        w._show_error = errors.append
+        def fail_incoming(owner):
+            if owner.active_graph_id != key[1]:
+                raise ValueError('Cannot restore incoming graph')
+            return restore(owner)
+        with patch.object(w, 'restore_dataset_controls', side_effect=fail_incoming):
+            self.assertIsNone(w._quick_sheet_plot(sheet.sheet_id, 'heatmap'))
+        self.assertEqual(errors, ['Cannot restore incoming graph'])
+        self.assertEqual(w._document_key(), key)
+        self.assertEqual(session.active_graph, previous)
+        self.assertEqual(list(session.graphs), [key[1]])
+        self.assertEqual(w.graph_documents._active_key, key)
+        self.assertEqual((w._heat_ax.get_xlim(), w._heat_ax.get_ylim()), limits)
+        w._render_plot_page()
+        self.assertEqual(w.plot_page.rendered_page.owner_token, w._plot_owner_token())
+
+    def test_invalid_outgoing_heatmap_editor_does_not_create_or_select_graph(self):
+        w = self.w
+        session = w.workspace.active
+        sheet = ensure_dataset_sheet(w.workspace, session.dataset_id)
+        sheet.y_columns = [1, 3]
+        key = w._document_key()
+        graphs = deepcopy(session.graphs)
+        errors = []
+        w._show_error = errors.append
+        w.xmin_spin.lineEdit().setText('-')
+        with patch.object(w, '_plot_cube', wraps=w._plot_cube) as plot:
+            self.assertIsNone(w._quick_sheet_plot(sheet.sheet_id, 'heatmap'))
+        self.assertEqual(plot.call_count, 0)
+        self.assertTrue(errors)
+        self.assertEqual(w._document_key(), key)
+        self.assertEqual(session.graphs, graphs)
+        w.xmin_spin.lineEdit().setText(str(w.xmin_spin.value()))
+
+    def test_cross_dataset_heatmap_projection_failure_keeps_outgoing_document(self):
+        w = self.w
+        outgoing = w.workspace.active
+        target_path = self.folder / 'failed-target.dat'
+        target_path.write_text('Energy(eV) 10 20 30\n' + '\n'.join(
+            f'{3+i/100} {i+2} {i+3} {i+4}' for i in range(100)))
+        w._load_dat_file_direct(target_path)
+        target = w.workspace.active
+        target_graphs = deepcopy(target.graphs)
+        target_graph_id = target.active_graph_id
+        sheet = ensure_dataset_sheet(w.workspace, target.dataset_id)
+        sheet.y_columns = [1, 3]
+        previous_page = w.open_graph_document(outgoing.dataset_id)
+        w.cmap_combo.setCurrentText('magma')
+        key = w._document_key()
+        restore = w.restore_dataset_controls
+        errors = []
+        w._show_error = errors.append
+        def fail_incoming(owner):
+            if owner is target:
+                raise ValueError('Cannot restore target DAT')
+            return restore(owner)
+        with patch.object(w, 'restore_dataset_controls', side_effect=fail_incoming):
+            self.assertIsNone(w._quick_sheet_plot(sheet.sheet_id, 'heatmap'))
+        self.assertEqual(errors, ['Cannot restore target DAT'])
+        self.assertIs(w.workspace.active, outgoing)
+        self.assertEqual(w._document_key(), key)
+        self.assertIs(w.plot_page, previous_page)
+        self.assertIs(w.graph_documents.activeSubWindow().widget(), previous_page)
+        self.assertEqual(w.cmap_combo.currentText(), 'magma')
+        self.assertEqual(target.active_graph_id, target_graph_id)
+        self.assertEqual(target.graphs, target_graphs)
+        self.assertFalse(any(page_key[0] == target.dataset_id and page_key[1] not in target_graphs
+                             for page_key in w.graph_documents._pages))
+        w._render_plot_page()
+        self.assertEqual(w.plot_page.rendered_page.owner_token, w._plot_owner_token())
 
     def test_analysis_edit_retires_bytes_and_defers_formal_render_until_plot_entry(self):
         w = self.w

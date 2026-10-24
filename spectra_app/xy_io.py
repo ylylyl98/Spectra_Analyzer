@@ -31,6 +31,8 @@ def _numeric(token):
 
 def _strip_comment(line):
     """Keep hashes inside CSV/TSV quoted fields, including doubled quotes."""
+    if '#' not in line:
+        return line
     quoted, field_start, index = False, True, 0
     while index < len(line):
         character = line[index]

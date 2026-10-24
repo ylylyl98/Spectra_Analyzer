@@ -37,6 +37,7 @@ _AXIS_LABELS = {
 }
 
 _SEP_RE = re.compile(r"[\t, ]+")
+_HEADER_SEP_RE = re.compile(r"[\t,]+")
 _TOKEN_SEP_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -278,6 +279,8 @@ def _read_dat_layout(path: str | Path):
         if all_numeric:
             numeric_lines.append(line)
             continue
+        if "\t" in line or "," in line:
+            tok = [field.strip() for field in _HEADER_SEP_RE.split(line.strip()) if field.strip()]
         numeric_tail = sum(1 for t in tok[1:] if _is_number(t))
         if header_tokens is None and (not _is_number(tok[0])) and numeric_tail >= max(1, len(tok) - 2):
             header_tokens = tok
@@ -342,7 +345,13 @@ def matrix_layout_reason(path: str | Path) -> str:
 
 def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> DataCube:
     p = Path(path)
-    arr, header_gates, x_label_hint, metadata_lines, numeric_header_layout, _ = _read_dat_layout(p)
+    return _cube_from_dat_layout(p, _read_dat_layout(p), x_axis_override=x_axis_override)
+
+
+def _cube_from_dat_layout(path: str | Path, layout, *, x_axis_override: str | None = None) -> DataCube:
+    """Interpret one operation's raw layout after the effective override is known."""
+    p = Path(path)
+    arr, header_gates, x_label_hint, metadata_lines, numeric_header_layout, _ = layout
     if numeric_header_layout:
         x_original = arr[1:, 0]
         vals = arr[1:, 1:]
