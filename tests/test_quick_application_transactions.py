@@ -314,7 +314,7 @@ class ActualTransactions(unittest.TestCase):
 
     def case_hidden_invalid_editor(self):
         from unittest.mock import patch
-        from PySide6.QtCore import Qt
+        from PySide6.QtCore import QObject, Qt
         from PySide6.QtTest import QTest
         from spectra_app.common_prompts import PromptAction
         from tests.quick_application_helpers import item, pump, wait_until
@@ -325,9 +325,12 @@ class ActualTransactions(unittest.TestCase):
         path = w.save_project(self.folder / 'valid.spectra')
         prior = path.read_bytes()
         w.request_task(2)
-        pump()
+        # The View loader and its focus timer settle on separate event-loop turns.
+        wait_until(lambda: (properties := self.host.window.findChild(QObject, 'sharedDatProperties'))
+                   is not None and properties.isVisible())
         w.dat_properties.focusRequested.emit('ranges', 'xmin')
-        pump(100)
+        wait_until(lambda: self.host.window.activeFocusItem() is not None
+                   and self.host.window.activeFocusItem().objectName() == 'xmin')
         editor = self.host.window.activeFocusItem()
         self.assertEqual(editor.objectName(), 'xmin')
         QTest.keyClick(self.host.window, Qt.Key_A, Qt.ControlModifier)
