@@ -1,0 +1,87 @@
+name: Windows full suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-suite-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shard:
+    name: Windows shard ${{ matrix.shard }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14.0'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: tools/windows/requirements-standalone.txt
+      - name: Install pinned runtime and test dependencies
+        run: python -m pip install -r tools/windows/requirements-standalone.txt pytest==9.1.1
+      - name: Run complete assigned shard in fresh processes
+        timeout-minutes: 35
+        run: >-
+          python -B tools/testing/ci_suite.py shard
+          --commit "${{ github.sha }}" --count 8 --index ${{ matrix.shard }}
+          --output "${{ runner.temp }}/suite/shard-${{ matrix.shard }}"
+      - name: Upload logs and case/process evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/suite/shard-${{ matrix.shard }}
+          if-no-files-found: error
+          retention-days: 14
+
+  full-suite-gate:
+    name: Windows full-suite gate
+    if: always()
+    needs: shard
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14.0'
+          architecture: x64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: windows-shard-*
+          path: ${{ runner.temp }}/evidence
+      - name: Verify full-suite coverage and every raw process report
+        run: >-
+          python -B tools/testing/ci_suite.py gate
+          --commit "${{ github.sha }}" --count 8
+          --evidence "${{ runner.temp }}/evidence"
+          --output "${{ runner.temp }}/gate"
+      - name: Require all shard jobs to pass
+        env:
+          SHARD_RESULT: ${{ needs.shard.result }}
+        run: if ($env:SHARD_RESULT -ne 'success') { throw "One or more shard jobs did not pass" }
+      - name: Upload full-suite verdict
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-full-suite-verdict
+          path: ${{ runner.temp }}/gate
+          if-no-files-found: error
+          retention-days: 14
