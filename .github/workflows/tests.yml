@@ -34,7 +34,27 @@ jobs:
           cache-dependency-path: tools/windows/requirements-standalone.txt
       - name: Install pinned runtime and test dependencies
         run: python -m pip install -r tools/windows/requirements-standalone.txt pytest==9.1.1
+      - name: Prepare canonical temporary paths and Windows PowerShell modules
+        shell: powershell
+        run: |
+          $privateTemp = Join-Path $env:RUNNER_TEMP 'spectra-test-temp'
+          New-Item -ItemType Directory -Path $privateTemp -Force | Out-Null
+          $canonicalTemp = python -c "from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))" $privateTemp
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the private temporary directory' }
+          if ([IO.Path]::GetPathRoot($canonicalTemp) -ne [IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)) {
+            throw 'Temporary fixtures and the checkout must use the same drive'
+          }
+          $nativeModules = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\Modules'
+          $env:PSModulePath = $nativeModules
+          Import-Module Microsoft.PowerShell.Utility,Microsoft.PowerShell.Archive -Force
+          Get-Command Get-FileHash | Format-List Name,Source,Version
+          Get-FileHash -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.github/workflows/tests.yml') -Algorithm SHA256
+          $lines = "TMP=$canonicalTemp`nTEMP=$canonicalTemp`nPSModulePath=$nativeModules`n"
+          [IO.File]::AppendAllText($env:GITHUB_ENV, $lines, [Text.UTF8Encoding]::new($false))
+          Write-Host "Canonical private temporary directory: $canonicalTemp"
+          Write-Host "Windows PowerShell module path: $nativeModules"
       - name: Run complete assigned shard in fresh processes
+        shell: powershell
         timeout-minutes: 35
         run: >-
           python -B tools/testing/ci_suite.py shard
