@@ -7,7 +7,7 @@ from typing import Callable
 from PySide6.QtCore import Property, Signal, Slot
 from PySide6.QtGui import QImage
 
-from .analysis_canvas import AnalysisCanvasBridge
+from .analysis_canvas import AnalysisCanvasBridge, PeakMenuRequest
 
 
 @dataclass(frozen=True)
@@ -100,11 +100,16 @@ class DatCanvasController(AnalysisCanvasBridge):
     @Slot(str, str, str, result=bool)
     def choosePeakMenu(self, request_id, key, owner):
         request = self._peak_menu_request
-        if (key not in ('set_label', 'delete') or request is None or not self._peak_menu_ready
+        if (key not in ('set_label', 'delete', 'copy_svg', 'copy_png', 'settings_copy', 'settings_paste')
+                or request is None or not self._peak_menu_ready
                 or request.request_id != request_id or request.pointer.owner != owner):
             return False
         self.clear_peak_menu()
-        if not self.allowed(owner) or not self.services.validate_peak_menu(request):
+        if key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste'):
+            accepted = self._invoke_format_command(key, owner)
+            self.restorePeakMenuFocus(owner)
+            return accepted
+        if not isinstance(request, PeakMenuRequest) or not self.allowed(owner) or not self.services.validate_peak_menu(request):
             self.restorePeakMenuFocus(owner)
             return False
         self.services.continue_peak_menu(request, key)

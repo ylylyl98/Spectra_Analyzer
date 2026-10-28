@@ -306,16 +306,20 @@ class RenderEventPerformanceTests(QuickMigrationCase):
         with patch.object(main_window, 'render_hybrid_svg', wraps=main_window.render_hybrid_svg) as render, \
              patch.object(w, '_layout_live_plots', wraps=w._layout_live_plots) as layout, \
              patch.object(w.canvas, 'draw', wraps=w.canvas.draw) as draw:
-            edit_field(w, 'bar_precision', '2', commit=True)
-            self.assertIsNone(page.rendered_page)
-            self.assertIs(preview.page, old)
-            self.assertEqual(preview.svg_bytes, old.svg_bytes)
-            self.assertFalse(preview.canEdit)
-            self.assertFalse(preview.canView)
-            self.assertFalse(page.command_enabled('export_svg'))
-            self.assertFalse(page.command_enabled('export_png'))
-            self.assertEqual(render.call_count, 0)
-            sample = page.formal.state['sample'].split(' | ')
+            # Observe commit invalidation before delivering the queued render.
+            with patch.object(w, '_schedule_plot_page_render') as schedule:
+                edit_field(w, 'bar_precision', '2', commit=True)
+                self.assertIsNone(page.rendered_page)
+                self.assertIs(preview.page, old)
+                self.assertEqual(preview.svg_bytes, old.svg_bytes)
+                self.assertFalse(preview.canEdit)
+                self.assertFalse(preview.canView)
+                self.assertFalse(page.command_enabled('export_svg'))
+                self.assertFalse(page.command_enabled('export_png'))
+                self.assertEqual(render.call_count, 0)
+                sample = page.formal.state['sample'].split(' | ')
+                schedule.assert_called_once_with(delay=0)
+            w._schedule_plot_page_render(delay=0)
             QTest.qWait(450)
             self.assertEqual(render.call_count, 1)
             self.assertIsNotNone(page.rendered_page, page.status_text)

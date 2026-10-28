@@ -71,6 +71,9 @@ class CanvasFixture(QObject):
     cursorShape = Property(int, lambda self: Qt.CrossCursor.value, notify=cursorChanged)
     rubberband = Property('QVariantMap', lambda self: self.band, notify=rubberbandChanged)
     peakMenu = Property('QVariantMap', lambda self: {}, notify=peakMenuChanged)
+    formatCommands = Property('QVariantMap', lambda self: {
+        key: False for key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste')
+    }, notify=stateChanged)
 
     @Slot(int, float, float, result=bool)
     def reportViewport(self, generation, width, height):

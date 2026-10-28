@@ -7,14 +7,14 @@ from copy import deepcopy
 import unittest
 from unittest.mock import patch
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt, QPoint, QPointF, QRect
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QPoint, QPointF, QRect, QTimer
+from PySide6.QtGui import QGuiApplication, QMouseEvent
 from PySide6.QtTest import QTest
 
 from spectra_app.common_prompts import PromptAction
 from spectra_app.project_io import read_project, write_project
 from spectra_app.workbook_state import create_comparison, create_workbook
-from tests.formal_quick_helpers import edit_field, item, pump
+from tests.formal_quick_helpers import click_item, edit_field, item, pump
 from tests.quick_application_helpers import application
 
 
@@ -348,6 +348,65 @@ class GraphDocumentTests(migration.QuickMigrationCase):
         self.assertEqual(w.workspace.active_dataset_id, first_id)
         saved, = list(w._output_folder().glob('first*.svg'))
         self.assertEqual(saved.read_bytes(), first.rendered_page.svg_bytes)
+
+    def test_formal_format_menu_copies_owner_and_rejects_stale_selection(self):
+        w = self.window
+        first = self.open()
+        first_key = w._document_key()
+        w._load_dat_file_direct(self.paths[1])
+        second = self.open()
+        second_key = w._document_key()
+        w.set_plot_presentation(replace(second.presentation, width_in=4.7, aspect_locked=False))
+        w._render_plot_page()
+        w.graph_documents.tile()
+        pump()
+        content = w.graph_documents.content_item(first_key)
+        paper = item(content, 'formalPaper')
+        point = paper.mapToScene(QPointF(30, 30)).toPoint()
+        QTest.mouseClick(self.host.window, Qt.RightButton, pos=point)
+        pump(60)
+        from PySide6.QtCore import QObject
+        menu = content.findChild(QObject, 'formalFormatMenu')
+        self.assertIsNotNone(menu)
+        self.assertTrue(menu.property('visible'))
+        self.assertIs(w.plot_page, first)
+        self.assertFalse(item(content, 'formalFormatPaste').isEnabled())
+        click_item(content, 'formalFormatCopy')
+        self.assertIsNotNone(w._plot_settings_clipboard)
+        self.assertIn(str(self.paths[0]), first.formal.state['clipboard'])
+        QTest.mouseClick(self.host.window, Qt.RightButton, pos=point)
+        pump(60)
+        self.assertTrue(item(content, 'formalFormatPaste').isEnabled())
+        preview = item(content, 'formalPreview')
+        scene = preview.property('attachmentGeneration')
+        generation = menu.property('generation')
+        w.open_graph_document(*second_key)
+        before = w._plot_settings_clipboard
+        self.assertFalse(first.preview.sceneFormatCommand(scene, generation, 'settings_copy'))
+        self.addCleanup(QGuiApplication.clipboard().clear)
+        QGuiApplication.clipboard().setText('Keep the active dataset clipboard')
+        for command in ('copy_svg', 'copy_png'):
+            self.assertFalse(first.preview.sceneFormatCommand(scene, generation, command))
+        self.assertEqual(QGuiApplication.clipboard().text(), 'Keep the active dataset clipboard')
+        self.assertIs(w.plot_page, second)
+        self.assertIs(w._plot_settings_clipboard, before)
+        menu.close()
+        second_content = w.graph_documents.content_item(second_key)
+        second_paper = item(second_content, 'formalPaper')
+        point = second_paper.mapToScene(QPointF(30, 30)).toPoint()
+        QTest.mouseClick(self.host.window, Qt.RightButton, pos=point)
+        pump(60)
+        selected = []
+        def accept_options():
+            from spectra_app.plot_dialogs import ApplyFormatDialog
+            dialogs = self.host.window.findChildren(ApplyFormatDialog)
+            if dialogs:
+                selected.extend(dialogs[-1].selected_ids())
+                dialogs[-1].accept()
+        QTimer.singleShot(100, accept_options)
+        click_item(second_content, 'formalFormatPaste')
+        self.assertEqual(selected, [second_key[0]])
+        self.assertEqual(second.presentation.width_in, before.style.width_in)
 
     def test_inactive_formal_projection_keeps_active_owner_and_actual_quick_action_authorizes(self):
         w = self.window

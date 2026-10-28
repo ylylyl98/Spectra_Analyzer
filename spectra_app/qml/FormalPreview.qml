@@ -134,22 +134,81 @@ Rectangle {
                 objectName: "formalPaperPointer"
                 anchors.fill: parent
                 enabled: !root.bridge.readOnly
-                acceptedButtons: Qt.LeftButton
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
                 property int generation: -1
                 readonly property bool editingGesture: generation >= 0 && generation === root.bridge.gestureGeneration
                 preventStealing: editingGesture
                 onPressed: function(mouse) {
                     viewport.forceActiveFocus()
+                    if (mouse.button === Qt.RightButton) {
+                        formatMenu.generation = root.bridge.sceneFormatMenu(root.attachmentGeneration)
+                        mouse.accepted = true
+                        return
+                    }
                     generation = root.bridge.scenePress(root.attachmentGeneration, mouse.x, mouse.y)
                     mouse.accepted = true
                 }
                 onPositionChanged: function(mouse) {
-                    if (pressed) root.bridge.sceneMove(root.attachmentGeneration, generation, mouse.x, mouse.y)
+                    if (pressed && generation >= 0) root.bridge.sceneMove(root.attachmentGeneration, generation, mouse.x, mouse.y)
                 }
-                onReleased: function(mouse) { root.bridge.sceneRelease(root.attachmentGeneration, generation, mouse.x, mouse.y); generation = -1 }
-                onDoubleClicked: function(mouse) { mouse.accepted = root.bridge.sceneDoubleClick(root.attachmentGeneration, mouse.x, mouse.y) }
+                onReleased: function(mouse) {
+                    if (mouse.button === Qt.RightButton) {
+                        if (formatMenu.generation >= 0) {
+                            const anchor = pointer.mapToItem(root, mouse.x, mouse.y)
+                            formatMenu.popup(root, anchor.x, anchor.y)
+                        }
+                        return
+                    }
+                    root.bridge.sceneRelease(root.attachmentGeneration, generation, mouse.x, mouse.y)
+                    generation = -1
+                }
+                onDoubleClicked: function(mouse) {
+                    mouse.accepted = mouse.button !== Qt.LeftButton
+                        || root.bridge.sceneDoubleClick(root.attachmentGeneration, mouse.x, mouse.y)
+                }
                 onCanceled: { root.bridge.sceneCancel(root.attachmentGeneration); generation = -1 }
             }
+        }
+    }
+
+    Controls.Menu {
+        id: formatMenu
+        objectName: "formalFormatMenu"
+        popupType: Controls.Popup.Item
+        property int generation: -1
+        property string choice: ""
+        onClosed: {
+            const captured = generation, command = choice
+            generation = -1
+            choice = ""
+            if (command) Qt.callLater(function() {
+                root.bridge.sceneFormatCommand(root.attachmentGeneration, captured, command)
+            })
+        }
+        Controls.MenuItem {
+            objectName: "formalCopySvg"
+            text: "Copy SVG"
+            enabled: root.bridge.formatCommands.copy_svg === true
+            onTriggered: { formatMenu.choice = "copy_svg"; formatMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "formalCopyPng"
+            text: "Copy PNG"
+            enabled: root.bridge.formatCommands.copy_png === true
+            onTriggered: { formatMenu.choice = "copy_png"; formatMenu.close() }
+        }
+        Controls.MenuSeparator { }
+        Controls.MenuItem {
+            objectName: "formalFormatCopy"
+            text: "Copy Format"
+            enabled: root.bridge.formatCommands.settings_copy === true
+            onTriggered: { formatMenu.choice = "settings_copy"; formatMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "formalFormatPaste"
+            text: "Paste Format"
+            enabled: root.bridge.formatCommands.settings_paste === true
+            onTriggered: { formatMenu.choice = "settings_paste"; formatMenu.close() }
         }
     }
 

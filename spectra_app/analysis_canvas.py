@@ -24,9 +24,13 @@ class CanvasPointerContext:
 
 
 @dataclass(frozen=True)
-class PeakMenuRequest:
+class CanvasMenuRequest:
     request_id: str
     pointer: CanvasPointerContext
+
+
+@dataclass(frozen=True)
+class PeakMenuRequest(CanvasMenuRequest):
     session: object
     graph: object
     cube: object
@@ -195,9 +199,24 @@ class AnalysisCanvasBridge(QObject):
         request = self._peak_menu_request
         if request is None or not self._peak_menu_ready:
             return {}
-        return dict(requestId=request.request_id, owner=request.pointer.owner,
+        peak = isinstance(request, PeakMenuRequest)
+        return dict(requestId=request.request_id, owner=request.pointer.owner, hasPeak=peak,
                     anchorX=request.pointer.anchor_x, anchorY=request.pointer.anchor_y,
-                    labelText=f'Set Label…  (current: {request.label})')
+                    labelText=f'Set Label…  (current: {request.label})' if peak else '')
+
+    @Property('QVariantMap', notify=stateChanged)
+    def formatCommands(self):
+        return {action['key']: action['enabled'] for action in self._navigation.actions
+                if action['key'] in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste')} if self._navigation is not None else {}
+
+    def request_format_menu(self, pointer):
+        if isinstance(pointer, CanvasPointerContext) and self.allowed(pointer.owner) and self._navigation is not None:
+            self.request_peak_menu(CanvasMenuRequest(self.next_peak_menu_id(), pointer))
+
+    def _invoke_format_command(self, key, owner):
+        if not self.allowed(owner) or self._navigation is None:
+            return False
+        return self._navigation.invoke(key, self._navigation.ownerToken)
 
     def next_peak_menu_id(self):
         self._peak_menu_serial += 1
@@ -231,11 +250,16 @@ class AnalysisCanvasBridge(QObject):
     @Slot(str, str, str, result=bool)
     def choosePeakMenu(self, request_id, key, owner):
         request = self._peak_menu_request
-        if (key not in ('set_label', 'delete') or request is None or not self._peak_menu_ready
+        if (key not in ('set_label', 'delete', 'copy_svg', 'copy_png', 'settings_copy', 'settings_paste')
+                or request is None or not self._peak_menu_ready
                 or request.request_id != request_id or request.pointer.owner != owner):
             return False
         self.clear_peak_menu()  # Consume before the prompt's nested event loop.
-        if self.window is None or not self.window._peak_menu_request_valid(request):
+        if key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste'):
+            accepted = self._invoke_format_command(key, owner)
+            self.restorePeakMenuFocus(owner)
+            return accepted
+        if not isinstance(request, PeakMenuRequest) or self.window is None or not self.window._peak_menu_request_valid(request):
             self.restorePeakMenuFocus(owner)
             return False
         self.window._continue_peak_menu(request, key)

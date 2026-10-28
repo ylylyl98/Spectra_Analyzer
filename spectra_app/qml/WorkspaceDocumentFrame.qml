@@ -34,7 +34,7 @@ Rectangle {
             id: titleTooltip
             objectName: "documentTitleTooltip"
             popupType: Controls.Popup.Window
-            visible: titleHover.hovered && root.documentTooltip.length > 0
+            visible: titleHover.hovered && !maximizeButton.hovered && !closeButton.hovered && root.documentTooltip.length > 0
             text: root.documentTooltip
             delay: 650; font: Qt.application.font
             width: Math.min(640, implicitWidth)
@@ -72,18 +72,69 @@ Rectangle {
             anchors.leftMargin: 8
             Text { text: root.documentTitle; color: colors.text; font: Qt.application.font; elide: Text.ElideRight; Layout.fillWidth: true }
             SurfaceButton {
+                id: maximizeButton
                 objectName: "documentMaximize"
                 property string inputToken: ""
                 text: root.frameMaximized ? "Restore" : "Maximize"
+                Accessible.name: text
+                implicitWidth: 32
+                leftPadding: 8; rightPadding: 8
                 visible: root.documents.mode === "free"
+                contentItem: Item {
+                    implicitWidth: 16; implicitHeight: 16
+                    Item {
+                        id: maximizeIcon
+                        anchors.centerIn: parent
+                        width: 16; height: 16
+                        readonly property color ink: maximizeButton.enabled ? colors.text : colors.disabledText
+                        Item {
+                            visible: root.frameMaximized
+                            Rectangle { x: 5; y: 2; width: 9; height: 1; color: maximizeIcon.ink }
+                            Rectangle { x: 13; y: 2; width: 1; height: 9; color: maximizeIcon.ink }
+                            Rectangle { x: 11; y: 10; width: 3; height: 1; color: maximizeIcon.ink }
+                        }
+                        Rectangle {
+                            x: 2; y: root.frameMaximized ? 5 : 2
+                            width: root.frameMaximized ? 9 : 12
+                            height: root.frameMaximized ? 9 : 12
+                            color: "transparent"
+                            border.width: 1; border.color: maximizeIcon.ink
+                        }
+                    }
+                }
+                Controls.ToolTip.visible: hovered
+                Controls.ToolTip.text: text
+                Controls.ToolTip.delay: 650
                 onPressed: inputToken = root.documents.captureFrameInput(root.documentKey, root)
                 onClicked: root.documents.toggleMaximize(root.documentKey, root, inputToken)
                 onCanceled: inputToken = ""
             }
             SurfaceButton {
+                id: closeButton
                 objectName: "documentClose"
                 property string inputToken: ""
                 text: "Close"
+                Accessible.name: text
+                implicitWidth: 32
+                leftPadding: 8; rightPadding: 8
+                contentItem: Item {
+                    implicitWidth: 16; implicitHeight: 16
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 14; height: 1
+                        rotation: 45; antialiasing: true
+                        color: closeButton.enabled ? colors.text : colors.disabledText
+                    }
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 14; height: 1
+                        rotation: -45; antialiasing: true
+                        color: closeButton.enabled ? colors.text : colors.disabledText
+                    }
+                }
+                Controls.ToolTip.visible: hovered
+                Controls.ToolTip.text: text
+                Controls.ToolTip.delay: 650
                 onPressed: inputToken = root.documents.captureFrameInput(root.documentKey, root)
                 onClicked: root.documents.closeDocument(root.documentKey, root, inputToken)
                 onCanceled: inputToken = ""

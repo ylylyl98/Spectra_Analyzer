@@ -33,7 +33,7 @@ from matplotlib.path import Path as MplPath
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.widgets import LassoSelector
 from scipy.signal import savgol_filter
-from PySide6.QtCore import Qt, QObject, QEvent, QPoint, QPointF, QSettings, QSignalBlocker, QTimer, Signal, QSize, QMimeData, QUrl, QItemSelection, QItemSelectionModel, Property, Slot
+from PySide6.QtCore import Qt, QObject, QEvent, QPoint, QPointF, QSettings, QSignalBlocker, QTimer, Signal, QSize, QMimeData, QUrl, QItemSelection, QItemSelectionModel, Property, Slot, QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QWheelEvent, QIcon, QImage, QPixmap, QKeySequence, QDesktopServices, QGuiApplication
 
 
@@ -93,8 +93,8 @@ from .plot_comparison import PlotComparisonWindow
 from .plot_batch import BatchExportJob, BatchFileResult, BatchSummary, SerialPlotBatch
 from .plot_dialogs import ApplyFormatDialog, BatchExportDialog
 from .svg_export import (MISSING_COLOR, build_color_norm, prepare_display_values,
-                         valid_color_values, prepare_heatmap_page, render_hybrid_svg, write_svg, write_svg_png,
-                         apply_heatmap_axis_style, apply_heatmap_colorbar_style,
+                         valid_color_values, prepare_heatmap_page, render_hybrid_svg, render_svg_image, write_svg, write_svg_png,
+                         apply_heatmap_axis_style, apply_heatmap_colorbar_style, validate_heatmap_axis_ticks,
                          _align_heatmap_corner_tick_labels, _update_heatmap_tick_contrast)
 
 
@@ -2282,12 +2282,15 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         self._fallback_plot_page = self._create_plot_page()
         self.plot_page = self._fallback_plot_page
         for name, text, handler in (
+            ('_graph_copy_svg_action', 'Copy SVG', self._on_copy_graph_svg),
+            ('_graph_copy_png_action', 'Copy PNG', self._on_copy_graph_png),
             ('_settings_copy_action', 'Copy settings', self._on_copy_plot_settings),
             ('_settings_paste_action', 'Paste settings…', self._on_paste_plot_settings),
             ('_settings_copy_to_action', 'Copy settings to active graphs…', self._on_copy_settings_to_datasets),
             ('_comparison_action', 'Open comparison window', self._on_open_plot_comparison)):
             action = QAction(text, self); action.triggered.connect(handler); setattr(self, name, action)
         self.analysis_navigation = AnalysisNavigationBridge(self, self.toolbar, {
+            'copy_svg': self._graph_copy_svg_action, 'copy_png': self._graph_copy_png_action,
             'settings_copy': self._settings_copy_action, 'settings_paste': self._settings_paste_action,
             'settings_copy_to': self._settings_copy_to_action, 'comparison': self._comparison_action})
         self.analysis_header.stateChanged.connect(self.analysis_navigation.refresh)
@@ -3770,12 +3773,15 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         page.analysisRequested.connect(lambda owner=key:
             self._open_analysis(('heatmap', owner)) if owner is not None else None)
         page.set_mutation_guard(lambda owner=key, target=page: self._formal_page_can_mutate(target, owner))
+        page.preview.set_format_guard(lambda target=page:
+            self.plot_page is target and self._outer_view == 'workspace')
         page.formal.set_properties_input_guard(lambda source, owner=key, target=page:
             self._formal_properties_input_allowed(target, owner, source))
         for signal, callback in (
 
                 (page.exportRequested, self._on_export_plot_page),
                 (page.graphCopyRequested, self._on_copy_graph_svg),
+                (page.graphPngCopyRequested, self._on_copy_graph_png),
                 (page.propertyEditRequested, self._show_plot_property),
                 (page.formatSaveRequested, self._on_save_plot_format),
                 (page.formatLoadRequested, self._on_load_plot_format),
@@ -4369,14 +4375,18 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         session.presentation = presentation
         self.plot_page.set_presentation(presentation)
         # Retire old export bytes before projecting fallible coordinate styles.
-        self._invalidate_plot_page(kind='presentation')
+        self._invalidate_plot_page(kind='presentation', schedule=False)
         if self._outer_view == 'workspace':
-            self._apply_live_heatmap_style()
             self._annotation_layout_pending = True
+            if self._heat_ax is not None:
+                try:
+                    validate_heatmap_axis_ticks(self._heat_ax, presentation)
+                except ValueError as exc:
+                    self.plot_page.set_status_message(f'Cannot prepare page: {exc}')
         else:
             self._layout_live_plots()
             self.canvas.draw_idle()
-        if getattr(self, '_live_heatmap_style_error', None):
+        if self._outer_view != 'workspace' and getattr(self, '_live_heatmap_style_error', None):
             self.plot_page.set_status_message(f'Cannot prepare page: {self._live_heatmap_style_error}')
         if before is not None:
             label = 'Plot presentation'
@@ -4387,6 +4397,9 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             elif previous.title_position != presentation.title_position:
                 label = 'Move title'
             self._record_history(session, label, before, capture_fields(session, ('presentation',)))
+        # Draft text has its own commit boundary. Coalesce accepted edits in
+        # this event turn without adding typing debounce to a completed edit.
+        self._schedule_plot_page_render(delay=0)
 
     def _on_plot_presentation_error(self, message):
         self._invalidate_plot_page(kind='presentation', schedule=False)
@@ -4399,6 +4412,28 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         return snapshot_dataset(session, activation_epoch=owner[1],
                                 science_revision=owner[2], view_revision=owner[3],
                                 presentation_revision=owner[4])
+
+    def _formal_page_matches_view(self, target, session):
+        """Check the view fields that capture can sync without a revision event."""
+        if target is None or target.presentation_error is not None or target.has_pending_project_edits():
+            return False
+        page, snapshot = target.rendered_page, target.preview.snapshot
+        owner = self._plot_owner_token((session.dataset_id, session.active_graph_id))
+        return (page is not None and page.owner_token == target.expected_owner == owner
+                and snapshot is not None and snapshot.owner_token == owner
+                and target.presentation == session.presentation
+                and snapshot.x_limits == session.view.x_limits
+                and snapshot.y_limits == session.view.y_limits
+                and snapshot.color_limits == session.view.color_limits)
+
+    @staticmethod
+    def _refresh_formal_colorbar_norms(target, snapshot):
+        # Properties samples follow the owned formal data even while Analysis
+        # styling/layout is deferred, including cached inactive graph pages.
+        limits = ({region.id: region.color_limits for region in snapshot.regions}
+                  if snapshot.regions else {'global': snapshot.color_limits})
+        target.set_colorbar_norms({key: build_color_norm(snapshot.norm, pair)
+                                  for key, pair in limits.items()})
 
     def _render_plot_page(self, key=None):
         """Render one owned snapshot serially; navigation never retires other pages."""
@@ -4431,12 +4466,10 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                               preserve_input=owner == target.expected_owner)
             return
         if active and self._heat_ax is not None:
-            # Applying style resets measured live label coordinates even when
-            # the formal frame size stays unchanged. Repair them on exposure.
-            self._annotation_layout_pending = True
-            self._apply_live_heatmap_style()
-            if self._live_heatmap_style_error:
-                target.invalidate(owner, f'Cannot prepare page: {self._live_heatmap_style_error}')
+            try:
+                validate_heatmap_axis_ticks(self._heat_ax, session.presentation)
+            except ValueError as exc:
+                target.invalidate(owner, f'Cannot prepare page: {exc}')
                 return
         if session.current_cube is None:
             target.invalidate(owner, 'Load a DAT file to prepare a formal page.')
@@ -4447,6 +4480,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                 target.set_presentation(graph_session.presentation)
             frame_before = self._live_heatmap_frame_size(session.presentation) if active else None
             snapshot = self.snapshot_plot_dataset(graph_session)
+            self._refresh_formal_colorbar_norms(target, snapshot)
             presentation, page = prepare_heatmap_page(snapshot, graph_session.presentation,
                                                        renderer=render_hybrid_svg)
             current = self.workspace.datasets.get(key[0])
@@ -4554,6 +4588,39 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         except Exception as exc:
             self._show_error(f'Cannot copy graph as SVG: {exc}')
 
+    def copy_graph_png(self):
+        """Publish PNG bytes and a native image only after final-page encoding succeeds."""
+        if self._auxiliary_active():
+            raise ValueError('Open a DAT graph document to copy as PNG.')
+        if self._outer_view == 'workspace' and self.graph_documents.registry.active_key is None:
+            raise ValueError('Open a graph document to copy.')
+        _session, _snapshot, page = self._capture_formal_source()
+        image = render_svg_image(page)
+        dots_per_meter = round(page.heatmap_dpi / .0254)
+        image.setDotsPerMeterX(dots_per_meter)
+        image.setDotsPerMeterY(dots_per_meter)
+        encoded = QByteArray()
+        buffer = QBuffer(encoded)
+        if not buffer.open(QIODevice.WriteOnly):
+            raise ValueError('Could not prepare the PNG clipboard buffer.')
+        try:
+            if not image.save(buffer, 'PNG') or encoded.isEmpty():
+                raise ValueError('Could not encode the graph as PNG.')
+        finally:
+            buffer.close()
+        mime = QMimeData()
+        mime.setData('image/png', encoded)
+        mime.setImageData(image)
+        QGuiApplication.clipboard().setMimeData(mime)
+        self.publish_status('')
+        return page
+
+    def _on_copy_graph_png(self):
+        try:
+            self.copy_graph_png()
+        except Exception as exc:
+            self._show_error(f'Cannot copy graph as PNG: {exc}')
+
     def _refresh_plot_formats(self, selected=None):
         try:
             self.plot_page.set_format_names(self._plot_format_store.list_names(), selected)
@@ -4577,6 +4644,8 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             self.plot_page.set_command_availability('comparison', True,
                 self.plot_page.command_tooltip('comparison') + f'\nSource: {session.source_path} [ID: {session.dataset_id}]')
         if hasattr(self, '_settings_copy_action'):
+            self._graph_copy_svg_action.setEnabled(available)
+            self._graph_copy_png_action.setEnabled(available)
             self._settings_copy_action.setEnabled(available)
             self._settings_copy_to_action.setEnabled(available)
             self._settings_paste_action.setEnabled(available and self._plot_settings_clipboard is not None)
@@ -4605,7 +4674,12 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         self._finish_annotation_edit()
         self._finish_history_edit()
         self._sync_formal_plot_view()
-        self._render_plot_page()
+        # Toolbar limits may reach the captured view before their invalidation
+        # callback. A matching revision alone cannot establish freshness here.
+        if not self._formal_page_matches_view(self.plot_page, session):
+            self._render_plot_page()
+        elif self._heat_ax is not None:
+            validate_heatmap_axis_ticks(self._heat_ax, session.presentation)
         page = self.plot_page.rendered_page
         if page is None or page.owner_token != self._plot_owner_token():
             raise ValueError(self.plot_page.status_text)
@@ -4735,6 +4809,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         self._finish_history_edit()
         outcomes = []
         active_changed = False
+        prepared = {}
         for dataset_id in dataset_ids:
             session = self.workspace.datasets.get(dataset_id)
             label = f'{session.source_path} — {session.active_graph.name}' if session else dataset_id
@@ -4751,22 +4826,30 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                     notice = 'Annotation positions skipped: no explicit usable pairs selected.'
                 result = apply_format(candidate, template, copy_mapping=copy_mapping,
                                       copy_color_limits=copy_color_limits, options=effective, annotation_pairs=pairs)
-                # Validate the target's retained text/ticks/data against the actual
-                # renderer before committing either of its ordinary records.
-                candidate.presentation, _page = prepare_heatmap_page(
-                    self.snapshot_plot_dataset(candidate), candidate.presentation, renderer=render_hybrid_svg)
+                key = (dataset_id, session.active_graph_id)
+                target = self.graph_documents.document_for(key)
+                if target is None and key == self._document_key():
+                    target = self.plot_page
+                unchanged = not field_changes(before, capture_fields(candidate, STYLE_FIELDS + ('presentation',)))
+                already_valid = unchanged and self._formal_page_matches_view(target, candidate)
+                if not already_valid:
+                    # Keep the exact final bytes used to validate retained
+                    # text/ticks/data, including any measured paper growth.
+                    snapshot = self.snapshot_plot_dataset(candidate)
+                    candidate.presentation, rendered = prepare_heatmap_page(
+                        snapshot, candidate.presentation, renderer=render_hybrid_svg)
+                    prepared[key] = (session, snapshot, candidate.presentation, rendered)
                 session.view, session.presentation = candidate.view, candidate.presentation
             except Exception as exc:
                 outcomes.append({'dataset_id':dataset_id,'source':label,'success':False,'error':str(exc)})
                 continue
-            self._record_history(session, 'Paste plot format', before,
-                                 capture_fields(session, STYLE_FIELDS + ('presentation',)))
-            key = (dataset_id, session.active_graph_id)
-            self._invalidate_graph_document(key, kind='presentation')
-            page = self.graph_documents.document_for(key)
-            if page is not None:
-                page.set_presentation(session.presentation)
-            active_changed |= dataset_id == self.workspace.active_dataset_id
+            after = capture_fields(session, STYLE_FIELDS + ('presentation',))
+            if field_changes(before, after):
+                self._record_history(session, 'Paste plot format', before, after)
+                self._invalidate_graph_document(key, kind='presentation')
+                if target is not None:
+                    target.set_presentation(session.presentation)
+                active_changed |= dataset_id == self.workspace.active_dataset_id
             try:
                 self._save_plot_dataset(session)
             except (ValueError, OSError, TypeError) as exc:
@@ -4777,7 +4860,33 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                                  'changed_fields':result.changed_fields,'notice':notice,'error':''})
         if active_changed:
             self._project_plot_dataset(self.workspace.active)
-        self._schedule_plot_page_render()
+        # Projection can advance view and presentation revisions. Publish the
+        # validated candidate only after those revisions have their final owner.
+        for key, (session, snapshot, presentation, rendered) in prepared.items():
+            # Inactive documents keep their established lazy preparation and
+            # invalidation boundary; this operation presents the active target.
+            if key != self._document_key():
+                continue
+            target = self.graph_documents.document_for(key)
+            if target is None and key == self._document_key():
+                target = self.plot_page
+            if (target is None or self.workspace.datasets.get(key[0]) is not session
+                    or session.graphs[key[1]].presentation != presentation
+                    or target.presentation_error is not None or target.has_pending_project_edits()):
+                continue
+            owner = self._plot_owner_token(key)
+            if target.expected_owner != owner:
+                target.invalidate(owner)
+            snapshot = replace(snapshot, activation_epoch=owner[1], science_revision=owner[2],
+                               view_revision=owner[3], presentation_revision=owner[4])
+            target.preview.set_geometry(snapshot, presentation)
+            self._refresh_formal_colorbar_norms(target, snapshot)
+            target.commit_rendered_page(replace(rendered, owner_token=owner))
+        if self.plot_page.rendered_page is not None:
+            self._plot_render_timer.stop()
+        if any(self.graph_documents.document_for(key).rendered_page is None
+               for key in self.graph_documents.visible_keys() if len(key) == 2):
+            self._schedule_plot_page_render()
         failures = sum(not item['success'] for item in outcomes)
         self.publish_status(
             f'Format applied: {len(outcomes)-failures}/{len(outcomes)} datasets; {failures} failed' if failures else '')
@@ -7396,6 +7505,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             return
         trace_peak_indices = self._current_trace_peak_indices()
         if trace_peak_indices.size == 0:
+            self.dat_canvas.request_format_menu(pointer)
             return
         x = self.current_cube.energy
         peak_x = x[trace_peak_indices]
@@ -7403,6 +7513,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         dists = np.abs(peak_x - x_click)
         nearest_arr_idx = int(np.argmin(dists))
         if dists[nearest_arr_idx] > 0.02 * x_span:
+            self.dat_canvas.request_format_menu(pointer)
             return
         nearest_idx = int(trace_peak_indices[nearest_arr_idx])
         gate_idx = self._current_gate_index()
@@ -8627,7 +8738,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             # A valid text draft can be committed by Export itself. The
             # controller prepares fresh bytes before writing, including when
             # the click's FocusOut has already committed the text.
-            for command in ('export_svg', 'export_png', 'copy_svg'):
+            for command in ('export_svg', 'export_png', 'copy_svg', 'copy_png'):
                 self.plot_page.set_command_availability(command, True)
         self._refresh_graph_commands()
 
@@ -9680,6 +9791,8 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
 
         # ── Heatmap ───────────────────────────────────────────────────────────
         if self._heat_ax is None:
+            if event.button == 3:
+                self.dat_canvas.request_format_menu(getattr(event, 'guiEvent', None))
             return
         if self._lasso_mode and event.inaxes is self._heat_ax:
             return
@@ -9701,6 +9814,12 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                 gate_used, y = self._nearest_spectrum(self.current_gate)
                 self._update_spectrum_only()
                 self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
+            else:
+                self.dat_canvas.request_format_menu(getattr(event, 'guiEvent', None))
+            return
+
+        if event.button == 3:
+            self.dat_canvas.request_format_menu(getattr(event, 'guiEvent', None))
             return
 
         # Left-click on heatmap → select gate (ORIGINAL BEHAVIOR, UNCHANGED)

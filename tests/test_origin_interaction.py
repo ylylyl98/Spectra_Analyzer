@@ -8,13 +8,13 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QObject, QPoint, QPointF, Qt
+from PySide6.QtGui import QGuiApplication, QImage
 from PySide6.QtQuick import QQuickItem
 from PySide6.QtTest import QTest
 from tests.settings_helpers import wait_for_background_jobs
 from tests.quick_application_helpers import application, wait_until
-from tests.formal_quick_helpers import item as quick_item, pump, input_receiver
+from tests.formal_quick_helpers import item as quick_item, click_item, pump, input_receiver
 
 class OriginInteractionTests(migration.QuickMigrationCase):
     def setUp(self):
@@ -270,15 +270,70 @@ class OriginInteractionTests(migration.QuickMigrationCase):
         QGuiApplication.clipboard().setText('Keep this clipboard')
         p.formal.setDraft('tick_values', 'bad ticks')
         p.formal.setValue('custom_ticks', True)
-        with self.assertRaises(ValueError):
-            w.copy_graph_svg()
-        self.assertEqual(QGuiApplication.clipboard().text(), 'Keep this clipboard')
+        for copy in (w.copy_graph_svg, w.copy_graph_png):
+            with self.assertRaises(ValueError):
+                copy()
+            self.assertEqual(QGuiApplication.clipboard().text(), 'Keep this clipboard')
         empty_host, _, errors = self.enterContext(application())
         self.window_errors.append(errors)
         empty = empty_host.controller
-        with self.assertRaises(ValueError):
-            empty.copy_graph_svg()
-        self.assertEqual(QGuiApplication.clipboard().text(), 'Keep this clipboard')
+        for copy in (empty.copy_graph_svg, empty.copy_graph_png):
+            with self.assertRaises(ValueError):
+                copy()
+            self.assertEqual(QGuiApplication.clipboard().text(), 'Keep this clipboard')
+
+    def test_formal_right_click_copies_fresh_svg_and_png(self):
+        from spectra_app.svg_export import render_svg_image
+        self.addCleanup(QGuiApplication.clipboard().clear)
+        w, p = self.w, self.w.plot_page
+        p.formal.setValue('aspect_locked', False)
+        p.formal.setValue('width_in', 4.)
+        p.formal.setValue('height_in', 3.)
+        p.formal.setDraft('heatmap_dpi', '150')
+        w.dat_properties.setLabel('plot_title', 'Clipboard menu title', w.dat_properties.ownerToken)
+        w._finish_graph_editors()
+        self.render()
+        for name, kind in (('formalCopySvg', 'svg'), ('formalCopyPng', 'png')):
+            with self.subTest(kind=kind):
+                point = self.paper_point(QPointF(30, 30))
+                QTest.mouseClick(w.root_window, Qt.RightButton, pos=point)
+                pump(60)
+                self.assertTrue(self.canvas().findChild(QObject, 'formalFormatMenu').property('visible'))
+                self.assertEqual(quick_item(self.canvas(), name).property('text'), 'Copy ' + kind.upper())
+                self.assertTrue(quick_item(self.canvas(), name).isEnabled())
+                click_item(self.canvas(), name)
+                page = p.rendered_page
+                mime = QGuiApplication.clipboard().mimeData()
+                self.assertEqual(page.heatmap_dpi, 150)
+                self.assertIn(b'Clipboard menu title', page.svg_bytes)
+                if kind == 'svg':
+                    self.assertEqual(mime.formats(), ['image/svg+xml'])
+                    self.assertEqual(bytes(mime.data('image/svg+xml')), page.svg_bytes)
+                else:
+                    encoded = bytes(mime.data('image/png'))
+                    self.assertTrue(encoded.startswith(b'\x89PNG\r\n\x1a\n'))
+                    decoded = QImage.fromData(encoded, 'PNG')
+                    expected = render_svg_image(page)
+                    self.assertFalse(decoded.isNull())
+                    self.assertTrue(mime.hasImage())
+                    self.assertEqual(decoded.size(), expected.size())
+                    decoded_rgba = decoded.convertToFormat(QImage.Format_RGBA8888)
+                    expected_rgba = expected.convertToFormat(QImage.Format_RGBA8888)
+                    self.assertEqual(bytes(decoded_rgba.constBits()), bytes(expected_rgba.constBits()))
+                    self.assertEqual(QGuiApplication.clipboard().image().size(), expected.size())
+                    self.assertAlmostEqual(decoded.dotsPerMeterX() * .0254, page.heatmap_dpi, delta=.02)
+                    self.assertAlmostEqual(decoded.dotsPerMeterY() * .0254, page.heatmap_dpi, delta=.02)
+
+    def test_copy_png_render_and_encoding_failures_preserve_clipboard(self):
+        self.addCleanup(QGuiApplication.clipboard().clear)
+        for target, kwargs in (
+                ('spectra_app.main_window.render_svg_image', {'side_effect': ValueError('Cannot render')}),
+                ('PySide6.QtGui.QImage.save', {'return_value': False})):
+            with self.subTest(target=target):
+                QGuiApplication.clipboard().setText('Preserve on failure')
+                with patch(target, **kwargs), self.assertRaises(ValueError):
+                    self.w.copy_graph_png()
+                self.assertEqual(QGuiApplication.clipboard().text(), 'Preserve on failure')
 
     def test_shared_menus_import_shortcut_and_native_text_copy(self):
         self.addCleanup(QGuiApplication.clipboard().clear)

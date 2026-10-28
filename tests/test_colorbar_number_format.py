@@ -19,7 +19,7 @@ from spectra_app.plot_templates import FormatStyle, FormatTemplate, capture_form
 from spectra_app.svg_export import (_bar_ticks, apply_heatmap_colorbar_style, build_color_norm,
                                     prepare_heatmap_page, render_hybrid_svg)
 from tests.formal_quick_helpers import edit_field, item, pump
-from tests.quick_application_helpers import application
+from tests.quick_application_helpers import application, wait_until
 from contextlib import contextmanager
 from unittest.mock import patch
 from tests.test_plot_templates import dataset
@@ -336,6 +336,21 @@ class NumberFormatUiTests(QuickMigrationCase):
         self.assertIsNotNone(item(self.w, 'bar_label_format'))
         return page
 
+    def _setup_narrow_global_range(self):
+        w = self.w
+        dat.setup_number(w, 'vmin', 920.)
+        dat.setup_number(w, 'vmax', 930.)
+        snapshot = w.snapshot_plot_dataset()
+        self.assertEqual(w.workspace.active.view.color_limits, (920., 930.))
+        self.assertEqual(snapshot.color_limits, (920., 930.))
+        self.assertEqual(w._heat_mesh.get_clim(), snapshot.color_limits)
+        # Formal samples publish the accepted snapshot at the render boundary.
+        w._render_plot_page()
+        self.assertEqual(w.plot_page.rendered_page.owner_token, snapshot.owner_token)
+        self.assertEqual(w.plot_page.preview.snapshot.color_limits, snapshot.color_limits)
+        norm = w.plot_page._colorbar_norms['global']
+        self.assertEqual((norm.vmin, norm.vmax), snapshot.color_limits)
+
     def _native_engineering_precision(self):
         from PySide6.QtCore import Qt
         from PySide6.QtGui import QGuiApplication
@@ -534,8 +549,7 @@ class NumberFormatUiTests(QuickMigrationCase):
 
     def test_controls_update_precision_meaning_live_sample_and_duplicate_warning(self):
         page = self.controls()
-        self.w._heat_mesh.set_clim(920., 930.)
-        self.w._apply_live_heatmap_style()
+        self._setup_narrow_global_range()
         page.formal.setValue('bar_label_format', 'scientific')
         precision = edit_field(self.w, 'bar_precision', '0', commit=True)
         self.assertIn('Mantissa decimal places', precision.parentItem().property('label'))
@@ -561,24 +575,23 @@ class NumberFormatUiTests(QuickMigrationCase):
         page = self.controls()
         w = self.w
         w._plot_render_timer.stop()
-        w._heat_mesh.set_clim(920., 930.)
-        w._apply_live_heatmap_style()
-        page.formal.focusRequested.emit('colorbar', 'bar_label_format')
-        pump(65)
-        choice = ensure_visible(item(w, 'bar_label_format'))
-        receiver = input_receiver(w, choice)
-        self.assertTrue(choice.hasActiveFocus())
-        QTest.keyClick(receiver, Qt.Key_Home)
-        QTest.keyClick(receiver, Qt.Key_Down)
-        QTest.keyClick(receiver, Qt.Key_Down)
-        self.assertEqual(page.presentation.colorbar.label_format, 'scientific')
-        w._plot_render_timer.stop()
-        precision = edit_field(w, 'bar_precision', '2', commit=False)
-        self.assertFalse(page.has_pending_project_edits())
-        token = precision.property('inputOwner')
-        generation = page._input_generation
-        gesture = page.preview._generation
-        before = page.presentation
+        with patch.object(w, '_schedule_plot_page_render'):
+            self._setup_narrow_global_range()
+            page.formal.focusRequested.emit('colorbar', 'bar_label_format')
+            pump(65)
+            choice = ensure_visible(item(w, 'bar_label_format'))
+            receiver = input_receiver(w, choice)
+            self.assertTrue(choice.hasActiveFocus())
+            QTest.keyClick(receiver, Qt.Key_Home)
+            QTest.keyClick(receiver, Qt.Key_Down)
+            QTest.keyClick(receiver, Qt.Key_Down)
+            self.assertEqual(page.presentation.colorbar.label_format, 'scientific')
+            precision = edit_field(w, 'bar_precision', '2', commit=False)
+            self.assertFalse(page.has_pending_project_edits())
+            token = precision.property('inputOwner')
+            generation = page._input_generation
+            gesture = page.preview._generation
+            before = page.presentation
 
         w._render_plot_page()
 
@@ -606,8 +619,7 @@ class NumberFormatUiTests(QuickMigrationCase):
 
         page = self.controls()
         w = self.w
-        w._heat_mesh.set_clim(920., 930.)
-        w._apply_live_heatmap_style()
+        self._setup_narrow_global_range()
         page.formal.setValue('bar_label_format', 'scientific')
         w._render_plot_page()
         precision = edit_field(w, 'bar_precision', '0', commit=False)
@@ -745,9 +757,10 @@ class NumberFormatUiTests(QuickMigrationCase):
         self.assertIsNotNone(page.rendered_page, page.status_text)
         self.assertEqual(tuple(getattr(page.presentation, field) for field in
                                ('width_in', 'height_in', 'frame_width_in', 'frame_height_in')), dimensions)
-        edit_field(self.w, 'bar_precision', '0', commit=True)
-        self.assertIsNone(page.rendered_page)
-        self.assertFalse(page.command_enabled('export_svg'))
+        with patch.object(w, '_schedule_plot_page_render'):
+            edit_field(self.w, 'bar_precision', '0', commit=True)
+            self.assertIsNone(page.rendered_page)
+            self.assertFalse(page.command_enabled('export_svg'))
         self.assertIs(w.current_cube, cube); self.assertIs(w._heat_mesh, mesh); self.assertIs(mesh.norm, norm)
         self.assertEqual((w._heat_ax.get_xlim(), w._heat_ax.get_ylim(), mesh.get_clim()), limits)
         np.testing.assert_array_equal(cube.z, arrays)
@@ -758,7 +771,13 @@ class NumberFormatUiTests(QuickMigrationCase):
                          (.7000000001, .0650000001, .1200000001, .0250000001))
         w._render_plot_page()
         self.assertIsNotNone(page.rendered_page, page.status_text)
-        self.assertEqual([text.get_text() for text in w._heat_colorbar.ax.get_xticklabels()], ['2e1', '5e2', '9e2'])
+        self.assertTrue(w.request_outer_view('analysis'))
+        wait_until(lambda: not w._annotation_layout_pending
+                   and not w._view_layout_timer.isActive(), timeout=2)
+        self.assertEqual([text.get_text() for text in w._heat_colorbar.ax.get_xticklabels()],
+                         ['2e1', '5e2', '9e2'])
+        self.assertTrue(w.request_outer_view('workspace'))
+        pump()
         saved = page.presentation
         sidecar = self.path.with_name(self.path.name + '.plot.json')
         # Opening the real graph saves its initial recipe. Closing must write

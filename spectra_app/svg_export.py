@@ -229,17 +229,26 @@ def apply_heatmap_colorbar_style(colorbar, presentation, bar_id, *, allow_invali
     return ticks
 
 
+def validate_heatmap_axis_ticks(ax, presentation):
+    """Check retained coordinate scales without rebuilding live tick artists."""
+    style = presentation.axis
+    for scale, step, count, minor in (
+            (ax.get_xscale(), style.x_major_step, style.x_major_count, style.x_minor_count),
+            (ax.get_yscale(), style.y_major_step, style.y_major_count, style.y_minor_count)):
+        if scale != 'linear' and minor not in (0, 1):
+            raise ValueError('Manual minor tick counts require linear coordinate axes; use 0 to disable or 1 for automatic non-linear minors.')
+        if scale != 'linear' and (step is not None or count is not None):
+            raise ValueError('Manual major tick increments and counts require linear coordinate axes.')
+
+
 def apply_heatmap_axis_style(ax, presentation, *, display_scale=1.):
     """Shared presentation only: never change coordinates, scales or limits."""
+    validate_heatmap_axis_ticks(ax, presentation)
     style = presentation.axis
     for coordinate, step, count, minor in ((ax.xaxis, style.x_major_step, style.x_major_count, style.x_minor_count),
                                           (ax.yaxis, style.y_major_step, style.y_major_count, style.y_minor_count)):
         scale = ax.get_xscale() if coordinate is ax.xaxis else ax.get_yscale()
-        if scale != 'linear' and minor not in (0, 1):
-            raise ValueError('Manual minor tick counts require linear coordinate axes; use 0 to disable or 1 for automatic non-linear minors.')
         if step is not None or count is not None:
-            if scale != 'linear':
-                raise ValueError('Manual major tick increments and counts require linear coordinate axes.')
             coordinate.set_major_locator(MultipleLocator(step) if step is not None else LinearLocator(count))
         elif scale == 'linear':
             coordinate.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=3))

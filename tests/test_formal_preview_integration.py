@@ -240,6 +240,74 @@ class FormalPreviewIntegrationTests(QuickMigrationCase):
         self.assertEqual(p.presentation.annotations, ())
         self.assertIs(self.window.current_cube, cube)
 
+    def test_native_drag_does_not_republish_document_frames_and_commit_is_queued(self):
+        from spectra_app import main_window
+        w = self.window
+        p = self.open_graph()
+        note = self.note(p)
+        start = self.reveal(p.preview, p.preview.annotation_point(note))
+        before = p.presentation
+        with patch.object(w.graph_documents.frames, 'refresh', wraps=w.graph_documents.frames.refresh) as refresh, \
+             patch.object(main_window, 'prepare_heatmap_page', wraps=main_window.prepare_heatmap_page) as prepare, \
+             patch.object(w, '_apply_live_heatmap_style', wraps=w._apply_live_heatmap_style) as style:
+            QTest.mousePress(self.host.window, Qt.LeftButton, pos=start)
+            for step in range(1, 11):
+                QTest.mouseMove(self.host.window, start + QPoint(step * 2, step))
+                pump(1)
+            self.assertEqual(refresh.call_count, 0)
+            self.assertEqual(prepare.call_count, 0)
+            self.assertEqual(p.presentation, before)
+            QTest.mouseRelease(self.host.window, Qt.LeftButton, pos=start + QPoint(20, 10))
+            self.assertNotEqual(p.presentation, before)
+            # Native release may already process the queued zero-delay timer.
+            self.assertEqual(w._plot_render_timer.interval(), 0)
+            pump(30)
+            self.assertEqual(prepare.call_count, 1)
+            self.assertEqual(style.call_count, 0)
+            self.assertEqual(p.rendered_page.owner_token, w._plot_owner_token())
+        self.assertTrue(w.undo_edit())
+        self.assertEqual(p.presentation, before)
+
+    def test_committed_properties_coalesce_without_hidden_live_style(self):
+        from spectra_app import main_window
+        w = self.window
+        p = self.open_graph()
+        with patch.object(main_window, 'prepare_heatmap_page', wraps=main_window.prepare_heatmap_page) as prepare, \
+             patch.object(w, '_apply_live_heatmap_style', wraps=w._apply_live_heatmap_style) as style:
+            p.formal.setDraft('text_pt', str(p.presentation.text_pt + 1))
+            self.assertTrue(p.formal.commitField('text_pt'))
+            p.formal.setDraft('numeric_pt', str(p.presentation.numeric_pt + 1))
+            self.assertTrue(p.formal.commitField('numeric_pt'))
+            self.assertEqual(prepare.call_count, 0)
+            self.assertEqual(style.call_count, 0)
+            self.assertEqual(w._plot_render_timer.interval(), 0)
+            pump(30)
+            self.assertEqual(prepare.call_count, 1)
+            self.assertEqual(style.call_count, 0)
+            self.assertEqual(p.rendered_page.owner_token, w._plot_owner_token())
+        self.assertTrue(w.request_outer_view('analysis'))
+        pump(70)
+        self.assertFalse(w._annotation_layout_pending)
+        self.assertEqual(w._heat_ax.title.get_fontsize(), w._live_display_presentation()[0].text_pt)
+
+    def test_same_active_document_still_publishes_when_stacking_changes(self):
+        w = self.window
+        self.open_graph()
+        first = w._document_key()
+        w.create_graph('Second frame')
+        w.open_graph_document()
+        self.render()
+        documents, active = w.graph_documents, w._document_key()
+        documents.setMode('free')
+        pump()
+        documents.registry.report_stacking((active, first))
+        with patch.object(documents.frames, 'refresh', wraps=documents.frames.refresh) as refresh:
+            self.assertTrue(documents.requestActivate(active))
+            self.assertEqual(documents._stacking()[-1], active)
+            self.assertEqual(refresh.call_count, 1)
+            self.assertTrue(documents.requestActivate(active))
+            self.assertEqual(refresh.call_count, 1)
+
     def test_graph_shortcuts_stay_local_to_canvas_and_leave_text_editor_undo_local(self):
         p = self.open_graph()
         self.note(p)

@@ -175,11 +175,14 @@ class UiLayoutTests(QuickMigrationCase):
         p.formatApplyRequested.connect(events.append)
         p.formal.command('format_apply')
         self.assertEqual(events, ['Journal'])
+        mount = self.w.graph_documents._presentations[self.w._document_key()].mount
         for command in p.formal.state['commands']:
+            control = (item(mount.item, 'formalCopyPng') if command == 'copy_png'
+                       else item(self.w, 'formal_' + command))
             p.set_command_availability(command, False)
-            self.assertFalse(item(self.w, 'formal_' + command).isEnabled())
+            self.assertFalse(control.isEnabled(), command)
             p.set_command_availability(command, True)
-            self.assertTrue(item(self.w, 'formal_' + command).isEnabled())
+            self.assertTrue(control.isEnabled(), command)
         for name in ('formal_settings_menu', 'formal_formats_menu', 'formal_batch_menu'):
             button = item(self.w, name)
             self.assertTrue(button.property('focusPolicy') & Qt.TabFocus)

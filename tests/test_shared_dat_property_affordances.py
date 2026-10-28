@@ -4,6 +4,7 @@ from dataclasses import replace
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+import time
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ import numpy as np
 from matplotlib import colormaps
 from PySide6.QtCore import QObject, QPoint, QPointF, Qt
 from PySide6.QtGui import QAccessible, QImage
+from PySide6.QtQml import QQmlEngine, QQmlExpression
 from PySide6.QtTest import QTest
 
 from spectra_app.custom_colormaps import resolve_colormap
@@ -70,10 +72,35 @@ class SharedDatPropertyAffordanceTests(QuickMigrationCase):
             self.assertTrue(preview.isVisible())
             self.assertEqual(preview.property('source').toString(), entries[index]['preview'])
             self.assertGreater(preview.property('sourceSize').width(), 0)
-            shot = input_receiver(self.w, row).grabWindow()
+            receiver = input_receiver(self.w, row)
+            # Visibility/sourceSize can precede popup polish and a native frame.
+            # Read the QML enum in QML; PySide cannot convert QQuickImageBase::Status.
+            ready = QQmlExpression(QQmlEngine.contextForObject(preview), preview,
+                                  'status === Image.Ready')
+            deadline = time.monotonic() + 3
+            while (not popup.property('opened') or not ready.evaluate()[0]) and time.monotonic() < deadline:
+                pump(10)
+            self.assertTrue(popup.property('opened'))
+            self.assertFalse(ready.hasError())
+            self.assertTrue(ready.evaluate()[0])
+            frames = []
+            def rendered():
+                frames.append(True)
+            receiver.afterRendering.connect(rendered)
+            try:
+                receiver.update()
+                while not frames and time.monotonic() < deadline:
+                    pump(10)
+                self.assertTrue(frames, 'popup did not render a ready image')
+            finally:
+                receiver.afterRendering.disconnect(rendered)
+            self.assertIs(preview.window(), receiver)
+            shot = receiver.grabWindow()
             self.assertFalse(shot.isNull())
             center = preview.mapToScene(QPointF(preview.width() / 2, preview.height() / 2))
             scale = shot.devicePixelRatio()
+            self.assertTrue(0 <= round(center.x() * scale) < shot.width())
+            self.assertTrue(0 <= round(center.y() * scale) < shot.height())
             pixel = shot.pixelColor(round(center.x() * scale), round(center.y() * scale))
             expected = QImage.fromData(base64.b64decode(entries[index]['preview'].split(',', 1)[1])).pixelColor(48, 6)
             self.assertLess(max(abs(a - b) for a, b in zip(pixel.getRgb(), expected.getRgb())), 12)

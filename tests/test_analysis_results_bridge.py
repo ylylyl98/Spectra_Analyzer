@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -334,7 +335,12 @@ class AnalysisResultsPersistenceTests(QuickMigrationCase):
         self.click_dialog(reopened, 'styleApply')
         self.assertFalse(reopened._finished)
         self.assertEqual(aq.item(reopened, 'style_detected-peak_size').property('text'), '-')
-        self.assertTrue(aq.item(reopened, 'style_detected-peak_size').hasActiveFocus())
+        invalid_size = aq.item(reopened, 'style_detected-peak_size')
+        # Validation returns focus through the QML timer on the next frame.
+        deadline = time.monotonic() + 2
+        while not invalid_size.hasActiveFocus() and time.monotonic() < deadline:
+            aq.pump(10)
+        self.assertTrue(invalid_size.hasActiveFocus())
         self.assertEqual(doc.overlay_styles, before)
         QTest.keyClick(reopened.window(), Qt.Key_Escape)
         aq.pump()

@@ -104,6 +104,16 @@ class ProjectDailyWorkflowTests(QuickMigrationCase):
         QTest.qWait(240)
         for window in self.windows:
             self.wait_idle(window)
+            # Paper growth during rendering can restart the dirty debounce.
+            # Observe its completion instead of assuming the first wait covered it.
+            deadline = time.monotonic() + 3
+            def pending():
+                return (window._plot_render_timer.isActive()
+                        or window._project_modified_timer.isActive()
+                        or window._project_io_jobs.busy or window._background_jobs.busy)
+            while pending() and time.monotonic() < deadline:
+                pump(10)
+            self.assertFalse(pending(), 'render and project marker did not settle')
         pump()
 
     def drop(self, window, paths):

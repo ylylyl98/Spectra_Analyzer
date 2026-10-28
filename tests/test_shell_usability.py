@@ -68,9 +68,10 @@ class ShellUsabilityTests(QuickMigrationCase):
         return row
 
     def tooltip(self, control):
+        name = ('documentTitleTooltip' if control.objectName() == 'documentTitleBar'
+                else 'documentTabTooltip')
         tooltips = [child for child in control.findChildren(QObject)
-                    if child.inherits('QQuickToolTipAttached')
-                    or child.inherits('QQuickToolTip')]
+                    if child.objectName() == name and child.inherits('QQuickToolTip')]
         self.assertEqual(len(tooltips), 1,
                          f'{control.objectName()} needs its actual source-path tooltip binding')
         return tooltips[0]

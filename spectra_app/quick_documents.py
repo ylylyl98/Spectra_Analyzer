@@ -327,8 +327,12 @@ class QuickDocuments(QObject):
                 or self._presentations.get(key) is not presentation or key not in self.registry.open_keys()):
             return False
         changed = self.registry.active_key != key
+        stacking_changed = self._stacking()[-1:] != (key,)
         self.registry.activated(key)
-        self._publish()
+        # Authorization also runs for every pointer move. Publish frame rows
+        # only when activation actually changes their selection or stacking.
+        if changed or stacking_changed:
+            self._publish()
         if changed:
             self.workspaceChanged.emit()
         return True

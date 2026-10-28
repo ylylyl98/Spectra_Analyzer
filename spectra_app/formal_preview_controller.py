@@ -33,6 +33,7 @@ class FormalPreviewController(QObject):
     titleMoved = Signal(object)
     propertyEditRequested = Signal(str, str)
     graphCopyRequested = Signal()
+    formatCommandRequested = Signal(str)
 
     def __init__(self, parent=None, *, display_policy='editable', authorization=None):
         if display_policy not in ('editable', 'readonly'):
@@ -68,6 +69,8 @@ class FormalPreviewController(QObject):
         self._publish_image = None
         self._retire_image = None
         self._scroll = (0., 0.)
+        self._format_commands = {}
+        self._format_guard = lambda: True
 
     def _can_view(self):
         return bool(self._accepted and self.page is not None
@@ -105,6 +108,34 @@ class FormalPreviewController(QObject):
     pageHeight = Property(float, lambda self: self._physical_size()[1] * 96, notify=stateChanged)
     zoom = Property(str, lambda self: self._zoom, notify=stateChanged)
     overlay = Property('QVariantMap', lambda self: self._overlay(), notify=overlayChanged)
+    formatCommands = Property('QVariantMap', lambda self: dict(self._format_commands), notify=stateChanged)
+
+    def set_format_commands(self, commands):
+        commands = {key: bool(commands[key]['enabled'])
+                    for key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste')}
+        if commands != self._format_commands:
+            self._format_commands = commands
+            self.stateChanged.emit()
+
+    def set_format_guard(self, guard):
+        self._format_guard = guard
+
+    @Slot(int, result=int)
+    def sceneFormatMenu(self, scene):
+        if not self._current_scene(scene) or not self._format_commands or not self._can_edit(authorize=True):
+            return -1
+        self._retire_gesture()
+        return self._generation
+
+    @Slot(int, int, str, result=bool)
+    def sceneFormatCommand(self, scene, generation, key):
+        if (not self._current_scene(scene) or generation != self._generation
+                or not self._format_commands.get(key, False) or not self._format_guard()
+                or not self._can_edit()):
+            return False
+        self._retire_gesture()
+        self.formatCommandRequested.emit(key)
+        return True
 
     def set_mutation_guard(self, guard):
         self._retire_gesture()

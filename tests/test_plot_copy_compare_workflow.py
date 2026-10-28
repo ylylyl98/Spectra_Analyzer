@@ -15,6 +15,7 @@ from PySide6.QtTest import QTest
 from shiboken6 import isValid
 
 from spectra_app.common_prompts import PromptAction
+from spectra_app import main_window
 from spectra_app.plot_presentation import PlotAnnotation
 from spectra_app.plot_templates import FORMAT_TEMPLATES_KEY, FormatApplicationOptions, FormatTemplate
 from tests.quick_migration_case import QuickMigrationCase
@@ -161,6 +162,99 @@ class PlotCopyCompareWorkflowTests(QuickMigrationCase):
         self.assertEqual(captured.style.width_in, 4.6)
         self.assertEqual(captured.annotation_layout[0].text, 'Pending σ⁺')
         self.assertEqual(captured.annotation_layout[0].position, (.33, .3))
+
+    def test_current_source_capture_reuses_page_and_detects_unsignaled_live_ranges(self):
+        w = self.w
+        w._render_plot_page()
+        current = w.plot_page.rendered_page
+        with patch.object(main_window, 'prepare_heatmap_page', wraps=main_window.prepare_heatmap_page) as prepare:
+            w.copy_plot_settings()
+            self.assertEqual(prepare.call_count, 0)
+            self.assertIs(w.plot_page.rendered_page, current)
+            # Capturing also imports toolbar/live limits, which need not have
+            # delivered an ordinary invalidation callback yet.
+            with w._heat_ax.callbacks.blocked():
+                w._heat_ax.set_xlim(1.15, 1.85)
+            copied = w.copy_plot_settings()
+            self.assertEqual(prepare.call_count, 1)
+            self.assertEqual(copied.x_limits, (1.15, 1.85))
+            self.assertEqual(w.plot_page.preview.snapshot.x_limits, copied.x_limits)
+            self.assertEqual(w.plot_page.rendered_page.owner_token, w._plot_owner_token())
+
+    def test_paste_publishes_validated_page_once_and_matching_paste_keeps_history(self):
+        w = self.w
+        w.copy_plot_settings()
+        w.set_plot_presentation(replace(self.c.presentation, text_pt=self.c.presentation.text_pt + 1))
+        w._render_plot_page()
+        before = w._plot_owner_token()
+        with patch.object(main_window, 'prepare_heatmap_page', wraps=main_window.prepare_heatmap_page) as prepare:
+            report = w.paste_plot_settings()
+            self.assertTrue(report[0]['success'], report)
+            self.assertEqual(prepare.call_count, 1)
+            page = w.plot_page.rendered_page
+            self.assertIsNotNone(page)
+            self.assertNotEqual(before, page.owner_token)
+            self.assertEqual(page.owner_token, w._plot_owner_token())
+            self.assertEqual(w.plot_page.preview.snapshot.owner_token, page.owner_token)
+            self.assertFalse(w._plot_render_timer.isActive())
+            pump(220)
+            self.assertEqual(prepare.call_count, 1)
+            owner = w._plot_owner_token()
+            with patch.object(w, '_project_plot_dataset', wraps=w._project_plot_dataset) as project:
+                report = w.paste_plot_settings()
+                self.assertTrue(report[0]['success'], report)
+                self.assertEqual(report[0]['changed_fields'], ())
+                self.assertEqual(project.call_count, 0)
+                self.assertEqual(prepare.call_count, 1)
+            self.assertEqual(w._plot_owner_token(), owner)
+            self.assertIs(w.plot_page.rendered_page, page)
+        # A no-op must leave the preceding real paste as the next Undo item.
+        fresh_presentation, fresh_page = main_window.prepare_heatmap_page(
+            w.snapshot_plot_dataset(), self.c.presentation, renderer=main_window.render_hybrid_svg)
+        self.assertEqual(fresh_presentation, self.c.presentation)
+        self.assertEqual(page.svg_bytes, fresh_page.svg_bytes)
+        self.assertEqual(page.digest, fresh_page.digest)
+        self.assertEqual(page.object_bounds, fresh_page.object_bounds)
+        self.assertTrue(w.undo_edit())
+        self.assertEqual(self.c.presentation.text_pt, w._plot_settings_clipboard.style.text_pt + 1)
+
+    def test_matching_paste_refreshes_ranges_captured_by_dialog_without_invalidation(self):
+        w = self.w
+        w.copy_plot_settings()
+        with w._heat_ax.callbacks.blocked():
+            w._heat_ax.set_xlim(1.15, 1.85)
+        dialog = w.create_paste_settings_dialog(current_only=True)
+        dialog.bridge.shutdown()
+        dialog.deleteLater()
+        self.assertEqual(self.c.view.x_limits, (1.15, 1.85))
+        with patch.object(main_window, 'prepare_heatmap_page', wraps=main_window.prepare_heatmap_page) as prepare:
+            report = w.paste_plot_settings()
+            self.assertTrue(report[0]['success'], report)
+            self.assertEqual(report[0]['changed_fields'], ())
+            self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(w.plot_page.preview.snapshot.x_limits, (1.15, 1.85))
+        self.assertEqual(w.plot_page.rendered_page.display_x_limits, (1.15, 1.85))
+        self.assertEqual(w.plot_page.rendered_page.owner_token, w._plot_owner_token())
+
+    def test_workspace_colorbar_sample_follows_global_and_regional_rendered_limits(self):
+        w = self.w
+        for mode in ('global', '2'):
+            with self.subTest(mode=mode):
+                dat.set_choice(w, 'color_scale', mode)
+                w._render_plot_page()
+                dat.setup_number(w, 'vmin', -50.)
+                dat.setup_number(w, 'vmax', 300.)
+                w._render_plot_page()
+                p, snapshot = w.plot_page, w.plot_page.preview.snapshot
+                limits = ({region.id: region.color_limits for region in snapshot.regions}
+                          if snapshot.regions else {'global': snapshot.color_limits})
+                self.assertEqual(set(p._colorbar_norms), set(limits))
+                for identifier, expected in limits.items():
+                    self.assertEqual((p._colorbar_norms[identifier].vmin,
+                                      p._colorbar_norms[identifier].vmax), expected)
+                if mode == 'global':
+                    self.assertIn('-50', p.formal.state['sample'])
+                    self.assertIn('300', p.formal.state['sample'])
 
     def test_named_load_for_current_uses_selective_dialog_and_preserves_other_owners(self):
         self.copy_source()

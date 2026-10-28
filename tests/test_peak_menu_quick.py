@@ -7,14 +7,14 @@ from dataclasses import replace
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QImage
 from PySide6.QtWidgets import QWidget
 
 from tests.quick_migration_case import QuickMigrationCase
 from tests import analysis_canvas_quick_helpers as ac
-from tests.formal_quick_helpers import item
+from tests.formal_quick_helpers import click_item, item
 from tests.settings_helpers import wait_for_background_jobs
 
 APP = QCoreApplication
@@ -71,6 +71,80 @@ class PeakMenuQuickTests(QuickMigrationCase):
         prompt.assert_not_called()
         self.assertEqual(len(self.w._history_for(self.w.workspace.active).undo_stack), before)
 
+    def test_format_menu_blank_peak_and_heatmap_routes_use_existing_clipboard(self):
+        w = self.w
+        self.assertIsNone(w._plot_settings_clipboard)
+        ac.click_data(w, w._spec_ax, (1.9, float(np.mean(w._spec_ax.get_ylim()))), button=Qt.RightButton)
+        self.assertTrue(ac.peak_menu(w).property('visible'))
+        self.assertFalse(item(w, 'analysisPeakSetLabel').isVisible())
+        self.assertAlmostEqual(item(w, 'analysisCopySvg').y(), 0.)
+        self.assertEqual(item(w, 'analysisFormatCopy').property('text'), 'Copy Format')
+        self.assertFalse(item(w, 'analysisFormatPaste').isEnabled())
+        click_item(w, 'analysisFormatCopy')
+        copied = w._plot_settings_clipboard
+        self.assertIsNotNone(copied)
+        w.set_plot_presentation(replace(w.plot_page.presentation, width_in=4.7, aspect_locked=False))
+        ac.pump(100)
+        # Existing peak actions remain alongside format transfer.
+        self.open_menu()
+        self.assertTrue(item(w, 'analysisPeakDelete').isVisible())
+        self.assertTrue(item(w, 'analysisFormatPaste').isEnabled())
+        selected = []
+        def accept_options():
+            from spectra_app.plot_dialogs import ApplyFormatDialog
+            dialogs = self.host.window.findChildren(ApplyFormatDialog)
+            if dialogs:
+                selected.extend(dialogs[-1].selected_ids())
+                dialogs[-1].accept()
+        QTimer.singleShot(100, accept_options)
+        click_item(w, 'analysisFormatPaste')
+        self.assertEqual(selected, [w.workspace.active_dataset_id])
+        self.assertEqual(w.plot_page.presentation.width_in, copied.style.width_in)
+        np.testing.assert_array_equal(w.peak_indices, [2, 5])
+        ac.click_data(w, w._heat_ax, (1.9, 7.), button=Qt.RightButton)
+        self.assertTrue(ac.peak_menu(w).property('visible'))
+        request = dict(self.bridge.peakMenu)
+        w.open_graph_document()
+        self.assertFalse(self.bridge.choosePeakMenu(request['requestId'], 'settings_paste', request['owner']))
+        ac.reveal(w)
+        ac.click_data(w, w._heat_ax, (1.5, .05), button=Qt.RightButton)
+        self.assertFalse(ac.peak_menu(w).property('visible'))
+        np.testing.assert_array_equal(w.peak_indices, [2])
+
+    def test_image_menu_copies_final_svg_and_png_and_rejects_stale_owner(self):
+        self.addCleanup(QGuiApplication.clipboard().clear)
+        w = self.w
+        w.set_plot_presentation(replace(w.plot_page.presentation, width_in=4., height_in=3.,
+                                       aspect_locked=False, heatmap_dpi=150))
+        for name, command in (('analysisCopySvg', 'copy_svg'), ('analysisCopyPng', 'copy_png')):
+            with self.subTest(command=command):
+                self.open_menu()
+                self.assertEqual(item(w, name).property('text'), 'Copy ' + command[-3:].upper())
+                self.assertTrue(item(w, name).isEnabled())
+                click_item(w, name)
+                page = w.plot_page.rendered_page
+                mime = QGuiApplication.clipboard().mimeData()
+                if command == 'copy_svg':
+                    self.assertEqual(mime.formats(), ['image/svg+xml'])
+                    self.assertEqual(bytes(mime.data('image/svg+xml')), page.svg_bytes)
+                else:
+                    encoded = bytes(mime.data('image/png'))
+                    self.assertTrue(encoded.startswith(b'\x89PNG\r\n\x1a\n'))
+                    decoded = QImage.fromData(encoded, 'PNG')
+                    self.assertFalse(decoded.isNull())
+                    self.assertTrue(mime.hasImage())
+                    self.assertEqual((decoded.width(), decoded.height()),
+                                     tuple(round(value * page.heatmap_dpi) for value in page.figure_size_in))
+                    self.assertEqual(QGuiApplication.clipboard().image().size(), decoded.size())
+        request = self.open_menu()
+        other = self.folder/'image-copy-other.dat'
+        other.write_bytes(self.path.read_bytes())
+        w._load_dat_file_direct(other)
+        QGuiApplication.clipboard().setText('Keep current clipboard')
+        for command in ('copy_svg', 'copy_png'):
+            self.assertFalse(self.bridge.choosePeakMenu(request['requestId'], command, request['owner']))
+        self.assertEqual(QGuiApplication.clipboard().text(), 'Keep current clipboard')
+
     def test_actual_right_release_menu_dismiss_and_canvas_focus(self):
         w = self.w; host = item(w, 'applicationDatCanvas'); point = self.point()
         owner = self.bridge.ownerToken
@@ -81,7 +155,7 @@ class PeakMenuQuickTests(QuickMigrationCase):
         ac.release(w, point, button=Qt.RightButton); ac.pump(70)
         menu = ac.peak_menu(w)
         self.assertTrue(menu.property('visible'))
-        self.assertEqual(menu.property('count'), 3)
+        self.assertEqual(menu.property('count'), 9)
         self.assertIn('8', item(host, 'analysisPeakSetLabel').property('text'))
         self.assertEqual(item(host, 'analysisPeakDelete').property('text'), 'Delete Peak')
         self.assertTrue(ac.peak_menu(w).property('visible'))
@@ -171,7 +245,9 @@ class PeakMenuQuickTests(QuickMigrationCase):
     def test_miss_empty_mode_import_and_heatmap_keep_their_routes(self):
         w = self.w; host = item(w, 'applicationDatCanvas')
         QTest.mouseClick(w.root_window, Qt.RightButton, pos=self.point(1.95)); ac.pump(40)
-        self.assertFalse(self.bridge.peakMenu)
+        self.assertFalse(self.bridge.peakMenu['hasPeak'])
+        self.assertTrue(ac.peak_menu(w).property('visible'))
+        QTest.keyClick(w.root_window, Qt.Key_Escape); ac.pump(40)
         w.toolbar.pan()
         QTest.mouseClick(w.root_window, Qt.RightButton, pos=self.point()); ac.pump(40)
         self.assertFalse(self.bridge.peakMenu)
@@ -188,8 +264,9 @@ class PeakMenuQuickTests(QuickMigrationCase):
         self.assertTrue(w.undo_edit())
         w.peak_indices = np.array([], dtype=int); w.batch_peak_map.clear()
         QTest.mouseClick(w.root_window, Qt.RightButton, pos=self.point()); ac.pump(40)
-        self.assertFalse(self.bridge.peakMenu)
-        self.assertFalse(ac.peak_menu(w).property('visible'))
+        self.assertFalse(self.bridge.peakMenu['hasPeak'])
+        self.assertTrue(ac.peak_menu(w).property('visible'))
+        self.assertFalse(item(host, 'analysisPeakDelete').isVisible())
 
     def test_same_gate_noop_new_request_invalid_choice_and_replay(self):
         first = self.open_menu()

@@ -47,7 +47,7 @@ Inno Setup is not required and no installer or ZIP is compressed.
   -OutputDirectory 'C:\BuildOutput\spectra-preview-001'
 ```
 
-To deliver only `SpectraAnalyzer-0.1.3-Setup.exe`, select `-Mode Installer`, provide
+To deliver only `SpectraAnalyzer-0.1.4-Setup.exe`, select `-Mode Installer`, provide
 `-InnoCompiler`, and keep the same cache directory. This freezes once, compresses
 one installer, and skips the portable ZIP. `Preview` and `Installer` share cache
 entries. A preceding Preview build is optional. Each still creates a fresh bundle

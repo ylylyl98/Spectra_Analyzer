@@ -150,6 +150,16 @@ class FormalPreviewQuickTests(unittest.TestCase):
                   for dx in range(-7, 8) for dy in range(-7, 8)]
         self.assertTrue(any(c.blue() > 160 and c.red() < 50 and c.green() < 140 for c in colors))
 
+    def test_right_doubleclick_does_not_enter_left_button_property_editor(self):
+        host = self.preview()
+        edits = []
+        host.propertyEditRequested.connect(lambda *args: edits.append(args))
+        point = self.point(host, self.measured_point(host, 'title'))
+        QTest.mouseDClick(host, Qt.RightButton, pos=point)
+        QTest.mouseRelease(host, Qt.RightButton, pos=point)
+        pump()
+        self.assertEqual(edits, [])
+
     def test_actual_text_title_and_arrow_head_drags_commit_once_with_offset(self):
         host = self.preview()
         moved, title, selections = [], [], []

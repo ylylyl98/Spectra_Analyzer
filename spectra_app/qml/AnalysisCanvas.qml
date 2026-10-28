@@ -206,14 +206,51 @@ FocusScope {
         }
         Controls.MenuItem {
             objectName: "analysisPeakSetLabel"
+            visible: root.peakRequest.hasPeak === true
+            height: visible ? implicitHeight : 0
             text: root.peakRequest.labelText || "Set Label…"
             onTriggered: { root.peakChoice = "set_label"; peakMenu.close() }
         }
-        Controls.MenuSeparator { objectName: "analysisPeakSeparator" }
+        Controls.MenuSeparator {
+            objectName: "analysisPeakSeparator"
+            visible: root.peakRequest.hasPeak === true
+            height: visible ? implicitHeight : 0
+        }
         Controls.MenuItem {
             objectName: "analysisPeakDelete"
+            visible: root.peakRequest.hasPeak === true
+            height: visible ? implicitHeight : 0
             text: "Delete Peak"
             onTriggered: { root.peakChoice = "delete"; peakMenu.close() }
+        }
+        Controls.MenuSeparator {
+            visible: root.peakRequest.hasPeak === true
+            height: visible ? implicitHeight : 0
+        }
+        Controls.MenuItem {
+            objectName: "analysisCopySvg"
+            text: "Copy SVG"
+            enabled: root.bridge.formatCommands.copy_svg === true
+            onTriggered: { root.peakChoice = "copy_svg"; peakMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "analysisCopyPng"
+            text: "Copy PNG"
+            enabled: root.bridge.formatCommands.copy_png === true
+            onTriggered: { root.peakChoice = "copy_png"; peakMenu.close() }
+        }
+        Controls.MenuSeparator { }
+        Controls.MenuItem {
+            objectName: "analysisFormatCopy"
+            text: "Copy Format"
+            enabled: root.bridge.formatCommands.settings_copy === true
+            onTriggered: { root.peakChoice = "settings_copy"; peakMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "analysisFormatPaste"
+            text: "Paste Format"
+            enabled: root.bridge.formatCommands.settings_paste === true
+            onTriggered: { root.peakChoice = "settings_paste"; peakMenu.close() }
         }
     }
 

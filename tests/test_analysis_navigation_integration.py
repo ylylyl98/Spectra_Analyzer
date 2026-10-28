@@ -187,7 +187,9 @@ class AnalysisNavigationIntegrationTests(QuickMigrationCase):
 
     def test_settings_actions_remain_authoritative_and_comparison_opens(self):
         w, bridge = self.w, self.w.analysis_navigation
-        actions = {'settings_copy': w._settings_copy_action,
+        actions = {'copy_svg': w._graph_copy_svg_action,
+                   'copy_png': w._graph_copy_png_action,
+                   'settings_copy': w._settings_copy_action,
                    'settings_paste': w._settings_paste_action,
                    'settings_copy_to': w._settings_copy_to_action,
                    'comparison': w._comparison_action}

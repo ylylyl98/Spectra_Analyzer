@@ -33,6 +33,7 @@ class FormalPlotController(QObject):
     displayZoomChanged = Signal(str)
     propertyEditRequested = Signal(str, str)
     graphCopyRequested = Signal()
+    graphPngCopyRequested = Signal()
     analysisRequested = Signal()
 
     def __init__(self, parent=None, *, prompt_window=None):
@@ -55,6 +56,9 @@ class FormalPlotController(QObject):
         self.preview = FormalPreviewController(self)
         self.preview.propertyEditRequested.connect(self.propertyEditRequested)
         self.preview.graphCopyRequested.connect(lambda: self.formal.command('copy_svg'))
+        self.preview.formatCommandRequested.connect(self.formal.command)
+        self.formal.stateChanged.connect(lambda:
+            self.preview.set_format_commands(self.formal.state['commands']))
         self.preview.titleMoved.connect(self._move_title)
         self.preview.annotationSelected.connect(self.select_annotation)
         self.preview.annotationMoved.connect(self._replace_annotation)
@@ -136,6 +140,7 @@ class FormalPlotController(QObject):
             named[key].emit(self.selected_format)
             return
         signals = {'analyze': self.analysisRequested, 'copy_svg': self.graphCopyRequested,
+            'copy_png': self.graphPngCopyRequested,
             'settings_copy': self.settingsCopyRequested, 'settings_paste': self.settingsPasteRequested,
             'settings_copy_to': self.settingsCopyToRequested, 'comparison': self.comparisonRequested,
             'format_save': self.formatSaveRequested, 'batch_export': self.batchExportRequested,
@@ -339,7 +344,7 @@ class FormalPlotController(QObject):
         self.preview.invalidate(owner_token)
         self.preview.selected_id = selected_id
         self.preview.title_selected = title_selected
-        for key in ('export_svg', 'export_png', 'copy_svg'):
+        for key in ('export_svg', 'export_png', 'copy_svg', 'copy_png'):
             self.formal._commands[key]['enabled'] = False
         self.status_text = message
         self._update_dimensions_summary()
@@ -352,7 +357,7 @@ class FormalPlotController(QObject):
             return False
         self.rendered_page = page
         self.formal._frame_auto_size = tuple(math.floor(value * 1000) / 1000 for value in page.plot_size_in)
-        for key in ('export_svg', 'export_png', 'copy_svg'):
+        for key in ('export_svg', 'export_png', 'copy_svg', 'copy_png'):
             self.formal._commands[key]['enabled'] = True
         self._update_dimensions_summary(current_page=True)
         self.status_text = ''
