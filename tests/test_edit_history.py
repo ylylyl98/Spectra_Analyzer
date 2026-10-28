@@ -1,55 +1,87 @@
+from tests import ordinary_analysis_quick_helpers as oa
+from tests import quick_migration_case as migration
+from tests import analysis_canvas_quick_helpers as ac
+from tests.quick_helpers import set_processing_window
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from dataclasses import replace
 from types import SimpleNamespace
 import threading
-import unittest
+import sys
 from unittest.mock import patch
+import unittest
 
 import numpy as np
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QPoint, QPointF, Qt
+from PySide6.QtGui import QGuiApplication, QInputMethodEvent
+from PySide6.QtQuick import QQuickItem
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMenu, QInputDialog
-
-from spectra_app.main_window import MainWindow
+from tests.dat_properties_quick_helpers import (
+    edit_number, edit_label, reveal, choose,
+    click, state, set_choice, set_flag, setup_number)
 from spectra_app.plot_templates import FormatApplicationOptions
-from tests.settings_helpers import isolate_settings, wait_for_background_jobs
+from tests.settings_helpers import wait_for_background_jobs
+from tests.formal_quick_helpers import item as quick_item, pump, input_receiver
 from tests.test_workflow import _fit_result
 
-APP = QApplication.instance() or QApplication([])
-
-
-class EditHistoryTests(unittest.TestCase):
+class EditHistoryTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.w = MainWindow()
-        self.w._show_error = self.fail
+        if sys.platform == 'win32' and self._testMethodName == 'test_template_manual_override_restores_owner_template_snapshot':
+            # The real ComboBox popup requires the native Windows presentation.
+            self.enterContext(patch.dict(os.environ, QT_QPA_PLATFORM='windows'))
+        super().setUp()
+        self.w = self.controller
         self.path = self.folder / 'history.dat'
         self.path.write_text('Energy(eV) 0 1 2\n' + '\n'.join(
             f'{1+i/10} {i+1} {2*(i+1)} {3*(i+1)}' for i in range(12)))
         self.w._load_dat_file_direct(self.path)
         self.w.open_graph_document()
         self.s = self.w.workspace.active
-        self.w.resize(1250, 900)
-        self.w.plot_tabs.setCurrentWidget(self.w.graph_documents)
-        self.w.show()
-        self.w.activateWindow()
-        APP.processEvents()
+        self.w.root_window.resize(1250, 900)
+        self.w.request_outer_view('workspace')
+        self.w.dat_details_action.setChecked(True)
+        self.w.request_task(2)
+        self.w.root_window.requestActivate()
+        pump()
         self.render()
 
     def tearDown(self):
         wait_for_background_jobs(self.w)
-        APP.clipboard().clear()
-        self.w.close()
-        self.w.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+        self.assertEqual(self.quick_errors, [], 'Unexpected production Quick error')
+        super().tearDown()
 
     def render(self):
         self.w._render_plot_page()
-        APP.processEvents()
+        pump()
         self.assertIsNotNone(self.w.plot_page.rendered_page)
         return self.w.plot_page.rendered_page
+
+    def canvas(self):
+        return self.w.graph_documents.content_item(self.w._document_key())
+
+    def focus_canvas(self):
+        viewport = quick_item(self.canvas(), 'formalViewport')
+        viewport.forceActiveFocus()
+        pump()
+        self.assertTrue(viewport.hasActiveFocus())
+
+    def menu_item(self, group, action):
+        bar = self.w.root_window.property('menuBar')
+        entry = next(item for item in bar.property('contentItem').childItems()
+                     if item.property('text') == group)
+        point = entry.mapToScene(QPointF(entry.width()/2, entry.height()/2)).toPoint()
+        QTest.mouseClick(self.w.root_window, Qt.LeftButton, pos=point)
+        pump()
+        control = next(item for item in self.w.root_window.findChildren(QQuickItem)
+                       if item.inherits('QQuickMenuItem') and item.isVisible()
+                       and item.property('text') == action.text())
+        self.assertTrue(control.isEnabled())
+        return control
+
+    def click_menu_item(self, control):
+        point = control.mapToScene(QPointF(control.width()/2, control.height()/2)).toPoint()
+        QTest.mouseClick(input_receiver(self.w, control), Qt.LeftButton, pos=point)
+        pump()
 
     def undo(self):
         self.assertTrue(hasattr(self.w, 'undo_edit'), 'Dataset Undo is missing')
@@ -57,9 +89,6 @@ class EditHistoryTests(unittest.TestCase):
 
     def redo(self):
         self.assertTrue(self.w.redo_edit())
-
-    def finish_label(self, control):
-        (control.lineEdit() if hasattr(control, 'lineEdit') else control).editingFinished.emit()
 
     def test_annotation_add_edit_move_delete_are_separate_reversible_commands(self):
         p = self.w.plot_page
@@ -70,17 +99,18 @@ class EditHistoryTests(unittest.TestCase):
         self.assertEqual(self.s.presentation.annotations[0].text, 'one')
         self.render()
         p.select_annotation(item.id)
-        p.annotation_text.setText('two')
-        p.annotation_apply_btn.click()
+        p.formal.setDraft('annotation_text', 'two')
+        p.formal.applyAnnotation()
         self.undo()
         self.assertEqual(self.s.presentation.annotations[0].text, 'one')
         self.redo()
         self.render()
-        start = p.preview.annotation_point(self.s.presentation.annotations[0])
+        start = quick_item(self.canvas(), 'formalPaper').mapToScene(
+            p.preview.annotation_point(self.s.presentation.annotations[0])).toPoint()
         end = start + QPoint(22, 15)
-        QTest.mousePress(p.preview, Qt.LeftButton, pos=start)
-        QTest.mouseMove(p.preview, end)
-        QTest.mouseRelease(p.preview, Qt.LeftButton, pos=end)
+        QTest.mousePress(self.w.root_window, Qt.LeftButton, pos=start)
+        QTest.mouseMove(self.w.root_window, end)
+        QTest.mouseRelease(self.w.root_window, Qt.LeftButton, pos=end)
         moved = self.s.presentation.annotations[0].position
         self.assertNotEqual(moved, (.15, .85))
         self.undo()
@@ -95,12 +125,12 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_committed_title_is_one_command_and_restores_sidecar_and_export(self):
         w = self.w
-        old = w.plot_title_edit.text()
+        old = state(w)['plot_title']
         for text in ('N', 'Ne', 'New title'):
-            w.plot_title_edit.setText(text)
-        self.finish_label(w.plot_title_edit)
+            edit_label(w, 'plot_title', text)
+        QTest.keyClick(w.root_window, Qt.Key_Return)
         self.undo()
-        self.assertEqual(w.plot_title_edit.text(), old)
+        self.assertEqual(state(w)['plot_title'], old)
         self.assertFalse(w.undo_edit(), 'Typing must produce one committed command')
         self.redo()
         self.assertIn('New title', self.render().svg_bytes.decode())
@@ -110,19 +140,19 @@ class EditHistoryTests(unittest.TestCase):
     def test_visual_undo_preserves_later_fit_controls_recipe_gate_and_cube(self):
         w = self.w
         cube = self.s.current_cube
-        old_name = w.y_axis_name_edit.text()
-        w.y_axis_name_edit.setText('Magnetic field')
-        self.finish_label(w.y_axis_name_edit)
+        old_name = state(w)['y_axis_name']
+        edit_label(w, 'y_axis_name', 'Magnetic field')
+        QTest.keyClick(w.root_window, Qt.Key_Return)
         fit = _fit_result(1.5)
         self.s.fit_result = fit
         self.s.fit_gate_idx = 0
         self.s.batch_fit_result_map[0] = fit
-        w.prom_spin.setValue(.37)
-        w.processing_window_spin.setValue(9)
+        oa.set_number(w, 'prominence', .37)
+        set_processing_window(w.processing, 9)
         w._set_current_gate_from_index(2)
         pending = replace(self.s.pending)
         self.undo()
-        self.assertEqual(w.y_axis_name_edit.text(), old_name)
+        self.assertEqual(state(w)['y_axis_name'], old_name)
         self.assertIs(self.s.fit_result, fit)
         self.assertIs(self.s.batch_fit_result_map[0], fit)
         self.assertEqual(self.s.analysis_controls.prominence, .37)
@@ -132,58 +162,59 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_signal_manual_edit_undo_restores_auto_mode_and_label(self):
         w = self.w
-        old = w.signal_title_combo.currentText()
-        self.assertTrue(w.signal_title_auto_chk.isChecked())
-        w.signal_title_combo.setCurrentText('Manual signal')
-        self.finish_label(w.signal_title_combo)
+        old = state(w)['signal_title']
+        self.assertTrue(state(w)['signal_title_auto'])
+        edit_label(w, 'signal_title', 'Manual signal')
+        QTest.keyClick(w.root_window, Qt.Key_Return)
         self.undo()
-        self.assertTrue(w.signal_title_auto_chk.isChecked())
-        self.assertEqual(w.signal_title_combo.currentText(), old)
+        self.assertTrue(state(w)['signal_title_auto'])
+        self.assertEqual(state(w)['signal_title'], old)
         self.redo()
-        self.assertFalse(w.signal_title_auto_chk.isChecked())
-        self.assertEqual(w.signal_title_combo.currentText(), 'Manual signal')
+        self.assertFalse(state(w)['signal_title_auto'])
+        self.assertEqual(state(w)['signal_title'], 'Manual signal')
 
     def test_presentation_and_range_changes_restore_only_changed_domains(self):
         w, p = self.w, self.w.plot_page
         old_text = self.s.presentation.text_pt
-        p.text_spin.setValue(old_text + 2)
-        w.xmin_spin.setValue(1.2)
+        p.formal.setValue('text_pt', old_text + 2)
+        edit_number(w, 'xmin', '1.2', commit=True)
         xlim = self.s.view.x_limits
         self.undo()
-        self.assertEqual(w.xmin_spin.value(), 1.)
+        self.assertEqual(float(state(w)['xmin']), 1.)
         self.assertEqual(self.s.presentation.text_pt, old_text + 2)
         self.undo()
-        self.assertEqual(p.text_spin.value(), old_text)
+        self.assertEqual(float(p.formal.state['fields']['text_pt']), old_text)
         self.redo()
         self.redo()
         self.assertEqual(self.s.view.x_limits, xlim)
-        w.xmin_lock.setChecked(True)
+        set_flag(w, 'xmin_lock', True)
         self.undo()
-        self.assertFalse(w.xmin_lock.isChecked())
+        self.assertFalse(state(w)['xmin_lock'])
         self.assertEqual(self.s.view.x_limits, xlim)
 
     def test_color_mapping_palette_regions_and_auto_colors_are_reversible(self):
         w = self.w
         old_palette = self.s.view.colormap
-        w.cmap_combo.setCurrentIndex(w.cmap_combo.findData('plasma'))
+        set_choice(w, 'colormap', 'plasma')
         self.undo()
         self.assertEqual(self.s.view.colormap, old_palette)
         self.redo()
-        w.mapping_combo.setCurrentIndex(w.mapping_combo.findData('log'))
+        set_choice(w, 'mapping', 'log')
         self.undo()
         self.assertEqual(self.s.view.norm.kind, 'linear')
         self.redo()
-        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData('2'))
+        set_choice(w, 'color_scale', '2')
         self.undo()
         self.assertEqual(self.s.view.color_scale_mode, 'global')
         self.redo()
         self.assertEqual(self.s.view.color_scale_mode, '2')
         old_edges = list(self.s.view.color_region_boundaries)
-        w.region_boundary_spins[0].setValue(1.35)
+        setup_number(w, 'edge0', 1.35)
         self.undo()
         self.assertEqual(self.s.view.color_region_boundaries, old_edges)
 
     def test_noop_capture_selection_render_zoom_and_gate_do_not_record_edits(self):
+        self.addCleanup(QGuiApplication.clipboard().clear)
         w, p = self.w, self.w.plot_page
         self.assertTrue(hasattr(w, 'undo_edit'), 'Dataset Undo is missing')
         w.copy_plot_settings()
@@ -204,21 +235,21 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_pending_label_flushes_to_original_owner_and_new_edit_clears_redo(self):
         w = self.w
-        w.plot_title_edit.setText('First owner')
+        edit_label(w, 'plot_title', 'First owner')
         other_path = self.folder / 'other.dat'
         other_path.write_bytes(self.path.read_bytes())
         w._load_dat_file_direct(other_path)
         other = w.workspace.active
         self.assertTrue(hasattr(w, 'undo_edit'), 'Dataset Undo is missing')
         self.assertFalse(w.undo_edit())
-        w.y_axis_name_edit.setText('Other field')
-        self.finish_label(w.y_axis_name_edit)
+        edit_label(w, 'y_axis_name', 'Other field')
+        QTest.keyClick(w.root_window, Qt.Key_Return)
         w.activate_dataset(self.s.dataset_id)
         self.undo()
         self.assertEqual(self.s.view.annotations['plot_title'], '')
         self.assertEqual(other.view.annotations['y_axis_name'], 'Other field')
-        w.plot_title_edit.setText('Replacement')
-        self.finish_label(w.plot_title_edit)
+        edit_label(w, 'plot_title', 'Replacement')
+        QTest.keyClick(w.root_window, Qt.Key_Return)
         self.assertFalse(w.redo_edit())
         w.activate_dataset(other.dataset_id)
         self.undo()
@@ -226,7 +257,7 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_selective_format_paste_records_each_target_and_preserves_unselected_values(self):
         w = self.w
-        w.plot_page.text_spin.setValue(11.)
+        w.plot_page.formal.setValue('text_pt', 11.)
         w.copy_plot_settings()
         source = self.s
         other_path = self.folder / 'target.dat'
@@ -325,47 +356,48 @@ class EditHistoryTests(unittest.TestCase):
     def test_native_text_undo_and_explicit_menu_undo_do_not_conflict(self):
         w, p = self.w, self.w.plot_page
         p.add_annotation('text', 'note')
-        p.control_scroll.ensureWidgetVisible(w.y_axis_name_edit)
-        w.y_axis_name_edit.setFocus()
-        old = w.y_axis_name_edit.text()
-        QTest.keyClick(w.y_axis_name_edit, Qt.Key_End)
-        QTest.keyClicks(w.y_axis_name_edit, ' xyz')
-        QTest.keyClick(w.y_axis_name_edit, Qt.Key_Z, Qt.ControlModifier)
-        self.assertEqual(w.y_axis_name_edit.text(), old)
+        reveal(w, 'y_axis_name')
+        old = state(w)['y_axis_name']
+        QTest.keyClick(w.root_window, Qt.Key_End)
+        for character in ' xyz':
+            event = QInputMethodEvent()
+            event.setCommitString(character)
+            QCoreApplication.sendEvent(w.root_window, event)
+        QTest.keyClick(w.root_window, Qt.Key_Z, Qt.ControlModifier)
+        self.assertEqual(state(w)['y_axis_name'], old)
         self.assertEqual(len(self.s.presentation.annotations), 1)
         self.assertIn('undo', w._graph_command_actions)
-        w._edit_menu.aboutToShow.emit()
-        self.assertIn('Add annotation', w._graph_command_actions['undo'].text())
-        w._graph_command_actions['undo'].trigger()
+        command = self.menu_item('Edit', w._graph_command_actions['undo'])
+        self.assertIn('Add annotation', command.property('text'))
+        self.click_menu_item(command)
         self.assertEqual(self.s.presentation.annotations, ())
         self.render()
-        p.preview.setFocus()
-        self.assertTrue(p.preview.hasFocus())
-        QTest.keyClick(p.preview, Qt.Key_Y, Qt.ControlModifier)
+        self.focus_canvas()
+        QTest.keyClick(w.root_window, Qt.Key_Y, Qt.ControlModifier)
         self.assertEqual(len(self.s.presentation.annotations), 1)
 
     def test_reread_and_transformation_retire_incompatible_history(self):
         w = self.w
-        w.plot_page.text_spin.setValue(16.)
+        w.plot_page.formal.setValue('text_pt', 16.)
         owner = self.s.dataset_id
         w._load_dat_file_direct(self.path)
         self.assertEqual(w.workspace.active.dataset_id, owner)
         self.assertTrue(hasattr(w, 'undo_edit'), 'Dataset Undo is missing')
         self.assertFalse(w.undo_edit())
-        w.plot_page.text_spin.setValue(18.)
+        w.plot_page.formal.setValue('text_pt', 18.)
         w._replace_current_data(replace(w.current_cube, z=w.current_cube.z * 2),
             mode='energy_second_derivative', smooth=False, window_length=5)
         self.assertFalse(w.undo_edit())
 
     def test_busy_work_rejects_restore_without_altering_committed_state(self):
         w = self.w
-        w.plot_page.text_spin.setValue(16.)
+        w.plot_page.formal.setValue('text_pt', 16.)
         release = threading.Event()
         self.addCleanup(release.set)
         def work(context):
             release.wait(3)
             return 'finished'
-        w._start_background_job(work, lambda result: w.statusBar().showMessage(result), 'Testing work')
+        w._start_background_job(work, w.publish_status, 'Testing work')
         self.assertTrue(w._background_jobs.busy)
         self.assertIn('undo', w._graph_command_actions)
         self.assertFalse(w._graph_command_actions['undo'].isEnabled())
@@ -393,9 +425,9 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_fixed_label_defaults_follow_undo_without_changing_named_presets(self):
         w = self.w
-        old = w.y_axis_unit_edit.text()
-        w.y_axis_unit_edit.setText('Tesla')
-        self.finish_label(w.y_axis_unit_edit)
+        old = state(w)['y_axis_unit']
+        edit_label(w, 'y_axis_unit', 'Tesla')
+        QTest.keyClick(w.root_window, Qt.Key_Return)
         w._annotation_settings.setValue('plot_titles/presets', '{"unrelated":"keep"}')
         self.undo()
         self.assertEqual(w._annotation_settings.value('plot_annotations/y_axis_unit'), old)
@@ -405,14 +437,14 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_template_manual_override_restores_owner_template_snapshot(self):
         w = self.w
-        w.title_preset_combo.setCurrentText('Current group')
-        w.title_pattern_edit.setText('Template title')
-        self.finish_label(w.title_pattern_edit)
+        choose(w, 'title_preset', 'Current group')
+        edit_label(w, 'title_pattern', 'Template title')
+        click(w, 'shared_template_apply')
         template = w._copy_title_settings(self.s.view.title_settings)
-        w.plot_title_edit.setText('Manual override')
-        self.finish_label(w.plot_title_edit)
+        edit_label(w, 'plot_title', 'Manual override')
+        QTest.keyClick(w.root_window, Qt.Key_Return)
         self.undo()
-        self.assertEqual(w.plot_title_edit.text(), 'Template title')
+        self.assertEqual(state(w)['plot_title'], 'Template title')
         self.assertEqual(self.s.view.title_settings, template)
         self.redo()
         self.assertEqual(self.s.view.title_settings['manual_override'], 'Manual override')
@@ -420,27 +452,26 @@ class EditHistoryTests(unittest.TestCase):
     def test_numeric_color_commit_includes_implicit_lock_in_one_command(self):
         w = self.w
         original = self.s.view.color_limits
-        w.vmax_spin.setFocus()
-        w.vmax_spin.lineEdit().selectAll()
-        QTest.keyClicks(w.vmax_spin.lineEdit(), '30')
-        QTest.keyClick(w.vmax_spin, Qt.Key_Return)
-        self.assertTrue(w.vmax_lock.isChecked())
+        edit_number(w, 'vmax', '30', commit=True)
+        self.assertTrue(state(w)['vmax_lock'])
         self.undo()
-        self.assertFalse(w.vmax_lock.isChecked())
+        self.assertFalse(state(w)['vmax_lock'])
         self.assertEqual(self.s.view.color_limits, original)
         self.assertFalse(w.undo_edit(), 'Value plus implicit Fix must be one command')
         self.redo()
-        self.assertTrue(w.vmax_lock.isChecked())
-        self.assertEqual(w.vmax_spin.value(), 30.)
+        self.assertTrue(state(w)['vmax_lock'])
+        self.assertEqual(float(state(w)['vmax']), 30.)
 
     def test_toolbar_range_gesture_is_one_command_and_display_zoom_is_not(self):
         w = self.w
         original = self.s.view.x_limits
+        ac.reveal(w)
         w.toolbar.pan()
-        w._heat_ax.set_xlim(1.1, 1.9)
-        w._heat_ax.set_xlim(1.2, 1.8)
-        w._on_canvas_release(SimpleNamespace())
+        before = tuple(w._heat_ax.get_xlim())
+        ac.drag_data(w, w._heat_ax, (1.4, 1.), (1.6, 1.))
+        self.assertNotEqual(tuple(w._heat_ax.get_xlim()), before)
         w.toolbar.pan()
+        w.request_outer_view('workspace')
         w.plot_page.set_zoom('200%')
         self.undo()
         self.assertEqual(self.s.view.x_limits, original)
@@ -464,8 +495,8 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_rejected_ticks_and_noop_peak_drag_do_not_create_entries(self):
         w, p = self.w, self.w.plot_page
-        p.tick_values_edit.setText('bad ticks')
-        p.custom_ticks.setChecked(True)
+        p.formal.setDraft('tick_values', 'bad ticks')
+        p.formal.setValue('custom_ticks', True)
         self.assertIsNotNone(p.presentation_error)
         self.assertFalse(w.undo_edit())
         p.set_presentation(self.s.presentation)
@@ -485,7 +516,7 @@ class EditHistoryTests(unittest.TestCase):
         w._load_dat_file_direct(other_path)
         target = w.workspace.active
         w.activate_dataset(source.dataset_id)
-        w.plot_page.numeric_spin.setValue(9.)
+        w.plot_page.formal.setValue('numeric_pt', 9.)
         w.copy_plot_settings()
         options = FormatApplicationOptions(layout=False, typography=True, axis=False,
             colormap=False, colorbar=False)
@@ -499,29 +530,37 @@ class EditHistoryTests(unittest.TestCase):
         self.assertEqual(target.presentation.numeric_pt, 10.)
 
     def test_peak_context_menu_delete_and_label_use_history_and_keep_label_fits(self):
+        from tests import analysis_canvas_quick_helpers as ac
         w = self.w
         self.seed_peaks()
         fit = _fit_result(1.5)
         w.fit_result, w._fit_gate_idx = fit, 0
         w.batch_fit_result_map = {0: fit}
-        def choose(data):
-            def select():
-                menu = APP.activePopupWidget()
-                action = next(action for action in menu.actions() if action.data() == data)
-                menu.setActiveAction(action)
-                QTest.keyClick(menu, Qt.Key_Return)
-            QTimer.singleShot(0, select)
-        choose('set_label')
-        with patch.object(QInputDialog, 'getInt', return_value=(12, True)):
-            w._show_peak_context_menu(1.5)
+        ac.reveal(w)
+        w._update_spectrum_only(); w.canvas.draw()
+        def open_menu():
+            ac.click_data(w, w._spec_ax, (1.5, float(np.mean(w._spec_ax.get_ylim()))),
+                          button=Qt.RightButton)
+            self.assertTrue(ac.peak_menu(w).property('visible'))
+        history = w._history_for(self.s)
+        before = len(history.undo_stack)
+        open_menu()
+        self.assertEqual(ac.choose_peak_label(w, 12), ('int', '8', 1, 99))
+        self.assertEqual(len(history.undo_stack), before + 1)
         self.assertEqual(w.peak_label_lookup[(0, 5)], 12)
         self.assertIs(w.fit_result, fit)
+        for result in ((99, False), (12, True)):
+            open_menu()
+            ac.choose_peak_label(w, result[0], accept=result[1])
+            self.assertEqual(w.peak_label_lookup[(0, 5)], 12)
+            self.assertEqual(len(history.undo_stack), before + 1)
+            self.assertIs(w.fit_result, fit)
         self.undo()
         self.assertEqual(w.peak_label_lookup[(0, 5)], 8)
         self.assertIs(w.fit_result, fit)
         self.redo()
-        choose('delete')
-        w._show_peak_context_menu(1.5)
+        open_menu()
+        ac.click_peak_menu(w, 'delete')
         np.testing.assert_array_equal(w.peak_indices, [2])
         self.assertNotIn(0, w.batch_fit_result_map)
         self.undo()
@@ -534,7 +573,7 @@ class EditHistoryTests(unittest.TestCase):
         fit = _fit_result(1.5)
         w.fit_result, w._fit_gate_idx = fit, 0
         w.batch_fit_result_map = {0: fit}
-        w.circle_delete_btn.setChecked(True)
+        oa.set_mode(w, 'circle', True)
         w._batch_delete_circle_start = (1.3, 1.)
         w._on_canvas_release(SimpleNamespace(inaxes=w._heat_ax, button=1, xdata=1.33, ydata=1.2))
         self.assertNotIn(1, w.batch_peak_map)
@@ -550,10 +589,10 @@ class EditHistoryTests(unittest.TestCase):
         np.testing.assert_array_equal(w._current_trace_peak_indices(), [2])
         self.assertNotIn('8', [artist.get_text() for artist in w._heat_peak_texts])
         self.undo()
-        self.assertIn('1.5', w.analysis_text.toPlainText())
+        self.assertIn('1.5', oa.summary(w))
         self.assertIn('8', [artist.get_text() for artist in w._heat_peak_texts])
         self.redo()
-        self.assertNotIn('1.5', w.analysis_text.toPlainText())
+        self.assertNotIn('1.5', oa.summary(w))
         self.assertNotIn('8', [artist.get_text() for artist in w._heat_peak_texts])
 
     def test_empty_peak_clear_is_a_noop_and_keeps_existing_csv_fit(self):
@@ -566,14 +605,14 @@ class EditHistoryTests(unittest.TestCase):
 
     def test_coupled_frame_and_tick_fields_restore_atomically(self):
         p = self.w.plot_page
-        p.frame_auto.setChecked(True)
+        p.formal.setValue('frame_auto', True)
         self.undo()
-        self.assertFalse(p.frame_auto.isChecked())
+        self.assertFalse(p.formal.state['fields']['frame_auto'])
         self.redo()
         self.assertIsNone(self.s.presentation.frame_width_in)
         self.assertIsNone(self.s.presentation.frame_height_in)
-        p.x_mode_combo.setCurrentText('By increment')
-        p.x_mode_combo.setCurrentText('By count')
+        p.formal.setValue('axis_x_mode', 'By increment')
+        p.formal.setValue('axis_x_mode', 'By count')
         self.undo()
-        self.assertEqual(p.x_mode_combo.currentText(), 'By increment')
+        self.assertEqual(p.formal.state['fields']['axis_x_mode'], 'By increment')
         self.assertIsNone(self.s.presentation.axis.x_major_count)

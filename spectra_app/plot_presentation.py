@@ -301,6 +301,9 @@ class PlotPresentation(_Record):
                 object.__setattr__(self, name, _number(getattr(self, name), name, positive=True))
         object.__setattr__(self, 'heatmap_dpi', _integer(self.heatmap_dpi, 'heatmap_dpi', minimum=1))
         _string(self.font_family, 'font_family', nonempty=True)
+        # Keep the serialized field compatible with older projects and formats,
+        # while applying the application's Arial policy at every record boundary.
+        object.__setattr__(self, 'font_family', 'Arial')
         _boolean(self.aspect_locked, 'aspect_locked')
         _boolean(self.include_peak_labels, 'include_peak_labels')
         title_position = _pair(self.title_position, 'title position')

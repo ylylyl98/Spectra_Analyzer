@@ -1,4 +1,4 @@
-"""Project rows follow available width without changing native navigation."""
+"""Production Project rows wrap while preserving pointer and keyboard routes."""
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
@@ -7,27 +7,27 @@ from unittest.mock import patch
 
 import numpy as np
 
-from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QFont, QFontMetricsF
+from PySide6.QtQml import QQmlExpression, qmlContext
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QTreeWidgetItem
 
-from spectra_app.main_window import MainWindow
 from spectra_app.workbook_state import Workbook, Sheet, Comparison
-from tests.settings_helpers import isolate_settings
+from tests.project_helpers import (click_project_row, project_control, project_label,
+                                   project_row, settle_project)
+from tests.quick_migration_case import QuickMigrationCase
 
 
-APP = QApplication.instance() or QApplication([])
 LONG_NAME = 'WSe2_PC2_20261012_ScanEnergyPolarizationTemperatureGateVoltage_NoSpaces.dat'
 
 
-class ProjectTreeWrapTests(unittest.TestCase):
+class ProjectTreeWrapTests(QuickMigrationCase):
     def setUp(self):
-        isolate_settings(self)
-        self.w = MainWindow()
-        self.w.resize(1500, 920)
-        self.w.show()
-        self.tree = self.w.data_navigator
+        super().setUp()
+        self.w = self.controller
+        self.original_font = QFont(project_control(self.w, 'projectNavigator').property('controlFont'))
+        self.host.window.resize(1500, 920)
+        self.host.show()
         book = Workbook(name=LONG_NAME)
         sheet = Sheet(name='能量光谱_' + LONG_NAME, source_path=None,
                       data=np.array([[1., 2.], [2., 3.]]), column_names=['X', 'Y'])
@@ -39,110 +39,113 @@ class ProjectTreeWrapTests(unittest.TestCase):
         self.w._refresh_data_navigator()
         self.book, self.sheet, self.comparison = book, sheet, comparison
         self.set_width(220)
-        self.addCleanup(self.dispose)
-
-    def dispose(self):
-        QTest.keyRelease(self.tree, Qt.Key_Control)
-        QTest.keyRelease(self.tree, Qt.Key_Shift)
-        self.w.close()
-        self.w.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+    def tearDown(self):
+        QTest.keyRelease(self.w.root_window, Qt.Key_Control)
+        QTest.keyRelease(self.w.root_window, Qt.Key_Shift)
+        self.assertEqual(self.quick_errors, [])
+        super().tearDown()
 
     def settle(self):
-        for _ in range(4):
-            APP.processEvents()
+        settle_project(self.w)
 
     def set_width(self, width):
-        self.w._main_splitter.setSizes([width, 1000])
+        panel = project_control(self.w, 'projectNavigator')
+        point = panel.mapToScene(QPointF(panel.width() + 2, panel.height() / 2))
+        end = point + QPointF(width - panel.width(), 0)
+        QTest.mousePress(self.w.root_window, Qt.LeftButton, Qt.NoModifier, point.toPoint())
+        QTest.mouseMove(self.w.root_window, end.toPoint(), 30)
+        QTest.mouseRelease(self.w.root_window, Qt.LeftButton, Qt.NoModifier, end.toPoint())
         self.settle()
+        self.assertAlmostEqual(panel.width(), width, delta=1)
 
-    def rows(self):
-        keys = [('workbook', self.book.workbook_id), ('sheet', self.sheet.sheet_id),
+    def keys(self):
+        return [('workbook', self.book.workbook_id), ('sheet', self.sheet.sheet_id),
                 ('xy', self.comparison.comparison_id)]
-        items = {item.data(0, Qt.UserRole): item for item in self.w._navigator_items()}
-        return tuple(items[key] for key in keys)
 
-    def lower_point(self, item):
-        self.tree.scrollToItem(item)
-        self.settle()
-        rect = self.tree.visualItemRect(item)
-        return QPoint(rect.left() + 10, rect.bottom() - 3)
+    def lower_point(self, key):
+        item = project_row(self.w, key)
+        return item.mapToScene(QPointF(item.width() - 18, item.height() - 4)).toPoint()
 
     def test_rows_grow_and_shrink_with_width_and_font_without_changing_names(self):
-        rows = self.rows()
-        originals = [(row.text(0), row.data(0, Qt.UserRole), row.toolTip(0)) for row in rows]
+        project = self.w.project
+        originals = [project.row_for_key(key) for key in self.keys()]
         font_heights = []
         for point_size in (10, 13, 15, 10):
-            font = QFont(self.tree.font())
+            font = QFont(self.original_font)
             font.setPointSize(point_size)
-            self.tree.setFont(font)
+            project_control(self.w, 'projectNavigator').setProperty('controlFont', font)
+            self.settle()
             sizes = []
             for width in (220, 490, 220):
                 self.set_width(width)
-                rects = [self.tree.visualItemRect(row) for row in rows]
-                self.assertTrue(all(rect.height() > self.tree.fontMetrics().height() for rect in rects))
-                self.assertTrue(all(rect.right() < self.tree.viewport().width() for rect in rects))
-                self.assertTrue(all(a.bottom() < b.top() for a, b in zip(rects, rects[1:])))
-                self.assertEqual(self.tree.horizontalScrollBar().maximum(), 0)
-                sizes.append([rect.height() for rect in rects])
+                rows = [project_row(self.w, key) for key in self.keys()]
+                labels = [project_label(self.w, key) for key in self.keys()]
+                project_list = project_control(self.w, 'projectList')
+                self.assertTrue(all(row.height() > QFontMetricsF(label.property('font')).height()
+                                    for row, label in zip(rows, labels)))
+                self.assertTrue(all(row.width() <= project_list.width() for row in rows))
+                self.assertTrue(all(a.y() + a.height() <= b.y() for a, b in zip(rows, rows[1:])))
+                self.assertTrue(all(not label.property('truncated') for label in labels))
+                self.assertTrue(all(label.property('paintedWidth') <= label.width() + 1 for label in labels))
+                self.assertEqual(project_list.property('contentX'), 0)
+                vertical_only = QQmlExpression(qmlContext(project_list), project_list,
+                                                'flickableDirection === Flickable.VerticalFlick')
+                self.assertEqual(vertical_only.evaluate(), (True, False))
+                self.assertEqual([label.property('text') for label in labels], [row.label for row in originals])
+                sizes.append([row.height() for row in rows])
             self.assertTrue(all(a > b for a, b in zip(sizes[0], sizes[1])))
             self.assertEqual(sizes[0], sizes[2])
             font_heights.append(sizes[0])
         self.assertEqual(font_heights[0], font_heights[-1])
         self.assertGreater(font_heights[2][0], font_heights[0][0])
-        self.assertEqual(originals, [(row.text(0), row.data(0, Qt.UserRole), row.toolTip(0)) for row in rows])
+        self.assertEqual(originals, [project.row_for_key(key) for key in self.keys()])
 
     def test_wrapped_hit_selection_refresh_and_open_routes_stay_native(self):
-        parent, child, comparison = self.rows()
-        QTest.mouseClick(self.tree.viewport(), Qt.LeftButton, Qt.NoModifier, self.lower_point(parent))
-        QTest.mouseClick(self.tree.viewport(), Qt.LeftButton, Qt.ControlModifier, self.lower_point(child))
-        selected = {item.data(0, Qt.UserRole) for item in self.tree.selectedItems()}
-        self.assertEqual(len(selected), 2)
+        parent, child, comparison = self.keys()
+        project = self.w.project
+        click_project_row(self.w, parent, lower=True)
+        click_project_row(self.w, child, Qt.ControlModifier, lower=True)
+        selected = set(project.selected_keys())
+        self.assertEqual(selected, {parent, child})
         self.w._refresh_data_navigator()
         self.settle()
-        self.assertEqual(selected, {item.data(0, Qt.UserRole) for item in self.tree.selectedItems()})
-        parent, child, comparison = self.rows()
-        self.assertTrue(parent.isExpanded())
+        self.assertEqual(selected, set(project.selected_keys()))
+        self.assertTrue(project.is_expanded(parent))
 
-        QTest.mouseClick(self.tree.viewport(), Qt.LeftButton, Qt.NoModifier, self.lower_point(parent))
-        QTest.mouseClick(self.tree.viewport(), Qt.LeftButton, Qt.ShiftModifier, self.lower_point(comparison))
-        self.assertEqual({item.data(0, Qt.UserRole) for item in self.tree.selectedItems()
-                          if item.data(0, Qt.UserRole)[0] != 'group'},
-                         {('workbook', self.book.workbook_id), ('sheet', self.sheet.sheet_id),
-                          ('xy', self.comparison.comparison_id)})
-        with patch('spectra_app.main_window.QMenu'):
-            self.w._navigator_menu(self.lower_point(child))
-        self.assertIs(self.tree.currentItem(), child)
-        self.assertEqual({item.data(0, Qt.UserRole) for item in self.tree.selectedItems()
-                          if item.data(0, Qt.UserRole)[0] != 'group'},
-                         {('workbook', self.book.workbook_id), ('sheet', self.sheet.sheet_id),
-                          ('xy', self.comparison.comparison_id)})
-        for item, method, args in (
+        click_project_row(self.w, parent, lower=True)
+        click_project_row(self.w, comparison, Qt.ShiftModifier, lower=True)
+        expected = {parent, child, comparison}
+        self.assertEqual({key for key in project.selected_keys() if key[0] != 'group'}, expected)
+        click_project_row(self.w, child, button=Qt.RightButton, lower=True)
+        self.assertEqual(project.current_key(), child)
+        self.assertEqual({key for key in project.selected_keys() if key[0] != 'group'}, expected)
+        QTest.keyClick(self.w.root_window, Qt.Key_Escape)
+        self.settle()
+        for key, method, args in (
             (parent, 'open_workbook', (self.book.workbook_id,)),
             (child, 'open_workbook', (self.book.workbook_id, self.sheet.sheet_id)),
             (comparison, 'open_xy_comparison', (self.comparison.comparison_id,)),
         ):
-            with self.subTest(kind=item.data(0, Qt.UserRole)[0]), patch.object(self.w, method) as opened:
-                point = self.lower_point(item)
-                self.assertIs(self.tree.itemAt(point), item)
-                QTest.mouseClick(self.tree.viewport(), Qt.LeftButton, Qt.NoModifier, point)
-                QTest.keyClick(self.tree, Qt.Key_Return)
+            with self.subTest(kind=key[0]), patch.object(self.w, method) as opened:
+                point = self.lower_point(key)
+                QTest.mouseClick(self.w.root_window, Qt.LeftButton, Qt.NoModifier, point)
+                QTest.keyClick(self.w.root_window, Qt.Key_Return)
+                self.settle()
                 opened.assert_called_once_with(*args)
                 opened.reset_mock()
-                QTest.mouseDClick(self.tree.viewport(), Qt.LeftButton, Qt.NoModifier, point)
-                opened.assert_called_once_with(*args)
-                parent.setExpanded(True)
+                QTest.mouseDClick(self.w.root_window, Qt.LeftButton, Qt.NoModifier, point)
                 self.settle()
-        self.tree.setCurrentItem(parent)
-        QTest.keyClick(self.tree, Qt.Key_Left)
-        self.assertFalse(parent.isExpanded())
+                opened.assert_called_once_with(*args)
+                project.set_expanded(parent, True)
+                self.settle()
+        click_project_row(self.w, parent, lower=True)
+        QTest.keyClick(self.w.root_window, Qt.Key_Left)
+        self.assertFalse(project.is_expanded(parent))
         self.w._refresh_data_navigator()
         self.settle()
-        parent = self.tree.topLevelItem(0)
-        self.assertFalse(parent.isExpanded())
-        QTest.keyClick(self.tree, Qt.Key_Right)
-        self.assertTrue(parent.isExpanded())
+        self.assertFalse(project.is_expanded(parent))
+        QTest.keyClick(self.w.root_window, Qt.Key_Right)
+        self.assertTrue(project.is_expanded(parent))
 
     def test_scroll_and_heatmap_row_survive_wrapping(self):
         for number in range(25):
@@ -150,26 +153,37 @@ class ProjectTreeWrapTests(unittest.TestCase):
             self.w.workspace.workbooks[book.workbook_id] = book
         self.w._refresh_data_navigator()
         self.set_width(220)
-        tree = self.tree
-        self.assertGreater(tree.verticalScrollBar().maximum(), 0)
-        tree.verticalScrollBar().setValue(12)
-        scroll = tree.verticalScrollBar().value()
+        project_list = project_control(self.w, 'projectList')
+        self.assertGreater(project_list.property('contentHeight'), project_list.height())
+        project_list.setProperty('contentY', 12.0)
+        self.settle()
+        scroll = project_list.property('contentY')
+        self.assertGreater(scroll, 0)
         self.w._refresh_data_navigator()
         self.settle()
-        self.assertEqual(tree.verticalScrollBar().value(), scroll)
-        heatmap = QTreeWidgetItem(['Heatmap_能量_e\u0301_🔬_' + LONG_NAME])
-        heatmap.setData(0, Qt.UserRole, ('heatmap', ('dataset-id', 'graph-id')))
-        heatmap.setToolTip(0, 'Full source filename: ' + LONG_NAME)
-        tree.addTopLevelItem(heatmap)
+        self.assertEqual(project_list.property('contentY'), scroll)
+
+        path = self.folder / LONG_NAME
+        path.write_text('Energy(eV) 0 1\n1 2 3\n2 4 6\n3 6 9\n')
+        self.w._load_dat_file_direct(path)
+        session = self.w.workspace.active
+        self.w.open_graph_document(session.dataset_id, session.active_graph_id)
+        graph = session.active_graph
+        graph.name = 'Heatmap_能量_e\u0301_🔬_' + LONG_NAME
+        self.w._refresh_data_navigator()
+        key = ('heatmap', (session.dataset_id, graph.graph_id))
+        row = self.w.project.row_for_key(key)
         with patch.object(self.w, 'open_graph_document') as opened:
-            point = self.lower_point(heatmap)
-            self.assertGreater(tree.visualItemRect(heatmap).height(), tree.fontMetrics().height())
-            self.assertIs(tree.itemAt(point), heatmap)
-            QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier, point)
-            QTest.keyClick(tree, Qt.Key_Return)
-            opened.assert_called_once_with('dataset-id', 'graph-id')
-        self.assertEqual(heatmap.text(0), 'Heatmap_能量_e\u0301_🔬_' + LONG_NAME)
-        self.assertEqual(heatmap.toolTip(0), 'Full source filename: ' + LONG_NAME)
+            label = project_label(self.w, key)
+            self.assertGreater(project_row(self.w, key).height(), QFontMetricsF(label.property('font')).height())
+            self.assertFalse(label.property('truncated'))
+            click_project_row(self.w, key, lower=True)
+            self.assertEqual(self.w.project.current_key(), key)
+            QTest.keyClick(self.w.root_window, Qt.Key_Return)
+            self.settle()
+            opened.assert_called_once_with(session.dataset_id, graph.graph_id)
+        self.assertEqual(label.property('text'), 'Heatmap_能量_e\u0301_🔬_' + LONG_NAME)
+        self.assertIn(str(path), row.tooltip)
 
 
 if __name__ == '__main__':

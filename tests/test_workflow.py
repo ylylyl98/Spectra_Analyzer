@@ -1,144 +1,101 @@
+from tests import ordinary_analysis_quick_helpers as oa
+from tests import analysis_header_quick_helpers as ah
 import csv
-import os
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
 import numpy as np
-from PySide6.QtWidgets import QApplication
-
-from spectra_app.dat_io import DataCube
-from spectra_app.fitting import FitResult, fit_multi_peak
-from spectra_app.main_window import MainWindow
-from tests.settings_helpers import isolate_settings
+from spectra_app.dataset_state import DatasetSession
+from spectra_app.fitting import fit_multi_peak
+from tests import dat_properties_quick_helpers as dp
 from tests.background_helpers import wait_jobs
+from tests.quick_migration_case import QuickMigrationCase
+from tests.quick_application_helpers import pump
+from tests.scientific_fixtures import workflow_cube as _cube, workflow_fit_result as _fit_result
 
 
-_APP = QApplication.instance() or QApplication([])
-
-
-def _cube(z: np.ndarray, gates: np.ndarray | None = None) -> DataCube:
-    z = np.asarray(z, dtype=float)
-    energy = np.linspace(0.0, 20.0, z.shape[1])
-    gate = np.asarray(gates if gates is not None else np.arange(z.shape[0]), dtype=float)
-    return DataCube(
-        energy=energy,
-        gate=gate,
-        z=z,
-        gate_label="Gate",
-        title="workflow",
-        source_path="",
-        x_original=energy.copy(),
-        x_original_type="pixel",
-        x_original_label="X",
-        x_detection_source="test",
-        x_detection_note="",
-        x_is_ambiguous=False,
-        x_override=None,
-        photon_energy=None,
-        photon_energy_note="",
-        energy_label="X",
-    )
-
-
-def _window(z: np.ndarray, gates: np.ndarray | None = None) -> MainWindow:
-    window = MainWindow()
-    window.current_cube = _cube(z, gates)
-    window.current_gate = float(window.current_cube.gate[0])
-    window._set_view_limits_to_auto()
-    window._set_fit_range_to_full()
-    window._plot_cube()
-    return window
-
-
-def _fit_result(center: float) -> FitResult:
-    x = np.linspace(0.0, 20.0, 21)
-    y = np.zeros_like(x)
-    return FitResult(
-        model="Lorentzian",
-        x=x,
-        y_fit=y,
-        components=np.zeros((1, x.size)),
-        centers=np.asarray([center]),
-        amplitudes=np.asarray([1.0]),
-        widths=np.asarray([0.5]),
-        baseline=0.0,
-        rmse=0.0,
-        r_squared=1.0,
-    )
-
-
-class WorkflowTests(unittest.TestCase):
-    def setUp(self) -> None:
-        isolate_settings(self)
-        self.windows: list[MainWindow] = []
-
-    def tearDown(self) -> None:
-        for window in self.windows:
-            window.close()
-
-    def make_window(self, z: np.ndarray, gates: np.ndarray | None = None) -> MainWindow:
-        window = _window(z, gates)
-        self.windows.append(window)
-        return window
+class WorkflowTests(QuickMigrationCase):
+    def make_window(self, z: np.ndarray, gates: np.ndarray | None = None):
+        """Register real scientific state in this case's production Quick host."""
+        controller = self.controller
+        cube = _cube(z, gates)
+        source = self.folder / 'workflow.dat'
+        source.write_text('X ' + ' '.join(f'{gate:.17g}' for gate in cube.gate) + '\n' +
+                          '\n'.join(' '.join(f'{value:.17g}' for value in row)
+                                    for row in np.column_stack((cube.energy, cube.z.T))),
+                          encoding='utf-8')
+        cube = replace(cube, source_path=str(source))
+        session = DatasetSession(source_path=source,
+                                 base_cube=cube, current_cube=cube,
+                                 sidecar_writes_enabled=False)
+        controller.register_dataset(session)
+        controller.activate_dataset(session.dataset_id, capture_outgoing=False)
+        controller.current_gate = float(cube.gate[0])
+        controller._set_view_limits_to_auto()
+        controller._set_fit_range_to_full()
+        controller._plot_cube()
+        assert controller.request_outer_view('analysis')
+        controller.dat_details_action.setChecked(True)
+        assert controller.request_task(1)
+        pump(100)
+        return controller
 
     def test_plot_gate_navigation_is_the_single_gate_state(self) -> None:
         window = self.make_window(np.ones((3, 21)), gates=np.asarray([1.5, 7.25, 19.0]))
 
         self.assertFalse(hasattr(window, "gate_spin"))
         self.assertFalse(hasattr(window, "apply_gate_btn"))
-        window.plot_gate_spin.setValue(7.25)
-        window.plot_gate_spin.editingFinished.emit()
+        ah.edit(window, 'gate', '7.25', commit=True)
 
         self.assertEqual(window.current_gate, 7.25)
-        self.assertEqual(window.plot_gate_index_spin.value(), 2)
+        self.assertEqual(int(ah.text(window, 'index')), 2)
         gate_used, _ = window._nearest_spectrum(window.current_gate)
         self.assertEqual(gate_used, 7.25)
         self.assertIn("7.25", window._spec_ax.get_title())
 
     def test_use_current_x_range_copies_bounds_without_following_zoom(self) -> None:
         window = self.make_window(np.ones((2, 21)))
-        window.xmin_spin.setValue(16.0)
-        window.xmax_spin.setValue(4.0)
-        window.fit_xmin_lock.setChecked(True)
-        window.fit_xmax_lock.setChecked(True)
+        dp.setup_number(window, 'xmin', 16.0)
+        dp.setup_number(window, 'xmax', 4.0)
+        oa.set_value(window, 'fit_xmin_fixed', True)
+        oa.set_value(window, 'fit_xmax_fixed', True)
 
-        window.use_current_x_range_btn.click()
+        oa.click(window, 'currentRange')
         self.assertEqual(window._fit_range_bounds(), (4.0, 16.0))
-        self.assertTrue(window.fit_xmin_lock.isChecked())
-        self.assertTrue(window.fit_xmax_lock.isChecked())
+        self.assertTrue(oa.value(window, 'fit_xmin_fixed'))
+        self.assertTrue(oa.value(window, 'fit_xmax_fixed'))
 
         window._heat_ax.set_xlim(1.0, 3.0)
         self.assertEqual(window._fit_range_bounds(), (4.0, 16.0))
-        self.assertIn("Fit range", window.fit_range_summary_label.text())
+        self.assertIn("Fit range", oa.ui(window, 'rangeText'))
 
     def test_axes_zoom_refreshes_visible_range_summary_and_readiness(self) -> None:
         window = self.make_window(np.ones((2, 21)))
         window._refresh_fit_readiness()
-        self.assertIn("0", window.fit_readiness_label.text())
+        self.assertIn("0", oa.ui(window, 'readinessText'))
         window._heat_ax.set_xlim(3.0, 12.0)
 
-        self.assertEqual((window.xmin_spin.value(), window.xmax_spin.value()), (3.0, 12.0))
-        self.assertIn("3", window.fit_range_summary_label.text())
-        self.assertIn("12", window.fit_range_summary_label.text())
-        self.assertIn("3", window.fit_readiness_label.text())
-        self.assertIn("12", window.fit_readiness_label.text())
+        self.assertEqual((window.dat_properties.number('xmin'), window.dat_properties.number('xmax')), (3.0, 12.0))
+        self.assertIn("3", oa.ui(window, 'rangeText'))
+        self.assertIn("12", oa.ui(window, 'rangeText'))
+        self.assertIn("3", oa.ui(window, 'readinessText'))
+        self.assertIn("12", oa.ui(window, 'readinessText'))
 
     def test_find_peaks_source_exposes_explicit_detect_then_fit_action(self) -> None:
         x = np.linspace(0.0, 20.0, 81)
         z = np.exp(-((x - 10.0) ** 2) / 1.2)[None, :]
         window = self.make_window(z)
-        window.fit_xmin_spin.setValue(0.0)
-        window.fit_xmax_spin.setValue(20.0)
-        window.lw_min_spin.setValue(0)
+        oa.set_number(window, 'fit_xmin', 0.0)
+        oa.set_number(window, 'fit_xmax', 20.0)
+        oa.set_number(window, 'linewidth_min', 0)
         messages: list[str] = []
         window._show_error = messages.append
         window._refresh_fit_readiness()
 
-        self.assertTrue(window.detect_then_fit_btn.isEnabled())
-        window.detect_then_fit_btn.click()
+        self.assertTrue(oa.command_enabled(window, 'fit'))
+        oa.click(window, 'fit')
         wait_jobs(window)
         self.assertGreater(window._get_seeds_for_current_gate().size, 0)
         self.assertIsNotNone(window._active_fit_result())
@@ -148,14 +105,14 @@ class WorkflowTests(unittest.TestCase):
         window = self.make_window(np.ones((1, 21)))
         window.peak_indices = np.asarray([2], dtype=int)
         window._peak_gate_idx = 0
-        window.fit_xmin_spin.setValue(10.0)
-        window.fit_xmax_spin.setValue(20.0)
+        oa.set_number(window, 'fit_xmin', 10.0)
+        oa.set_number(window, 'fit_xmax', 20.0)
         messages: list[str] = []
         window._show_error = messages.append
 
         window._refresh_fit_readiness()
-        self.assertFalse(window.detect_then_fit_btn.isEnabled())
-        self.assertIn("outside", window.fit_readiness_label.text().lower())
+        self.assertFalse(oa.command_enabled(window, 'fit'))
+        self.assertIn("outside", oa.ui(window, 'readinessText').lower())
         window._on_fit()
         wait_jobs(window)
         self.assertTrue(messages)
@@ -166,9 +123,9 @@ class WorkflowTests(unittest.TestCase):
         window = self.make_window(np.exp(-((x - 10.0) ** 2) / 1.2)[None, :])
         window.peak_indices = np.asarray([40], dtype=int)
         window._peak_gate_idx = 0
-        window.lw_min_spin.setValue(0)
-        window.fit_xmin_spin.setValue(0.0)
-        window.fit_xmax_spin.setValue(20.0)
+        oa.set_number(window, 'linewidth_min', 0)
+        oa.set_number(window, 'fit_xmin', 0.0)
+        oa.set_number(window, 'fit_xmax', 20.0)
         messages: list[str] = []
         window._show_error = messages.append
         window._on_fit()
@@ -181,14 +138,14 @@ class WorkflowTests(unittest.TestCase):
     def test_loaded_csv_seeds_are_used_without_detection_fallback(self) -> None:
         x = np.linspace(0.0, 20.0, 81)
         window = self.make_window(np.exp(-((x - 10.0) ** 2) / 1.2)[None, :])
-        window.lw_min_spin.setValue(0)
+        oa.set_number(window, 'linewidth_min', 0)
         messages: list[str] = []
         window._show_error = messages.append
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "seeds.csv"
             path.write_text("gate,peak_energy\n0,10\n", encoding="utf-8")
             window._load_seeds_csv_file(path)
-            self.assertTrue(window._seeds_from_csv_radio.isChecked())
+            self.assertTrue(oa.value(window, 'csv_source'))
             self.assertEqual(window._get_seeds_for_current_gate().tolist(), [10.0])
             window._on_fit()
             wait_jobs(window)
@@ -206,7 +163,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_csv_source_without_loaded_seeds_does_not_fallback_to_detection(self) -> None:
         window = self.make_window(np.ones((1, 21)))
-        window._seeds_from_csv_radio.setChecked(True)
+        oa.set_value(window, 'csv_source', True)
         window._csv_seeds_map = None
         messages: list[str] = []
         window._show_error = messages.append
@@ -219,7 +176,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_batch_fit_rejects_missing_selected_csv_without_mutating_results(self) -> None:
         window = self.make_window(np.ones((2, 21)))
-        window._seeds_from_csv_radio.setChecked(True)
+        oa.set_value(window, 'csv_source', True)
         window._csv_seeds_map = None
         window.batch_peak_map = {0: np.asarray([10], dtype=int)}
         existing = _fit_result(10.0)
@@ -248,9 +205,9 @@ class WorkflowTests(unittest.TestCase):
         window = self.make_window(z, gates=np.asarray([1.0, 9.0, 13.0]))
         messages: list[str] = []
         window._show_error = messages.append
-        window.lw_min_spin.setValue(0)
-        window.fit_xmin_spin.setValue(0.0)
-        window.fit_xmax_spin.setValue(20.0)
+        oa.set_number(window, 'linewidth_min', 0)
+        oa.set_number(window, 'fit_xmin', 0.0)
+        oa.set_number(window, 'fit_xmax', 20.0)
         window.peak_indices = np.asarray([5], dtype=int)
         window._peak_gate_idx = 0
         window._on_fit()
@@ -267,7 +224,7 @@ class WorkflowTests(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             paths = [Path(tmp) / "current.csv", Path(tmp) / "all.csv"]
-            with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=[
+            with patch("spectra_app.main_window.FilePicker.getSaveFileName", side_effect=[
                 (str(paths[0]), "CSV Files (*.csv)"), (str(paths[1]), "CSV Files (*.csv)")
             ]):
                 window._on_export_current_fit_csv()

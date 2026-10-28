@@ -148,6 +148,34 @@ class ProjectIOTests(unittest.TestCase):
         members['manifest.json'] = json.dumps(manifest).encode('utf-8')
         overwrite_archive(self.path, members)
 
+    def test_legacy_custom_fonts_normalize_on_load_and_save_without_other_changes(self):
+        def custom_fonts(manifest):
+            for dataset in manifest['datasets']:
+                for graph in dataset['graphs']:
+                    graph['presentation']['font_family'] = 'DejaVu Serif'
+        self.corrupt_manifest(custom_fonts)
+        legacy_bytes = self.path.read_bytes()
+        loaded = read_project(self.path)
+        self.assertEqual(self.path.read_bytes(), legacy_bytes)
+        for identifier, session in loaded.datasets.items():
+            original = self.workspace.datasets[identifier]
+            np.testing.assert_array_equal(session.current_cube.z, original.current_cube.z)
+            for graph_id, graph in session.graphs.items():
+                self.assertEqual(graph.presentation.font_family, 'Arial')
+                self.assertEqual(graph.presentation, original.graphs[graph_id].presentation)
+        write_project(self.path, loaded)
+        manifest = json.loads(archive_members(self.path)['manifest.json'])
+        self.assertTrue(all(graph['presentation']['font_family'] == 'Arial'
+                            for dataset in manifest['datasets'] for graph in dataset['graphs']))
+
+    def test_invalid_font_fields_remain_invalid_before_normalization(self):
+        for invalid in ('', '  ', None, 42, ['Arial']):
+            with self.subTest(font=invalid):
+                self.corrupt_manifest(lambda manifest: manifest['datasets'][0]['graphs'][0][
+                    'presentation'].update(font_family=invalid))
+                with self.assertRaisesRegex(ProjectFormatError, 'font_family'):
+                    read_project(self.path)
+
     def test_legacy_graph_workspace_upgrades_to_v8_and_layout_digests(self):
         from spectra_app.project_io import runtime_workspace_stamp
         self.assertTrue(hasattr(self.workspace, 'graph_workspace'), 'Workspace must retain graph layout')

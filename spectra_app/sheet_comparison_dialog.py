@@ -1,11 +1,12 @@
-"""Existing-Sheet comparison choices, staged until one validated batch is accepted."""
+"""Staged existing-Sheet comparison choices rendered in a real Qt Quick window."""
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFormLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QSizePolicy, QSplitter, QTableView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtCore import (QAbstractListModel, QAbstractTableModel, QModelIndex,
+                            QObject, Property, Qt, Signal, Slot)
 
+from PySide6.QtGui import QFont, QGuiApplication
+
+from .quick_dialog import QuickDialog
 from .workbook_state import (sheet_columns, sheet_column_values, sheet_shape,
                              sheet_numeric_columns, validate_mapping, select_curve_additions)
 from .workbook_page import _cell_text
@@ -47,6 +48,9 @@ class _SheetPreviewModel(QAbstractTableModel):
         self.values = [sheet_column_values(workspace, sheet, index, mode)[:self.rows]
                        for index in range(len(self.columns))]
 
+    def roleNames(self):
+        return {int(Qt.DisplayRole): b'display'}
+
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else self.rows
 
@@ -64,221 +68,244 @@ class _SheetPreviewModel(QAbstractTableModel):
             return self.columns[section] if orientation == Qt.Horizontal else str(section + 1)
 
 
-class SheetComparisonDialog(QDialog):
-    def __init__(self, workspace, parent=None, *, selected_sheet_ids=(), comparison_id=None):
+class _ChoiceRows(QAbstractListModel):
+    """Small metadata rows; source values stay in the authoritative workspace."""
+    def __init__(self, fields, parent=None):
         super().__init__(parent)
+        self._roles = {int(Qt.UserRole) + i + 1: key.encode() for i, key in enumerate(fields)}
+        self.rows = []
+
+    def roleNames(self):
+        return self._roles
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.rows)
+
+    def data(self, index, role=Qt.DisplayRole):
+        key = self._roles.get(role)
+        if index.isValid() and key is not None and 0 <= index.row() < len(self.rows):
+            return self.rows[index.row()].get(key.decode())
+
+    def replace(self, rows):
+        self.beginResetModel()
+        self.rows = rows
+        self.endResetModel()
+
+    def refresh(self):
+        if self.rows:
+            self.dataChanged.emit(self.index(0), self.index(len(self.rows) - 1), list(self._roles))
+
+
+class SheetComparisonBridge(QObject):
+    applicationFontChanged = Signal()
+    changed = Signal()
+    previewChanged = Signal()
+
+    def __init__(self, workspace, *, selected_sheet_ids=(), comparison_id=None):
+        super().__init__()
+        QGuiApplication.instance().fontChanged.connect(self.applicationFontChanged)
         self.workspace = workspace
         self._fixed_target = comparison_id
-        self._syncing = False
+        self._target = comparison_id
+        self._include_existing = False
         self._choices = {}
-        self._items = {}
         self._names = {}
-        self.setWindowTitle('Add data to comparison' if comparison_id is not None else 'Compare selected data')
-        self.resize(960, 680)
-        layout = QVBoxLayout(self)
-        introduction = QLabel('Check Sheets, then review X and Y columns. A Workbook checkbox selects all its Sheets.')
-        introduction.setToolTip('Original X grids are retained.')
-        introduction.setWordWrap(True)
-        layout.addWidget(introduction)
-        destination = QHBoxLayout()
-        destination.addWidget(QLabel('Destination:'))
-        self.destination_combo = QComboBox(self)
-        self.destination_combo.setAccessibleName('Destination comparison')
-        self.destination_combo.setMinimumContentsLength(12)
-        self.destination_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        if comparison_id is None:
-            self.destination_combo.addItem('New comparison', None)
-            for comparison in workspace.comparisons.values():
-                self.destination_combo.addItem(comparison.name, comparison.comparison_id)
-        else:
-            target = workspace.comparisons.get(comparison_id)
-            self.destination_combo.addItem(target.name if target else 'Comparison no longer available', comparison_id)
-            self.destination_combo.setEnabled(False)
-        if comparison_id is None:
-            destination.addWidget(self.destination_combo, 1)
-        else:
-            # A fixed destination is information, so keep it readable rather
-            # than making the owning graph's name disabled/low-contrast text.
-            self.destination_combo.hide()
-            fixed_destination = QLabel(self.destination_combo.currentText())
-            fixed_destination.setTextFormat(Qt.PlainText)
-            fixed_destination.setWordWrap(True)
-            destination.addWidget(fixed_destination, 1)
-        layout.addLayout(destination)
-        self.splitter = QSplitter(Qt.Horizontal)
-        source_panel = QWidget()
-        source_layout = QVBoxLayout(source_panel)
-        source_layout.setContentsMargins(0, 0, 0, 0)
-        self.select_originals_btn = QPushButton('Select only Originals\n(all Workbooks)')
-        self.select_originals_btn.setAccessibleName('Select only Original Sheets in all Workbooks')
-        self.select_originals_btn.clicked.connect(self._select_originals)
-        source_layout.addWidget(self.select_originals_btn)
-        self.source_tree = QTreeWidget()
-        self.source_tree.setHeaderLabels(['Include Sheets', 'Mapping'])
-        self.source_tree.setAccessibleName('Workbook and Sheet sources to include')
-        self.source_tree.setMinimumWidth(200)
-        self.source_tree.setColumnWidth(0, 160)
-        source_layout.addWidget(self.source_tree, 1)
-        self.splitter.addWidget(source_panel)
-        editor = QWidget()
-        editor_layout = QVBoxLayout(editor)
-        editor_layout.setContentsMargins(0, 0, 0, 0)
-        self.provenance = QLabel()
-        self.provenance.setWordWrap(True)
-        self.provenance.setTextFormat(Qt.PlainText)
-        self.provenance.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.provenance.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        editor_layout.addWidget(self.provenance)
-        form = QFormLayout()
-        self.mode_combo = QComboBox()
-        self.mode_combo.setAccessibleName('Values for selected Sheet')
-        self.x_combo = QComboBox()
-        self.x_combo.setAccessibleName('X column for selected Sheet')
-        for combo in (self.mode_combo, self.x_combo):
-            combo.setMinimumContentsLength(12)
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        form.addRow('Values:', self.mode_combo)
-        form.addRow('X column:', self.x_combo)
-        editor_layout.addLayout(form)
-        self.mapping_splitter = QSplitter(Qt.Horizontal)
-        self.mapping_splitter.setChildrenCollapsible(False)
-        y_panel = QWidget()
-        y_layout = QVBoxLayout(y_panel)
-        y_layout.setContentsMargins(0, 0, 0, 0)
-        y_label = QLabel('Y columns · check one or more')
-        y_label.setWordWrap(True)
-        y_layout.addWidget(y_label)
-        self.y_list = QListWidget()
-        self.y_list.setAccessibleName('Y columns for selected Sheet')
-        self.y_list.setMinimumHeight(74)
-        y_layout.addWidget(self.y_list, 1)
-        self.match_gates_btn = QPushButton('Match selected Gates')
-        self.match_gates_btn.setAccessibleName('Match selected Gates')
-        self.match_gates_btn.setToolTip('Apply this source’s selected physical Gate values to checked DAT Original and Processed Sheets. Every value must match exactly.')
-        self.match_gates_btn.clicked.connect(self._match_selected_gates)
-        y_layout.addWidget(self.match_gates_btn)
-        self.mapping_splitter.addWidget(y_panel)
-        preview_panel = QWidget()
-        preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
-        self.preview_info = QLabel()
-        self.preview_info.setWordWrap(True)
-        self.preview_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        preview_layout.addWidget(self.preview_info)
-        self.preview = QTableView()
-        self.preview.setAccessibleName('Selected Sheet numeric preview')
-        self.preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.preview.horizontalHeader().setDefaultSectionSize(110)
-        preview_layout.addWidget(self.preview, 1)
-        self.mapping_splitter.addWidget(preview_panel)
-        self.mapping_splitter.setStretchFactor(0, 1)
-        self.mapping_splitter.setStretchFactor(1, 2)
-        self.mapping_splitter.setSizes([180, 330])
-        editor_layout.addWidget(self.mapping_splitter, 1)
-        self.splitter.addWidget(editor)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 2)
-        self.splitter.setSizes([350, 590])
-        layout.addWidget(self.splitter, 1)
-        self.summary = QLabel()
-        self.summary.setAccessibleName('Included Sheet and curve count')
-        self.summary.setWordWrap(True)
-        layout.addWidget(self.summary)
-        self.feedback = QLabel()
-        self.feedback.setTextFormat(Qt.PlainText)
-        self.feedback.setWordWrap(True)
-        layout.addWidget(self.feedback)
-        self.include_existing_chk = QCheckBox('Include existing curves (add again)')
-        self.include_existing_chk.setToolTip('Unchecked: skip the same source Sheet, X column, Y column and values already in the graph.')
-        self.include_existing_chk.toggled.connect(self._validate)
-        layout.addWidget(self.include_existing_chk)
-        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
-        self.commit_btn = QPushButton('Add data' if comparison_id is not None else 'Create comparison')
-        self.commit_btn.setDefault(True)
-        buttons.addButton(self.commit_btn, QDialogButtonBox.AcceptRole)
-        buttons.rejected.connect(self.reject)
-        self.commit_btn.clicked.connect(self.accept)
-        layout.addWidget(buttons)
-        selected = set(selected_sheet_ids)
+        self._included = set(selected_sheet_ids)
+        self._current_id = ''
+        self._preview = None
+        self._can_accept = False
+        self._feedback = self._summary = self._provenance = self._preview_info = ''
+        self._x_options = []
+        self._x_index = -1
+        self._x_editable = self._can_match = False
+        self._value_label = ''
+        self._source_model = _ChoiceRows(('stableId', 'parentId', 'rowKind', 'checkState',
+            'indent', 'label', 'summary', 'tooltip'), self)
+        self._column_model = _ChoiceRows(('column', 'label', 'included', 'available'), self)
+        rows = []
         for book in workspace.workbooks.values():
-            parent_item = QTreeWidgetItem([book.name])
-            parent_item.setFlags(parent_item.flags() | Qt.ItemIsUserCheckable)
-            parent_item.setCheckState(0, Qt.Unchecked)
-            self.source_tree.addTopLevelItem(parent_item)
-            for sheet_id in book.sheet_ids:
-                sheet = workspace.sheets[sheet_id]
-                self._choices[sheet_id] = (sheet.x_column, list(sheet.y_columns), sheet.mode)
-                self._names[sheet_id] = f'{book.name} / {sheet.name}'
-                item = QTreeWidgetItem([sheet.name])
-                item.setData(0, Qt.UserRole, sheet_id)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(0, Qt.Checked if sheet_id in selected else Qt.Unchecked)
-                item.setToolTip(0, f'{self._names[sheet_id]}\n{sheet.source_path or "Embedded values"}')
-                parent_item.addChild(item)
-                self._items[sheet_id] = item
-                self._update_mapping_text(sheet_id)
-            parent_item.setExpanded(True)
-            self._refresh_parent_check(parent_item)
-        self.source_tree.currentItemChanged.connect(self._load_editor)
-        self.source_tree.itemChanged.connect(self._source_check_changed)
-        self.x_combo.currentIndexChanged.connect(self._mapping_changed)
-        self.y_list.itemChanged.connect(self._mapping_changed)
-        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
-        self.destination_combo.currentIndexChanged.connect(self._validate)
-        first = next((self._items[sid] for sid in self._items if sid in selected), next(iter(self._items.values()), None))
-        self.source_tree.setCurrentItem(first)
-        if first is None:
-            self._load_editor()
-        self._validate()
-        self.source_tree.setFocus()
+            rows.append(dict(stableId=book.workbook_id, parentId='', rowKind='workbook',
+                checkState=0, indent=0, label=book.name, summary='', tooltip=book.name))
+            for sid in book.sheet_ids:
+                sheet = workspace.sheets.get(sid)
+                if sheet is None:
+                    continue
+                self._choices[sid] = (sheet.x_column, list(sheet.y_columns), sheet.mode)
+                self._names[sid] = f'{book.name} / {sheet.name}'
+                rows.append(dict(stableId=sid, parentId=book.workbook_id, rowKind='sheet',
+                    checkState=0, indent=1, label=sheet.name, summary='',
+                    tooltip=f'{self._names[sid]}\n{sheet.snapshot_note or sheet.source_path or "Embedded values"}'))
+        self._source_model.replace(rows)
+        self._destinations = ([dict(label='New comparison', value='')] +
+            [dict(label=c.name, value=c.comparison_id) for c in workspace.comparisons.values()]
+            if comparison_id is None else [dict(label=workspace.comparisons[comparison_id].name
+                if comparison_id in workspace.comparisons else 'Comparison no longer available', value=comparison_id)])
+        first = next((sid for sid in self._choices if sid in self._included), next(iter(self._choices), ''))
+        self._refresh_sources()
+        self.selectSource(first)
+        self.validate()
+
+    applicationFont = Property(QFont, lambda self: QGuiApplication.font(), notify=applicationFontChanged)
+    sourceModel = Property(QObject, lambda self: self._source_model, constant=True)
+    columnModel = Property(QObject, lambda self: self._column_model, constant=True)
+    previewModel = Property(QObject, lambda self: self._preview, notify=previewChanged)
+    destinations = Property('QVariantList', lambda self: self._destinations, constant=True)
+    fixedDestination = Property(bool, lambda self: self._fixed_target is not None, constant=True)
+    destinationIndex = Property(int, lambda self: next((i for i, row in enumerate(self._destinations)
+        if row['value'] == (self._target or '')), 0), notify=changed)
+    destinationLabel = Property(str, lambda self: self._destinations[self.destinationIndex]['label'], notify=changed)
+    currentId = Property(str, lambda self: self._current_id, notify=changed)
+    currentRow = Property(int, lambda self: next((i for i, row in enumerate(self._source_model.rows)
+        if row['stableId'] == self._current_id), -1), notify=changed)
+    xOptions = Property('QVariantList', lambda self: self._x_options, notify=changed)
+    xIndex = Property(int, lambda self: self._x_index, notify=changed)
+    xEditable = Property(bool, lambda self: self._x_editable, notify=changed)
+    valueLabel = Property(str, lambda self: self._value_label, notify=changed)
+    canMatchGates = Property(bool, lambda self: self._can_match, notify=changed)
+    provenance = Property(str, lambda self: self._provenance, notify=changed)
+    previewInfo = Property(str, lambda self: self._preview_info, notify=changed)
+    summary = Property(str, lambda self: self._summary, notify=changed)
+    feedback = Property(str, lambda self: self._feedback, notify=changed)
+    canAccept = Property(bool, lambda self: self._can_accept, notify=changed)
+    includeExisting = Property(bool, lambda self: self._include_existing, notify=changed)
+    actionText = Property(str, lambda self: 'Create comparison' if self._target is None else 'Add data', notify=changed)
 
     def selected_mappings(self):
-        return {sid: (x, list(ys), mode) for sid, (x, ys, mode) in self._choices.items()
-                if self._items[sid].checkState(0) == Qt.Checked}
+        return {sid: (x, list(ys), mode) for sid, (x, ys, mode) in self._choices.items() if sid in self._included}
 
-    def _current_id(self):
-        item = self.source_tree.currentItem()
-        return item.data(0, Qt.UserRole) if item else None
-
-    def _refresh_parent_check(self, parent):
-        children = [parent.child(i) for i in range(parent.childCount())]
-        checked = any(item.checkState(0) == Qt.Checked for item in children)
-        state = (Qt.Checked if children and all(item.checkState(0) == Qt.Checked for item in children)
-                 else Qt.PartiallyChecked if checked else Qt.Unchecked)
-        parent.setCheckState(0, state)
-
-    def _source_check_changed(self, item, column):
-        if self._syncing or column != 0:
-            return
-        self._syncing = True
-        try:
-            if item.parent() is None:
-                checked = item.checkState(0) == Qt.Checked
-                for index in range(item.childCount()):
-                    child = item.child(index)
-                    child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-                self._refresh_parent_check(item)
+    def _refresh_sources(self):
+        for row in self._source_model.rows:
+            sid = row['stableId']
+            if row['rowKind'] == 'sheet':
+                row['checkState'] = 2 if sid in self._included else 0
+                x, ys, mode = self._choices[sid]
+                try:
+                    columns = sheet_columns(self.workspace, sid, mode)
+                    row['summary'] = f'X: {columns[x]} · Y: {", ".join(columns[y] for y in ys) or "none"} · {mode}'
+                except (ValueError, KeyError, IndexError, TypeError):
+                    row['summary'] = 'Review mapping'
             else:
-                self._refresh_parent_check(item.parent())
-        finally:
-            self._syncing = False
-        self._validate()
+                children = [child['stableId'] for child in self._source_model.rows if child['parentId'] == sid]
+                count = sum(child in self._included for child in children)
+                row['checkState'] = 2 if children and count == len(children) else 1 if count else 0
+        self._source_model.refresh()
 
-    def _select_originals(self):
-        self._syncing = True
+    @Slot(int, result=str)
+    def sourceIdAt(self, index):
+        rows = self._source_model.rows
+        return rows[index]['stableId'] if 0 <= index < len(rows) else ''
+
+    @Slot(str)
+    def toggleSource(self, source_id):
+        row = next((row for row in self._source_model.rows if row['stableId'] == source_id), None)
+        if row is None:
+            return
+        children = ([row['stableId']] if row['rowKind'] == 'sheet' else
+                    [child['stableId'] for child in self._source_model.rows if child['parentId'] == source_id])
+        if row['checkState'] == 2:
+            self._included.difference_update(children)
+        else:
+            self._included.update(children)
+        self._refresh_sources()
+        self.validate()
+
+    @Slot()
+    def selectOriginals(self):
+        self._included = {sid for sid in self._choices if (sheet := self.workspace.sheets.get(sid)) is not None
+                          and sheet.role == 'original'}
+        self._refresh_sources()
+        self.validate()
+
+    @Slot(str)
+    def selectSource(self, source_id):
+        if source_id != self._current_id or self._preview is None:
+            self._current_id = source_id
+            self._load_editor()
+            self.changed.emit()
+
+    def _load_editor(self):
+        old_model, self._preview = self._preview, None
+        self._x_options = []
+        self._x_index = -1
+        self._x_editable = self._can_match = False
+        self._value_label = self._preview_info = ''
+        self._provenance = self._names.get(self._current_id, 'Select a Sheet to review its mapping.')
+        self._column_model.replace([])
+        sheet = self.workspace.sheets.get(self._current_id)
         try:
-            for sid, item in self._items.items():
-                sheet = self.workspace.sheets.get(sid)
-                item.setCheckState(0, Qt.Checked if sheet is not None and sheet.role == 'original' else Qt.Unchecked)
-            for index in range(self.source_tree.topLevelItemCount()):
-                self._refresh_parent_check(self.source_tree.topLevelItem(index))
-        finally:
-            self._syncing = False
-        self._validate()
+            if sheet is not None and self._current_id in self._choices:
+                x, ys, mode = self._choices[self._current_id]
+                columns = sheet_columns(self.workspace, sheet, mode)
+                numeric = sheet_numeric_columns(self.workspace, sheet, mode)
+                self._x_options = [dict(label=f'{index + 1}: {columns[index]}', column=index) for index in numeric]
+                self._x_index = next((i for i, option in enumerate(self._x_options) if option['column'] == x), -1)
+                self._x_editable = sheet.kind != 'dat' or sheet.role == 'fit_parameters'
+                self._can_match = sheet.kind == 'dat' and sheet.role in ('original', 'processed')
+                self._value_label = sheet.role.replace('_', ' ').title()
+                self._column_model.replace([dict(column=i, label=f'{i + 1}: {label}', included=i in ys,
+                    available=i in numeric and i != x) for i, label in enumerate(columns)])
+                self._preview = _SheetPreviewModel(self.workspace, sheet, mode, self)
+                count = sheet_shape(self.workspace, sheet, mode)[0]
+                self._preview_info = f'Preview: first {self._preview.rows} of {count} rows · all rows will be plotted.'
+                if sheet.kind == 'dat' and sheet.role != 'fit_parameters':
+                    self._preview_info += ' DAT X is fixed to the energy axis.'
+        except (ValueError, KeyError, IndexError) as exc:
+            self._preview_info = f'Preview unavailable: {exc}'
+        self.previewChanged.emit()
+        if old_model is not None:
+            old_model.deleteLater()
 
-    def _match_selected_gates(self):
-        """Stage physical-value matches across the entire batch before changing choices."""
-        source_id = self._current_id()
+    def _mapping_changed(self):
+        self._refresh_sources()
+        # A mapping edit does not replace the borrowed-value preview.
+        if self._current_id in self._choices:
+            x, ys, _ = self._choices[self._current_id]
+            self._x_index = next((i for i, row in enumerate(self._x_options) if row['column'] == x), -1)
+            sheet = self.workspace.sheets.get(self._current_id)
+            numeric = sheet_numeric_columns(self.workspace, sheet) if sheet is not None else []
+            for row in self._column_model.rows:
+                row['included'] = row['column'] in ys
+                row['available'] = row['column'] in numeric and row['column'] != x
+            self._column_model.refresh()
+        self.validate()
+
+    @Slot(int)
+    def setX(self, column):
+        sheet = self.workspace.sheets.get(self._current_id)
+        if sheet is None or not self._x_editable or column not in sheet_numeric_columns(self.workspace, sheet):
+            return
+        _, ys, mode = self._choices[self._current_id]
+        self._choices[self._current_id] = (column, sorted(y for y in ys if y != column), mode)
+        self._mapping_changed()
+
+    @Slot(int, bool)
+    def setY(self, column, included):
+        sheet = self.workspace.sheets.get(self._current_id)
+        if sheet is None or self._current_id not in self._choices:
+            return
+        x, ys, mode = self._choices[self._current_id]
+        if column == x or column not in sheet_numeric_columns(self.workspace, sheet):
+            return
+        selected = set(ys)
+        (selected.add if included else selected.discard)(column)
+        self._choices[self._current_id] = (x, sorted(selected), mode)
+        self._mapping_changed()
+
+    @Slot(int)
+    def setDestination(self, index):
+        if self._fixed_target is None and 0 <= index < len(self._destinations):
+            self._target = self._destinations[index]['value'] or None
+            self.validate()
+
+    @Slot(bool)
+    def setIncludeExisting(self, included):
+        self._include_existing = included
+        self.validate()
+
+    @Slot()
+    def matchSelectedGates(self):
+        """Stage exact physical-value matches atomically across the checked batch."""
+        source_id = self._current_id
         try:
             source = self.workspace.sheets.get(source_id)
             if source is None or source.kind != 'dat' or source.role not in ('original', 'processed'):
@@ -309,130 +336,62 @@ class SheetComparisonDialog(QDialog):
                 matched += 1
             validate_sheet_comparison(self.workspace, staged, names=self._names)
         except (ValueError, KeyError, IndexError, AttributeError) as exc:
-            self.feedback.setText(str(exc))
+            self._feedback = str(exc)
+            self.changed.emit()
             return
         self._choices.update(staged)
-        for sid in staged:
-            self._update_mapping_text(sid)
-        self._load_editor()
-        self._validate()
-        self.feedback.setText(f'Matched {len(values)} physical Gate value(s) in {matched} checked DAT Sheet(s).')
+        self._refresh_sources()
+        self._mapping_changed()
+        self._feedback = f'Matched {len(values)} physical Gate value(s) in {matched} checked DAT Sheet(s).'
+        self.changed.emit()
 
-    def _load_editor(self, *_args):
-        sheet_id = self._current_id()
-        sheet = self.workspace.sheets.get(sheet_id)
-        self._syncing = True
-        old_model = self.preview.model()
-        self.preview.setModel(None)
-        if old_model is not None:
-            old_model.deleteLater()
-        try:
-            self.x_combo.clear()
-            self.y_list.clear()
-            self.mode_combo.clear()
-            for widget in (self.x_combo, self.mode_combo, self.y_list):
-                widget.setEnabled(sheet is not None)
-            self.provenance.setText(self._names.get(sheet_id, 'Select a Sheet to review its mapping.'))
-            self.preview_info.clear()
-            self.match_gates_btn.setEnabled(bool(sheet is not None and sheet.kind == 'dat'
-                and sheet.role in ('original', 'processed')))
-            if sheet is not None:
-                x, ys, mode = self._choices[sheet_id]
-                self.provenance.setText(self._names[sheet_id])
-                self.provenance.setToolTip(f'{self._names[sheet_id]}\n{sheet.snapshot_note or sheet.source_path or "Embedded values"}')
-                self.mode_combo.addItem(sheet.role.replace('_', ' ').title(), sheet.mode)
-                self.mode_combo.setCurrentIndex(self.mode_combo.findData(mode))
-                self.mode_combo.setEnabled(False)
-                columns = sheet_columns(self.workspace, sheet, mode)
-                numeric = sheet_numeric_columns(self.workspace, sheet)
-                for index, label in enumerate(columns):
-                    text = f'{index + 1}: {label}'
-                    self.x_combo.addItem(text, index)
-                    self.x_combo.model().item(index).setEnabled(index in numeric)
-                    item = QListWidgetItem(text)
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    if index == x or index not in numeric:
-                        item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
-                    item.setCheckState(Qt.Checked if index in ys else Qt.Unchecked)
-                    self.y_list.addItem(item)
-                self.x_combo.setCurrentIndex(x)
-                self.x_combo.setEnabled(sheet.kind != 'dat' or sheet.role == 'fit_parameters')
-                model = _SheetPreviewModel(self.workspace, sheet, mode, self.preview)
-                self.preview.setModel(model)
-                count = sheet_shape(self.workspace, sheet, mode)[0]
-                self.preview_info.setText(f'Preview: first {model.rowCount()} of {count} rows · all rows will be plotted.' +
-                    ('\nDAT X is fixed to the energy axis. Gate labels show this source’s values.' if sheet.kind == 'dat' else ''))
-        except (ValueError, KeyError) as exc:
-            self.preview_info.setText(f'Preview unavailable: {exc}')
-        finally:
-            self._syncing = False
-
-    def _mapping_changed(self, *_args):
-        sheet_id = self._current_id()
-        if self._syncing or sheet_id not in self._choices:
-            return
-        x = self.x_combo.currentData()
-        numeric = sheet_numeric_columns(self.workspace, sheet_id)
-        self._syncing = True
-        try:
-            for index in range(self.y_list.count()):
-                item = self.y_list.item(index)
-                item.setFlags(item.flags() | Qt.ItemIsEnabled if index != x and index in numeric else item.flags() & ~Qt.ItemIsEnabled)
-                if index == x:
-                    item.setCheckState(Qt.Unchecked)
-        finally:
-            self._syncing = False
-        ys = [i for i in range(self.y_list.count()) if i in numeric and self.y_list.item(i).checkState() == Qt.Checked]
-        self._choices[sheet_id] = (x, ys, self.mode_combo.currentData())
-        self._update_mapping_text(sheet_id)
-        self._validate()
-
-    def _mode_changed(self, *_args):
-        sheet_id = self._current_id()
-        if self._syncing or sheet_id not in self._choices:
-            return
-        x, ys, _ = self._choices[sheet_id]
-        self._choices[sheet_id] = (x, ys, self.mode_combo.currentData())
-        self._load_editor()
-        self._update_mapping_text(sheet_id)
-        self._validate()
-
-    def _update_mapping_text(self, sheet_id):
-        x, ys, mode = self._choices[sheet_id]
-        try:
-            columns = sheet_columns(self.workspace, sheet_id, mode)
-            text = f'X: {columns[x]} · Y: {", ".join(columns[y] for y in ys) or "none"} · {mode}'
-        except (ValueError, KeyError, IndexError, TypeError):
-            text = 'Review mapping'
-        self._items[sheet_id].setText(1, text)
-        self._items[sheet_id].setToolTip(1, text)
-
-    def _validate(self, *_args):
-        if self._syncing:
-            return False
+    @Slot(result=bool)
+    def validate(self):
         mappings = self.selected_mappings()
-        self.summary.setText(f'{len(mappings)} Sheet(s) included · {sum(len(ys) for _, ys, _ in mappings.values())} curve(s)')
-        target = self._fixed_target if self._fixed_target is not None else self.destination_combo.currentData()
-        self.commit_btn.setText('Create comparison' if target is None else 'Add data')
+        self._summary = f'{len(mappings)} Sheet(s) included · {sum(len(ys) for _, ys, _ in mappings.values())} curve(s)'
         try:
             validate_sheet_comparison(self.workspace, mappings, names=self._names)
-            if target is not None and target not in self.workspace.comparisons:
+            if self._target is not None and self._target not in self.workspace.comparisons:
                 raise ValueError('The destination comparison no longer exists.')
             candidates = [(sid, x, y, mode) for sid, (x, ys, mode) in mappings.items() for y in ys]
-            additions, existing = select_curve_additions(self.workspace, target, candidates)
-            total = len(candidates) if self.include_existing_chk.isChecked() else len(additions)
-            self.summary.setText(f'{len(mappings)} Sheet(s) included · {len(additions)} new · '
-                                 f'{existing} already present · {total} to add')
+            additions, existing = select_curve_additions(self.workspace, self._target, candidates)
+            total = len(candidates) if self._include_existing else len(additions)
+            self._summary = f'{len(mappings)} Sheet(s) included · {len(additions)} new · {existing} already present · {total} to add'
             if not total:
                 raise ValueError('All selected curves are already present. Select “Include existing curves (add again)” to add them again.')
-        except ValueError as exc:
-            self.feedback.setText(str(exc))
-            self.commit_btn.setEnabled(False)
-            return False
-        self.feedback.clear()
-        self.commit_btn.setEnabled(True)
-        return True
+        except (ValueError, KeyError) as exc:
+            self._feedback, self._can_accept = str(exc), False
+        else:
+            self._feedback, self._can_accept = '', True
+        self.changed.emit()
+        return self._can_accept
 
+    def shutdown(self):
+        old_model, self._preview = self._preview, None
+        self.previewChanged.emit()
+        if old_model is not None:
+            old_model.deleteLater()
+
+
+class SheetComparisonDialog(QuickDialog):
+    def __init__(self, workspace, parent=None, *, selected_sheet_ids=(), comparison_id=None):
+        bridge = SheetComparisonBridge(workspace, selected_sheet_ids=selected_sheet_ids, comparison_id=comparison_id)
+        super().__init__(bridge, 'SheetComparisonDialog.qml', parent,
+            title='Add data to comparison' if comparison_id is not None else 'Compare selected data', size=(960, 680))
+
+    @property
+    def comparison_id(self):
+        return self.bridge._target
+
+    @property
+    def include_existing(self):
+        return self.bridge.includeExisting
+
+    def selected_mappings(self):
+        return self.bridge.selected_mappings()
+
+    @Slot()
     def accept(self):
-        if self._validate():
-            super().accept()
+        # The workspace may have changed while this modal window was open.
+        if self.bridge.validate():
+            self._finish(self.Accepted)

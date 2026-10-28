@@ -15,6 +15,7 @@ from spectra_app.dataset_state import Workspace
 from spectra_app.workbook_state import create_workbook, register_xy_sheet, create_comparison, add_curve
 from spectra_app.xy_analysis import capture_input, AnalysisSettings
 from spectra_app.xy_plot_page import XYPlotPage, draw_comparison
+from tests.xy_helpers import set_xy_draft, select_xy_rows
 
 APP = QApplication.instance() or QApplication([])
 
@@ -57,7 +58,7 @@ class XYDensePreviewTests(unittest.TestCase):
             axes = original(*args, **kwargs)
             rendered.append(len(axes.lines[0].get_xdata()))
             return axes
-        with TemporaryDirectory() as folder, patch('spectra_app.xy_plot_page.draw_comparison', side_effect=record):
+        with TemporaryDirectory() as folder, patch('spectra_app.xy_plot_controller.draw_comparison', side_effect=record):
             self.page.export(Path(folder) / 'dense.png')
             self.page.export(Path(folder) / 'dense.svg')
             self.page.svg_bytes()
@@ -66,17 +67,20 @@ class XYDensePreviewTests(unittest.TestCase):
 
     def test_style_edit_reuses_artists_data_and_zoom_without_prepare(self):
         page = self.page
+        page.resize(1100, 760)
+        page.show()
+        APP.processEvents()
+        self.assertTrue(page.inspector_bridge.enabled)
         line, axes = page.axes.lines[0], page.axes
         xdata = line.get_xdata()
-        page.curve_list.item(0).setSelected(True)
+        select_xy_rows(page, [0])
         page.axes.set_xlim(1000., 2000.); page.axes.set_ylim(-1., 1.)
         page.toolbar.push_current()
         history_size = len(page.toolbar._nav_stack)
-        with patch('spectra_app.xy_plot_page.prepare_comparison', side_effect=AssertionError('full prepare')):
-            page._apply_batch_style({self.curve.curve_id}, 'color', '#abcdef')
-            page.plot_title_edit.setText('Title')
-            page.plot_title_edit.editingFinished.emit()
-            page.width_spin.setValue(3.)
+        with patch('spectra_app.xy_plot_controller.prepare_comparison', side_effect=AssertionError('full prepare')):
+            page.controller._apply_batch_style({self.curve.curve_id}, 'color', '#abcdef')
+            self.assertTrue(set_xy_draft(page, 'plot_title', 'Title', commit=True))
+            self.assertTrue(set_xy_draft(page, 'width', '3', commit=True))
         self.assertIs(page.axes, axes)
         self.assertIs(page.axes.lines[0], line)
         self.assertIs(line.get_xdata(), xdata)

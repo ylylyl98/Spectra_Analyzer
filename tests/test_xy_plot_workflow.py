@@ -9,6 +9,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 from spectra_app.dataset_state import Workspace
 from spectra_app.workbook_state import create_workbook, register_xy_sheet, create_comparison, add_curve
+from tests.xy_helpers import set_xy_draft, select_xy_rows
 
 APP = QApplication.instance() or QApplication([])
 
@@ -25,13 +26,14 @@ class XYPlotWorkflowTests(unittest.TestCase):
         second = add_curve(workspace, comparison.comparison_id, sheet.sheet_id, 0, 1)
         page = XYPlotPage(workspace, comparison.comparison_id)
         self.addCleanup(page.deleteLater)
-        page.curve_list.setCurrentRow(0)
-        page.label_edit.setText('Measured')
-        page.label_edit.editingFinished.emit()
-        page.color_edit.setText('#dd3300')
-        page.color_edit.editingFinished.emit()
-        page.width_spin.setValue(2.5)
-        page.curve_list.item(1).setCheckState(Qt.Unchecked)
+        page.resize(620, 500)
+        page.show()
+        APP.processEvents()
+        select_xy_rows(page, [0])
+        set_xy_draft(page, 'label', 'Measured', commit=True)
+        set_xy_draft(page, 'color', '#dd3300', commit=True)
+        set_xy_draft(page, 'width', '2.5', commit=True)
+        page.set_curve_visibility(second.curve_id, False)
         self.assertEqual((first.label, first.color, first.width), ('Measured','#dd3300',2.5))
         self.assertFalse(second.visible)
         self.assertEqual(len(page.axes.lines), 1)
@@ -52,7 +54,7 @@ class XYPlotWorkflowTests(unittest.TestCase):
             self.assertGreater(image.height(), 300)
             with self.assertRaises(FileExistsError):
                 page.export(png)
-        page.remove_btn.click()
+        page.inspector_bridge.action('remove')
         self.assertEqual(len(comparison.curves), 1)
         second.width = .123456789012345
         page.refresh()

@@ -6,7 +6,7 @@ The explicit window bindings below bridge existing algorithms to one owner.
 from __future__ import annotations
 
 from copy import copy, deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 import os
 import hashlib
 from pathlib import Path
@@ -24,7 +24,8 @@ from .title_templates import manual_settings, render_title
 from .plot_presentation import NormSpec, PlotPresentation
 from .svg_export import valid_color_values
 from .workbook_state import (Comparison, Sheet, Workbook, ensure_dataset_sheet,
-                             reconcile_dataset_sheets, remove_dataset_sheets, _source_key)
+                             reconcile_dataset_sheets, remove_dataset_sheets,
+                             retain_current_processing_result, _source_key)
 
 if TYPE_CHECKING:
     from .analysis_document import AnalysisDocument
@@ -82,6 +83,14 @@ class ProcessingState:
         return {'mode': self.mode, 'smooth': self.smooth,
                 'window_length': self.window_length,
                 'original_signal_title': self.original_signal_title or RAW_LABEL}
+
+
+@dataclass(frozen=True)
+class ProcessingResult:
+    """One retained processing run; graphs and Sheets share its cube by ID."""
+    result_id: str
+    cube: DataCube
+    processing: ProcessingState
 
 
 @dataclass
@@ -159,41 +168,6 @@ class AnalysisControls:
     csv_source: bool = False
 
 
-# (record field, window control, accessor, setter). This is an ownership catalog,
-# not a dynamic snapshot of arbitrary widgets or window attributes.
-ANALYSIS_BINDINGS = (
-    ('derivative_detection', '_d2_radio', 'isChecked', 'setChecked'),
-    ('peak_mode', 'peak_mode_combo', 'currentText', 'setCurrentText'),
-    ('prominence', 'prom_spin', 'value', 'setValue'),
-    ('distance', 'distance_spin', 'value', 'setValue'),
-    ('max_peaks', 'max_peaks_spin', 'value', 'setValue'),
-    ('max_dips', 'max_dips_spin', 'value', 'setValue'),
-    ('peak_smooth', 'peak_smooth_chk', 'isChecked', 'setChecked'),
-    ('peak_smooth_window', 'peak_smooth_win_spin', 'value', 'setValue'),
-    ('d2_mode', 'd2_mode_combo', 'currentText', 'setCurrentText'),
-    ('d2_window', 'd2_sg_win_spin', 'value', 'setValue'),
-    ('d2_polyorder', 'd2_sg_poly_spin', 'value', 'setValue'),
-    ('d2_prominence', 'd2_prom_spin', 'value', 'setValue'),
-    ('d2_distance', 'd2_dist_spin', 'value', 'setValue'),
-    ('d2_separation', 'd2_sep_spin', 'value', 'setValue'),
-    ('d2_max_peaks', 'd2_max_peaks_spin', 'value', 'setValue'),
-    ('d2_max_dips', 'd2_max_dips_spin', 'value', 'setValue'),
-    ('d2_target', 'd2_target_spin', 'value', 'setValue'),
-    ('fit_xmin', 'fit_xmin_spin', 'value', 'setValue'),
-    ('fit_xmax', 'fit_xmax_spin', 'value', 'setValue'),
-    ('fit_xmin_fixed', 'fit_xmin_lock', 'isChecked', 'setChecked'),
-    ('fit_xmax_fixed', 'fit_xmax_lock', 'isChecked', 'setChecked'),
-    ('fit_smooth', 'fit_smooth_chk', 'isChecked', 'setChecked'),
-    ('fit_smooth_window', 'fit_smooth_win_spin', 'value', 'setValue'),
-    ('fit_model', 'fit_model_combo', 'currentText', 'setCurrentText'),
-    ('linewidth_min', 'lw_min_spin', 'value', 'setValue'),
-    ('linewidth_max', 'lw_max_spin', 'value', 'setValue'),
-    ('peak_move_limit', 'peak_move_limit_spin', 'value', 'setValue'),
-    ('maxfev', 'maxfev_spin', 'value', 'setValue'),
-    ('csv_source', '_seeds_from_csv_radio', 'isChecked', 'setChecked'),
-)
-
-
 @dataclass
 class GraphState:
     graph_id: str = 'default'
@@ -204,6 +178,7 @@ class GraphState:
     gate_indices: list[int] | None = None
     published: bool = True
     analysis: AnalysisDocument | None = None
+    result_id: str | None = None
 
 
 def validate_graph_source(source_mode, gate_indices, gate_count=None):
@@ -221,6 +196,7 @@ def graph_cube(session, graph=None):
     """Read the graph's source and exact sparse Gate selection, without mutation."""
     graph = graph or session.active_graph
     cube = (graph.analysis.science.current_cube if graph.analysis is not None else
+            session.processing_results[graph.result_id].cube if graph.result_id is not None else
             session.base_cube if graph.source_mode == 'raw' else session.current_cube)
     validate_graph_source(graph.source_mode, graph.gate_indices, None if cube is None else cube.gate.size)
     if cube is None or graph.gate_indices is None:
@@ -237,8 +213,10 @@ def graph_signal_label(session, graph=None):
     source = cube.signal_source_kind
     if source == 'unknown':
         source = infer_source_signal_kind(cube.source_path or '')
+    applied = (session.processing_results[graph.result_id].processing
+               if graph.result_id is not None else session.applied)
     return automatic_signal_label(source,
-        graph.source_mode == 'processed' and session.applied.mode == 'energy_second_derivative',
+        graph.source_mode == 'processed' and applied.mode == 'energy_second_derivative',
         cube.signal_kind == 'energy_second_derivative')
 
 
@@ -262,6 +240,7 @@ def detached_graph_session(session):
     # A render/format candidate borrows scientific ownership. Explicit analysis
     # duplication is the operation that copies candidate pools and fit results.
     candidate.graphs[session.active_graph_id] = graph
+    candidate.activate_graph(session.active_graph_id)
     return candidate
 
 
@@ -339,6 +318,7 @@ class DatasetSession:
     summary: str = ''
     initialization_notice: str = ''
     sidecar_writes_enabled: bool = True
+    processing_results: dict[str, ProcessingResult] = field(default_factory=dict)
 
     @property
     def active_graph(self) -> GraphState:
@@ -372,6 +352,7 @@ class DatasetSession:
             return graph
         graph = GraphState(uuid4().hex, name, deepcopy(self.view), deepcopy(self.presentation),
                            self.active_graph.source_mode, deepcopy(self.active_graph.gate_indices))
+        graph.result_id = self.active_graph.result_id
         self.graphs[graph.graph_id] = graph
         self.active_graph_id = graph.graph_id
         return graph
@@ -380,9 +361,31 @@ class DatasetSession:
         if graph_id not in self.graphs:
             raise ValueError('The graph no longer exists.')
         self.active_graph_id = graph_id
+        if self.active_graph.result_id is not None:
+            result = self.processing_results[self.active_graph.result_id]
+            if result.cube is not self.current_cube:
+                self._clear_derived_results()
+            self.current_cube = result.cube
+            self.applied = deepcopy(result.processing)
+            self.pending = deepcopy(result.processing)
         if self.active_graph.analysis is not None:
             from .analysis_document import sync_analysis_format
             sync_analysis_format(self)
+
+    def _clear_derived_results(self):
+        """Shared ordinary analyses belong to the previous current cube."""
+        self.peak_indices = np.array([], dtype=int)
+        self.peak_gate_idx = None
+        self.peak_kind_lookup = {}
+        self.peak_label_lookup = {}
+        self.batch_peak_map = {}
+        self.batch_peak_kind_lookup = {}
+        self.fit_result = None
+        self.fit_gate_idx = None
+        self.batch_fit_map = {}
+        self.batch_fit_result_map = {}
+        self.fit_export_rows = []
+        self.has_batch_fit_results = False
 
     def rename_graph(self, graph_id, name):
         if graph_id not in self.graphs:
@@ -399,7 +402,7 @@ class DatasetSession:
         index = list(self.graphs).index(graph_id)
         removed = self.graphs.pop(graph_id)
         if self.active_graph_id == graph_id:
-            self.active_graph_id = list(self.graphs)[min(index, len(self.graphs)-1)]
+            self.activate_graph(list(self.graphs)[min(index, len(self.graphs)-1)])
         return removed
 
     def plot_collection(self):
@@ -408,7 +411,8 @@ class DatasetSession:
         for graph in self.graphs.values():
             # Analysis state is portable project content, never a source DAT
             # sidecar that could later reinterpret the result as source science.
-            if graph.analysis is not None:
+            if (graph.analysis is not None or graph.result_id is not None
+                    and self.processing_results[graph.result_id].cube is not self.current_cube):
                 continue
             recipe = graph.view.plot_recipe(self.current_cube, self.applied, graph.presentation)
             recipe.pop('axis_override')
@@ -453,10 +457,54 @@ class Workspace:
             raise ValueError('A new copy requires an independent dataset identity.')
         key = canonical_path(session.source_path)
         existing = self.dataset_for_path(session.source_path)
+        retained_results = False
+        refresh_processing_graph_name = False
         if existing is not None and not as_new_copy:
             if not replace_existing:
                 return existing
             session.dataset_id = existing.dataset_id
+            if existing.processing_results:
+                for descriptor in fields(existing.base_cube):
+                    old, new = getattr(existing.base_cube, descriptor.name), getattr(session.base_cube, descriptor.name)
+                    if isinstance(old, np.ndarray) or isinstance(new, np.ndarray):
+                        same = old is not None and new is not None and np.array_equal(old, new, equal_nan=True)
+                    else:
+                        same = old == new
+                    if not same:
+                        raise ValueError('Retained processing results use the previous source data and axes. Import this changed DAT as a new copy to preserve those results.')
+                session.processing_results = dict(existing.processing_results)
+                retained_graphs = {graph.graph_id: graph for graph in existing.graphs.values()
+                                   if graph.result_id is not None}
+                names = {graph.name for graph in retained_graphs.values()}
+                graphs = {}
+                for graph in session.graphs.values():
+                    if retained_graphs.get(graph.graph_id) is graph:
+                        continue
+                    previous_id = graph.graph_id
+                    if previous_id in retained_graphs:
+                        if previous_id != session.active_graph_id:
+                            continue
+                        previous = retained_graphs[previous_id]
+                        sheet = next((sheet for sheet in self.sheets.values()
+                                      if sheet.dataset_id == session.dataset_id
+                                      and sheet.role == 'processed'
+                                      and sheet.result_id == previous.result_id), None)
+                        refresh_processing_graph_name = sheet is not None and re.fullmatch(
+                            re.escape(f'{sheet.name} Heatmap') + r'(?: \d+)?', graph.name) is not None
+                        graph = replace(graph, graph_id=uuid4().hex)
+                    name, count = graph.name, 2
+                    while name in names:
+                        name, count = f'{graph.name} {count}', count + 1
+                    graph = replace(graph, name=name)
+                    names.add(name)
+                    graphs[graph.graph_id] = graph
+                    if session.active_graph_id == previous_id:
+                        session.active_graph_id = graph.graph_id
+                # A recalled projection and a historical run can share a sidecar
+                # graph ID, but must retain independent science and visuals.
+                session.graphs = {**graphs, **retained_graphs}
+                session.activate_graph(session.active_graph_id)
+                retained_results = True
         elif session.dataset_id in self.datasets:
             raise ValueError('Dataset ID already belongs to a different source')
         self.datasets[session.dataset_id] = session
@@ -465,6 +513,19 @@ class Workspace:
         if existing is None or replace_existing:
             self.path_index[key] = session.dataset_id
         if session.base_cube is not None and session.current_cube is not None:
+            if retained_results:
+                result = retain_current_processing_result(self, session.dataset_id)
+                if refresh_processing_graph_name:
+                    if result is None:
+                        base_name = 'Original Heatmap'
+                    else:
+                        sheet = ensure_dataset_sheet(self, session.dataset_id, 'processed', result_id=result.result_id)
+                        base_name = f'{sheet.name} Heatmap'
+                    name, count = base_name, 2
+                    while any(graph is not session.active_graph and graph.name == name
+                              for graph in session.graphs.values()):
+                        name, count = f'{base_name} {count}', count + 1
+                    session.active_graph.name = name
             ensure_dataset_sheet(self, session.dataset_id)
             reconcile_dataset_sheets(self, session.dataset_id)
         return session

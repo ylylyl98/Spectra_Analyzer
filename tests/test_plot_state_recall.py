@@ -8,28 +8,35 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtWidgets import QApplication
 
-from spectra_app.main_window import MainWindow
+from spectra_app.common_prompts import PromptAction
+from tests import quick_migration_case as migration
+from tests.quick_application_helpers import application, pump, wait_until
 from spectra_app.plot_state import active_plot_recipe
 from spectra_app.image_export import _build_heatmap_export_figure
-from tests.settings_helpers import isolate_settings, wait_for_background_jobs
+from tests import dat_properties_quick_helpers as dp
+from tests.background_helpers import wait_jobs as wait_for_background_jobs
 
 
-_APP = QApplication.instance() or QApplication([])
-
-
-class PlotStateRecallTests(unittest.TestCase):
+class PlotStateRecallTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.directory = isolate_settings(self).parent
+        super().setUp()
+        self.directory = self.folder
+        self.window_errors = []
         self.windows = []
         self.a = self.make_dat("first/sample.dat")
         self.b = self.make_dat("second/sample.dat")
 
     def tearDown(self):
-        for window in self.windows:
+        for errors in self.window_errors:
+            self.assertEqual(errors, [], 'Unexpected production Quick error')
+
+    def close_window(self, window):
+        # Exercise the production close guard with the user's explicit Discard choice.
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.DISCARD):
             window.close()
-            _APP.processEvents()
+            wait_until(lambda: window._closing)
+        self.assertFalse(window.root_window.isVisible())
 
     def make_dat(self, name):
         path = self.directory / name
@@ -39,20 +46,25 @@ class PlotStateRecallTests(unittest.TestCase):
         return path
 
     def window(self):
-        window = MainWindow()
+        if not self.windows:
+            window, errors = self.controller, self.quick_errors
+        else:
+            host, folder, errors = self.enterContext(application())
+            window = host.controller
         self.windows.append(window)
+        self.window_errors.append(errors)
         return window
 
     def configure(self, window):
-        window.fix_annotations_chk.setChecked(False)
-        window.plot_title_edit.setText("Sample A")
-        window.y_axis_name_edit.setText("Bias")
-        window.y_axis_unit_edit.setText("mV")
-        window.signal_title_combo.setEditText("Custom signal")
-        window.cmap_combo.setCurrentText("viridis")
-        window.xmin_lock.setChecked(True)
-        window.vmin_lock.setChecked(True)
-        window.vmax_lock.setChecked(True)
+        dp.set_flag(window, 'fix_annotations', False)
+        window.dat_properties.setLabel('plot_title', "Sample A", window.dat_properties.ownerToken)
+        window.dat_properties.setLabel('y_axis_name', "Bias", window.dat_properties.ownerToken)
+        window.dat_properties.setLabel('y_axis_unit', "mV", window.dat_properties.ownerToken)
+        window.dat_properties.setLabel('signal_title', "Custom signal", window.dat_properties.ownerToken)
+        dp.set_choice(window, 'colormap', "viridis")
+        dp.set_flag(window, 'xmin_lock', True)
+        dp.set_flag(window, 'vmin_lock', True)
+        dp.set_flag(window, 'vmax_lock', True)
         window.current_gate = 2.0
         window._sync_gate_controls()
         window._heat_ax.set_xlim(1.123456789, 1.987654321)
@@ -60,9 +72,9 @@ class PlotStateRecallTests(unittest.TestCase):
         window._heat_mesh.set_clim(2.123456789, 15.987654321)
 
     def configure_regional(self, window):
-        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
-        window.region_boundary_spins[0].setValue(1.4)
-        window.region_boundary_spins[1].setValue(1.8)
+        dp.set_choice(window, 'color_scale', "3")
+        dp.setup_number(window, 'edge0', 1.4)
+        dp.setup_number(window, 'edge1', 1.8)
 
     def assert_recalled(self, window):
         self.assertEqual(window._heat_ax.get_title(), "Sample A")
@@ -70,11 +82,11 @@ class PlotStateRecallTests(unittest.TestCase):
         self.assertEqual(window._heat_colorbar.ax.get_xlabel(), "Custom signal")
         self.assertEqual(window._heat_mesh.get_cmap().name, "viridis")
         self.assertEqual(window.current_gate, 2.)
-        self.assertTrue(window.xmin_lock.isChecked())
-        self.assertTrue(window.vmin_lock.isChecked())
-        self.assertTrue(window.vmax_lock.isChecked())
-        self.assertFalse(window.ymin_lock.isChecked())
-        self.assertFalse(window.fix_annotations_chk.isChecked())
+        self.assertTrue(dp.state(window)['xmin_lock'])
+        self.assertTrue(dp.state(window)['vmin_lock'])
+        self.assertTrue(dp.state(window)['vmax_lock'])
+        self.assertFalse(dp.state(window)['ymin_lock'])
+        self.assertFalse(dp.state(window)['fix_annotations'])
         np.testing.assert_array_equal(window._heat_ax.get_xlim(), [1.123456789, 1.987654321])
         np.testing.assert_array_equal(window._heat_ax.get_ylim(), [0.123456789, 1.876543219])
         np.testing.assert_array_equal(window._heat_mesh.get_clim(), [2.123456789, 15.987654321])
@@ -92,11 +104,11 @@ class PlotStateRecallTests(unittest.TestCase):
         self.configure(window)
         window._load_dat_file_direct(self.b)
         self.assertEqual(window._heat_ax.get_title(), "")
-        window.plot_title_edit.setText("Sample B")
+        window.dat_properties.setLabel('plot_title', "Sample B", window.dat_properties.ownerToken)
         window._load_dat_file_direct(self.a)
         self.assert_recalled(window)
-        window.close()
-        _APP.processEvents()
+        self.close_window(window)
+        pump()
         restored = self.window()
         restored._load_dat_file_direct(self.a)
         self.assert_recalled(restored)
@@ -106,17 +118,18 @@ class PlotStateRecallTests(unittest.TestCase):
     def test_saved_override_is_used_before_parsing_and_latest_style_applies(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
-        window.x_axis_override_combo.setCurrentIndex(window.x_axis_override_combo.findData("pixel"))
+        dp.set_choice(window, 'axis_override', "pixel")
         wait_for_background_jobs(window)
         self.configure(window)
-        window.close()
-        _APP.processEvents()
+        self.close_window(window)
+        pump()
         restored = self.window()
         with patch("spectra_app.image_export.PLOT_FONT_SIZE", 14):
             restored._load_dat_file_direct(self.a)
             self.assertEqual(restored.current_cube.x_override, "pixel")
             p = restored.workspace.active.presentation
-            factor = 96*restored.plot_page.display_scale*restored.canvas.device_pixel_ratio/restored.figure.dpi
+            # The live Analysis canvas fits independently of the formal paper.
+            factor = 96*restored._analysis_display_scale()*restored.canvas.device_pixel_ratio/restored.figure.dpi
             self.assertEqual(restored._heat_ax.xaxis.label.get_fontsize(), p.text_pt*factor)
             detached = _build_heatmap_export_figure(restored.figure,
                 selected_axes=(restored._heat_ax, restored._heat_colorbar.ax))
@@ -138,20 +151,20 @@ class PlotStateRecallTests(unittest.TestCase):
         window._load_dat_file_direct(self.a)
         self.assertEqual(window._heat_ax.get_title(), "")
         self.assertEqual(window.current_cube.x_original_type, "pixel")
-        self.assertIn("changed", window.statusBar().currentMessage().lower())
+        self.assertIn("changed", window.statusText.lower())
 
     def test_corrupt_snapshot_is_ignored_with_visible_status(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
         self.configure(window)
-        window.close()
+        self.close_window(window)
         path = window._plot_state_store.path_for(self.a)
         path.write_text('{"version":', encoding="utf-8")
         restored = self.window()
         restored._load_dat_file_direct(self.a)
         self.assertEqual(restored._heat_ax.get_title(), "")
-        self.assertIn("saved plot", restored.statusBar().currentMessage().lower())
-        self.assertIn("ignored", restored.statusBar().currentMessage().lower())
+        self.assertIn("saved plot", restored.statusText.lower())
+        self.assertIn("ignored", restored.statusText.lower())
 
     def test_failed_load_preserves_current_plot_and_results(self):
         window = self.window()
@@ -169,9 +182,9 @@ class PlotStateRecallTests(unittest.TestCase):
     def test_restoring_annotations_does_not_replace_global_new_file_defaults(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
-        window.plot_title_edit.setText("A saved title")
+        window.dat_properties.setLabel('plot_title', "A saved title", window.dat_properties.ownerToken)
         window._load_dat_file_direct(self.b)
-        window.plot_title_edit.setText("Global new file title")
+        window.dat_properties.setLabel('plot_title', "Global new file title", window.dat_properties.ownerToken)
         window._load_dat_file_direct(self.a)
         self.assertEqual(window._heat_ax.get_title(), "A saved title")
         window._load_dat_file_direct(self.make_dat("third.dat"))
@@ -181,8 +194,8 @@ class PlotStateRecallTests(unittest.TestCase):
         window = self.window()
         window._load_dat_file_direct(self.a)
         self.configure(window)
-        window.close()
-        _APP.processEvents()
+        self.close_window(window)
+        pump()
         sidecar = self.a.with_name(self.a.name + ".plot.json")
         self.assertTrue(sidecar.is_file())
         destination = self.directory / "copied" / self.a.name
@@ -201,26 +214,23 @@ class PlotStateRecallTests(unittest.TestCase):
         self.configure(window)
         with patch("spectra_app.plot_state.os.replace", side_effect=PermissionError("Folder is read-only")):
             window._load_dat_file_direct(self.b)
-        self.assertIn("Could not save plot settings", window.statusBar().currentMessage())
+        self.assertIn("Could not save plot settings", window.statusText)
         self.assertEqual(self.a.read_bytes(), original)
         self.assertEqual(window.current_dat_path, self.b)
 
     def test_unrestored_source_uses_default_signal_when_global_default_absent(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
-        window.signal_title_combo.blockSignals(True)
         # Model a per-file manual recipe without changing global defaults.
-        window.signal_title_auto_chk.blockSignals(True)
-        window.signal_title_auto_chk.setChecked(False)
-        window.signal_title_auto_chk.blockSignals(False)
-        window.signal_title_combo.setEditText("Saved custom Z")
-        window.signal_title_combo.blockSignals(False)
+        window._dat_view().signal_title_auto = False
+        window._dat_view().annotations['signal_title'] = 'Saved custom Z'
+        window.dat_properties.syncFromOwner()
         window._load_dat_file_direct(self.b)
         window._load_dat_file_direct(self.a)
-        self.assertEqual(window.signal_title_combo.currentText(), "Saved custom Z")
+        self.assertEqual(dp.state(window)['signal_title'], "Saved custom Z")
         self.assertFalse(window._annotation_settings.contains("plot_annotations/signal_title"))
         window._load_dat_file_direct(self.make_dat("third.dat"))
-        self.assertEqual(window.signal_title_combo.currentText(), "Signal (arb. units)")
+        self.assertEqual(dp.state(window)['signal_title'], "Signal (arb. units)")
 
     def test_png_export_saves_sidecar_while_window_remains_open(self):
         window = self.window()
@@ -228,35 +238,35 @@ class PlotStateRecallTests(unittest.TestCase):
         window.open_graph_document()
         self.configure(window)
         window._render_plot_page()
-        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_text)
         output = self.a.with_name(self.a.stem + "_Graph 1_export01.png")
-        with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")):
+        with patch("spectra_app.main_window.FilePicker.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")):
             window._on_export_png()
         self.assertTrue(output.is_file())
         sidecar = self.a.with_name(self.a.name + ".plot.json")
         self.assertTrue(sidecar.is_file())
         self.assertEqual(active_plot_recipe(json.loads(sidecar.read_text(encoding="utf-8"))["plot"])["annotations"]["plot_title"], "Sample A")
 
-    def test_png_export_success_is_reported_even_when_sidecar_save_fails(self):
+    def test_png_export_keeps_sidecar_failure_visible_after_success(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
         window.open_graph_document()
         window._render_plot_page()
-        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+        self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_text)
         output = self.a.with_name(self.a.stem + "_Graph 1_export01.png")
-        with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), \
+        with patch("spectra_app.main_window.FilePicker.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), \
                 patch.object(window._plot_state_store, "save", side_effect=PermissionError("Folder is read-only")):
             window._on_export_png()
         self.assertTrue(output.is_file())
-        self.assertIn("Exported PNG", window.statusBar().currentMessage())
-        self.assertIn("Could not save plot settings", window.statusBar().currentMessage())
+        self.assertNotIn("Exported PNG", window.statusText)
+        self.assertIn("Could not save plot settings", window.statusText)
 
     def test_invalid_or_incompatible_recipes_do_not_partially_restore(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
         self.configure(window)
-        window.close()
-        _APP.processEvents()
+        self.close_window(window)
+        pump()
         path = window._plot_state_store.path_for(self.a)
         original = json.loads(path.read_text(encoding="utf-8"))
         for mutation in (lambda data: data.update(version=99),
@@ -270,23 +280,23 @@ class PlotStateRecallTests(unittest.TestCase):
                 restored = self.window()
                 restored._load_dat_file_direct(self.a)
                 self.assertEqual(restored._heat_ax.get_title(), "")
-                self.assertFalse(restored.xmin_lock.isChecked())
-                self.assertIn("ignored", restored.statusBar().currentMessage())
-                restored.close()
-                _APP.processEvents()
+                self.assertFalse(dp.state(restored)['xmin_lock'])
+                self.assertIn("ignored", restored.statusText)
+                self.close_window(restored)
+                pump()
 
     def test_regional_color_scale_round_trips_and_old_sidecar_defaults_to_global(self):
         window = self.window()
         window._load_dat_file_direct(self.a)
         self.configure_regional(window)
-        saved_boundaries = [spin.value() for spin in window.region_boundary_spins[:2]]
-        window.close()
-        _APP.processEvents()
+        saved_boundaries = [window.dat_properties.number(f'edge{index}') for index in range(2)]
+        self.close_window(window)
+        pump()
         restored = self.window()
         restored._load_dat_file_direct(self.a)
-        self.assertEqual(restored.color_scale_combo.currentData(), "3")
+        self.assertEqual(dp.state(restored)['color_scale'], "3")
         np.testing.assert_allclose(
-            [spin.value() for spin in restored.region_boundary_spins[:2]], saved_boundaries)
+            [restored.dat_properties.number(f'edge{index}') for index in range(2)], saved_boundaries)
         self.assertEqual(len(restored._heat_meshes), 3)
 
         path = restored._plot_state_store.path_for(self.a)
@@ -298,5 +308,5 @@ class PlotStateRecallTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         old = self.window()
         old._load_dat_file_direct(self.a)
-        self.assertEqual(old.color_scale_combo.currentData(), "global")
+        self.assertEqual(dp.state(old)['color_scale'], "global")
         self.assertEqual(len(old._heat_meshes), 1)

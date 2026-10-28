@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtWidgets import QLabel, QMdiArea, QMdiSubWindow, QTabBar, QWidget, QVBoxLayout, QToolButton
-from .workbook_state import document_record_key, encode_document_key
+from .document_registry import DocumentRegistry, ParkedRegistry
+
+
+@dataclass
+class ParkedDocuments:
+    registry: ParkedRegistry
+    windows: tuple
+    disposed: bool = False
 
 
 class _GraphWindow(QMdiSubWindow):
@@ -41,15 +49,13 @@ class GraphDocuments(QMdiArea):
     layoutChanged = Signal()
     workspaceChanged = Signal()
 
-    def __init__(self, activate, finish_close, parent=None):
+    def __init__(self, activate, finish_close, parent=None, *, input_eligible=None):
         super().__init__(parent)
         self._activate = activate
         self._finish_close = finish_close
-        self._pages = {}
+        self._host_input_eligible = input_eligible or (lambda: True)
+        self.registry = DocumentRegistry(self._activate_input, self._input_eligible, self)
         self._windows = {}
-        self._normal_rects = {}
-        self._active_key = None
-        self.initial_view = True
         self._restore_pending = False
         self._restore_timer = QTimer(self)
         self._restore_timer.setSingleShot(True)
@@ -112,7 +118,7 @@ class GraphDocuments(QMdiArea):
             with self._change():
                 for key, window in self._windows.items():
                     if not window.isMaximized() and not window.isMinimized():
-                        self._place_window(window, self._normal_rects[key], clamp=True)
+                        self._place_window(window, self.registry.normal_rectangle(key), clamp=True)
                 self._restore_pending = False
 
     @contextmanager
@@ -130,8 +136,8 @@ class GraphDocuments(QMdiArea):
                 or self._windows.get(window.key) is not window):
             return
         rect = self._document_rectangle(window)
-        if rect != self._normal_rects.get(window.key):
-            self._normal_rects[window.key] = QRect(rect)
+        if rect != self.registry.normal_rectangle(window.key):
+            self.registry.remember_rectangle(window.key, rect)
             self.workspaceChanged.emit()
 
     def _reachable(self, rect):
@@ -159,6 +165,7 @@ class GraphDocuments(QMdiArea):
     def _set_mode(self, mode):
         self.setOption(QMdiArea.DontMaximizeSubWindowOnActivation, mode == QMdiArea.SubWindowView)
         self.setViewMode(mode)
+        self.registry.set_mode('tabbed' if mode == QMdiArea.TabbedView else 'free')
         if mode == QMdiArea.TabbedView:
             active = self._windows.get(self._active_key)
             if active is not None:
@@ -171,25 +178,77 @@ class GraphDocuments(QMdiArea):
             max(300, min(620, area.width() - 48)), max(220, min(460, area.height() - 48)))
             .translated(self._scroll_offset()))
 
+    @property
+    def _active_key(self):
+        return self.registry.active_key
+
+    @property
+    def initial_view(self):
+        return self.registry.initial_view
+
+    @initial_view.setter
+    def initial_view(self, value):
+        self.registry.initial_view = value
+
     def page_for(self, key):
-        return self._pages.get(key)
+        return self.registry.document_for(key)
+
+    def cached_documents(self):
+        return self.registry.cached_documents()
+
+    def cached_items(self):
+        return self.registry.cached_items()
+
+    def _report_stacking(self):
+        self.registry.report_stacking(window.key for window in self.subWindowList(QMdiArea.StackingOrder))
+
+    def _input_eligible(self, key, page):
+        window = self._windows.get(key)
+        if (self._changing or not self._host_input_eligible() or not self.isVisible()
+                or not self.isEnabled() or window is None or not window.isVisible()
+                or not window.isEnabled() or not page.isVisible() or not page.isEnabled()):
+            return False
+        return self.registry.mode == 'free' or self.activeSubWindow() is window
+
+    def _activate_input(self, key):
+        page, window = self.page_for(key), self._windows.get(key)
+        if not self._activate(key):
+            return False
+        if (window is None or self._windows.get(key) is not window
+                or self.page_for(key) is not page):
+            return False
+        # A same-owner domain fast path need not select its native frame. In
+        # particular, deleting an old closed frame can clear QMdiArea's active
+        # pointer after its retained page has already been reopened.
+        with self._change():
+            self.setActiveSubWindow(window)
+            if self.activeSubWindow() is not window:
+                return False
+            self.registry.activated(key)
+        return True
 
     def window_for(self, key):
         return self._windows.get(key)
 
     def cache_page(self, key, page):
-        self._pages[key] = page
+        self.registry.register(key, page)
         page.setParent(self)
         page.hide()
         self.refresh_page_inputs(key)
 
     def refresh_page_inputs(self, key):
-        page = self._pages[key]
+        page = self.page_for(key)
+        lease = self.registry.capture_input(key)
+        # Quick popup items are outside the QWidget ancestry. Their controllers
+        # must renew the same owner guard at the action boundary.
+        if hasattr(page, 'set_input_guard'):
+            page.set_input_guard(lambda captured=lease: self.registry.authorize(captured))
         # Select before native editing starts, including annotation drags and
         # graph shortcuts. A rejected activation consumes the original event.
         for root in self._page_roots(page):
             for widget in (root, *root.findChildren(QWidget)):
                 widget.setProperty('graphDocumentKey', key)
+                widget._graph_document_input_lease = lease
                 widget.installEventFilter(self._input_filter)
 
     @staticmethod
@@ -212,12 +271,14 @@ class GraphDocuments(QMdiArea):
         if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick,
                             QEvent.ContextMenu, QEvent.KeyPress, QEvent.ShortcutOverride):
             key = watched.property('graphDocumentKey')
-            page = self._pages.get(tuple(key)) if key is not None else None
+            lease = getattr(watched, '_graph_document_input_lease', None)
+            page = self.page_for(tuple(key)) if key is not None else None
             # Another MainWindow may have the same document keys. Keep this
             # input filter separate from QMdiArea's native lifecycle filter.
             belongs = page is not None and isinstance(watched, QWidget) and any(
                 watched is root or root.isAncestorOf(watched) for root in self._page_roots(page))
-            if belongs and not self._changing and not self._activate(tuple(key)):
+            if (self.registry.owns_input(lease)
+                    and (not belongs or not self.registry.authorize(lease))):
                 return True
         return False
 
@@ -227,43 +288,47 @@ class GraphDocuments(QMdiArea):
         with self._change():
             window = self._windows.get(key)
             if window is None:
-                rect = self._normal_rects.get(key) or self._new_rectangle()
+                rect = self.registry.normal_rectangle(key) or self._new_rectangle()
                 window = _GraphWindow(self, key)
-                window.setWidget(self._pages[key])
+                window.setWidget(self.page_for(key))
                 self.addSubWindow(window)
                 self._windows[key] = window
-                self._normal_rects[key] = QRect(rect)
+                self.registry.opened(key, rect)
                 self._place_window(window, rect, clamp=True)
                 window.show()
             window.setWindowTitle(title)
-            self._pages[key].show()
-            self._active_key = key
+            self.page_for(key).show()
+            self.registry.activated(key)
             self.setActiveSubWindow(window)
             self._empty.hide()
+        if not self._changing:
+            self._report_stacking()
         if opened:
+            self.refresh_page_inputs(key)
             self.layoutChanged.emit()
         self.workspaceChanged.emit()
-        return self._pages[key]
+        return self.page_for(key)
 
     def _window_activated(self, window):
-        if self._changing or window is None:
+        if self._changing or window is None or self._windows.get(window.key) is not window:
             return
-        if self._activate(window.key):
-            self._active_key = window.key
+        previous = self._active_key
+        if self.registry.authorize(self.registry.capture_input(window.key)):
+            self._report_stacking()
             self.workspaceChanged.emit()
         else:
-            self._changing = True
-            try:
-                self.setActiveSubWindow(self._windows.get(self._active_key))
-            finally:
-                self._changing = False
+            with self._change():
+                if previous is None or previous in self.registry.open_keys():
+                    self.registry.activated(previous)
+                    self.setActiveSubWindow(self._windows.get(previous))
 
-    def _detach_window(self, key):
+    def _detach_window(self, key, page=None):
         window = self._windows.pop(key, None)
         if window is None:
             return
         with self._change():
-            page = self._pages[key]
+            page = page if page is not None else self.page_for(key)
+            self.registry.closed(key)
             page.setParent(self)
             page.hide()
             self.removeSubWindow(window)
@@ -282,71 +347,76 @@ class GraphDocuments(QMdiArea):
                 neighbor = neighbors[-1]
                 if not self._activate(neighbor):
                     return False
-                self._active_key = neighbor
+                self.registry.activated(neighbor)
         self._detach_window(key)
-        if not self._windows:
-            self._active_key = None
+        self._report_stacking()
         self.layoutChanged.emit()
         self.workspaceChanged.emit()
         return True
 
     def discard(self, key):
         was_active = self._active_key == key
-        if was_active:
-            self._active_key = None
-        self._detach_window(key)
-        page = self._pages.pop(key, None)
+        # Retire authority before detaching or disposing any live view roots.
+        page = self.registry.remove(key)
+        self._detach_window(key, page)
         if page is not None:
             self._dispose_page(key, page)
-        self._normal_rects.pop(key, None)
         if was_active:
             for window in reversed(self.subWindowList(QMdiArea.StackingOrder)):
                 if self._activate(window.key):
-                    self._active_key = window.key
+                    self.registry.activated(window.key)
                     with self._change():
                         self.setActiveSubWindow(window)
                     break
+        self._report_stacking()
         self.layoutChanged.emit()
         self.workspaceChanged.emit()
 
     def keys(self):
-        return tuple(self._pages)
+        return self.registry.keys()
 
     def park(self):
-        """Keep cached pages alive while a candidate project is installed."""
+        """Keep exact cached documents alive while a candidate is installed."""
         self._restore_timer.stop()
         self._restore_pending = False
-        state = (self._pages.copy(), [(window.key, window.windowTitle(), self._document_rectangle(window))
-                 for window in self.subWindowList(QMdiArea.StackingOrder)], self.viewMode(),
-                 self._active_key, {key: QRect(rect) for key, rect in self._normal_rects.items()},
-                 self.initial_view)
+        self._report_stacking()
+        windows = tuple((window.key, window.windowTitle(), self._document_rectangle(window))
+                        for window in self.subWindowList(QMdiArea.StackingOrder))
+        registry = self.registry.park()
+        pages = dict(registry.cached_items())
         for key in tuple(self._windows):
-            self._detach_window(key)
-        self._pages.clear()
-        self._normal_rects.clear()
-        self._active_key = None
-        return state
+            self._detach_window(key, pages[key])
+        return ParkedDocuments(registry, windows)
 
     def restore(self, state):
+        if state.disposed:
+            raise ValueError('Disposed parked documents cannot be restored.')
         self._restore_timer.stop()
         self._restore_pending = False
-        pages, windows, mode, active_key, rectangles, initial_view = state
+        # Rollback deliberately restores twice, around scientific projection.
         with self._change():
-            self._pages.update(pages)
-            self._normal_rects = {key: QRect(rect) for key, rect in rectangles.items()}
+            for key in tuple(self._windows):
+                self._detach_window(key)
+            self.registry.restore(state.registry)
             self._set_mode(QMdiArea.SubWindowView)
-            for key, title, geometry in windows:
+            for key, title, geometry in state.windows:
                 self.show_document(key, title)
                 self._place_window(self._windows[key], geometry)
-            self._set_mode(mode)
-            self._active_key = active_key
-            self.setActiveSubWindow(self._windows.get(active_key))
-            self.initial_view = initial_view
-        self._empty.setVisible(not windows)
+            self._set_mode(QMdiArea.TabbedView if state.registry.mode == 'tabbed' else QMdiArea.SubWindowView)
+            self.registry.activated(state.registry.active_key)
+            self.setActiveSubWindow(self._windows.get(self._active_key))
+            self.registry.report_stacking(state.registry.stacking)
+            self.initial_view = state.registry.initial_view
+            for key in self.keys():
+                self.refresh_page_inputs(key)
+        self._empty.setVisible(not state.windows)
 
     @staticmethod
     def discard_parked(state):
-        for key, page in state[0].items():
+        if state.disposed:
+            return
+        state.disposed = True
+        for key, page in state.registry.cached_items():
             GraphDocuments._dispose_page(key, page)
 
     def visible_keys(self):
@@ -374,6 +444,7 @@ class GraphDocuments(QMdiArea):
     def tabbed_view(self):
         with self._change():
             self._set_mode(QMdiArea.TabbedView)
+        self._report_stacking()
         self._refresh_tab_tooltips()
         self.layoutChanged.emit()
         self.workspaceChanged.emit()
@@ -386,8 +457,9 @@ class GraphDocuments(QMdiArea):
             self.horizontalScrollBar().setValue(0)
             self.verticalScrollBar().setValue(0)
             for key, window in self._windows.items():
-                self._place_window(window, self._normal_rects[key], clamp=self._restore_pending)
+                self._place_window(window, self.registry.normal_rectangle(key), clamp=self._restore_pending)
             self.setActiveSubWindow(self._windows.get(self._active_key))
+        self._report_stacking()
         self.layoutChanged.emit()
         self.workspaceChanged.emit()
         self._schedule_restore_placement()
@@ -396,7 +468,9 @@ class GraphDocuments(QMdiArea):
         self.free_view()
         with self._change():
             self.tileSubWindows()
-            self._normal_rects.update({key: self._document_rectangle(window) for key, window in self._windows.items()})
+            for key, window in self._windows.items():
+                self.registry.remember_rectangle(key, self._document_rectangle(window))
+        self._report_stacking()
         self.layoutChanged.emit()
         self.workspaceChanged.emit()
 
@@ -404,50 +478,41 @@ class GraphDocuments(QMdiArea):
         self.free_view()
         with self._change():
             self.cascadeSubWindows()
-            self._normal_rects.update({key: self._document_rectangle(window) for key, window in self._windows.items()})
+            for key, window in self._windows.items():
+                self.registry.remember_rectangle(key, self._document_rectangle(window))
+        self._report_stacking()
         self.layoutChanged.emit()
         self.workspaceChanged.emit()
 
     def workspace_snapshot(self, keys):
         """Detached JSON metadata, including retained geometry of closed graphs."""
-        keys = tuple(keys)
-        existing = set(keys)
-        stacking = [window.key for window in self.subWindowList(QMdiArea.StackingOrder)
-                    if window.key in existing]
-        return {'mode': 'tabbed' if self.viewMode() == QMdiArea.TabbedView else 'free',
-                'documents': [{'key': encode_document_key(key), 'open': key in self._windows,
-                    'rect': list(self._normal_rects[key].getRect()) if key in self._normal_rects else None}
-                    for key in keys],
-                'active': list(self._active_key) if self._active_key in stacking else None,
-                'stacking': [list(key) for key in stacking]}
+        self._report_stacking()
+        return self.registry.workspace_snapshot(keys)
 
     def restore_workspace(self, metadata, title):
         """Restore a validated layout after its saved open pages have been cached."""
         with self._change():
-            self.initial_view = False
+            self._restore_timer.stop()
             self._restore_pending = True
             for key in tuple(self._windows):
                 self._detach_window(key)
-            self._normal_rects = {
-                document_record_key(record): QRect(*record['rect'])
-                for record in metadata['documents'] if record['rect'] is not None}
+            self.registry.restore_workspace(metadata)
             self._set_mode(QMdiArea.SubWindowView)
             for identity in metadata['stacking']:
                 key = tuple(identity)
                 self.show_document(key, title(key))
             if metadata['mode'] == 'tabbed':
                 self._set_mode(QMdiArea.TabbedView)
-            self._active_key = tuple(metadata['active']) if metadata['active'] else None
+            self.registry.activated(tuple(metadata['active']) if metadata['active'] else None)
             self.setActiveSubWindow(self._windows.get(self._active_key))
+            self._report_stacking()
             self._empty.setVisible(not self._windows)
         self.layoutChanged.emit()
         self._schedule_restore_placement()
 
     def reset_layout(self):
         self._restore_timer.stop()
-        self._normal_rects.clear()
-        self._active_key = None
-        self.initial_view = True
+        self.registry.reset_layout()
         self._restore_pending = False
         with self._change():
             self._set_mode(QMdiArea.SubWindowView)

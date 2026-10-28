@@ -11,7 +11,8 @@ from unittest.mock import patch
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from PIL import Image
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, Qt
+from PySide6.QtQml import QQmlEngine, QQmlExpression
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 from shiboken6 import isValid
@@ -63,6 +64,19 @@ class PlotComparisonTests(unittest.TestCase):
         self.windows.append(window)
         return window
 
+    def item(self, window, name):
+        item = window.rootObject().findChild(QObject, name)
+        self.assertIsNotNone(item, name)
+        return item
+
+    def click(self, window, name):
+        window.show()
+        APP.processEvents()
+        item = self.item(window, name)
+        point = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseClick(window, Qt.LeftButton, pos=point)
+        APP.processEvents()
+
     def test_exports_keep_creation_bytes_and_nested_metadata_after_caller_mutation(self):
         # Re-reading the caller's page/metadata at export would change these files.
         borrowed_bytes = bytearray(SVG_A)
@@ -87,7 +101,7 @@ class PlotComparisonTests(unittest.TestCase):
 
         self.assertEqual(before_svg.read_bytes(), SVG_A)
         self.assertEqual(after_svg.read_bytes(), SVG_A)
-        self.assertEqual(window.preview.svg_bytes, SVG_A)
+        self.assertEqual(window.svg_bytes, SVG_A)
         for path in (before_png, after_png):
             with Image.open(path) as image:
                 self.assertEqual(image.size, (400, 200))
@@ -98,8 +112,8 @@ class PlotComparisonTests(unittest.TestCase):
                 self.assertEqual(saved['plot_title'], 'Capture A')
                 self.assertEqual(saved['presentation']['annotations'][0]['text'], 'Captured annotation A')
                 self.assertEqual(image.info['Source'], SOURCE)
-        self.assertIn('Capture A', window.source_label.text())
-        self.assertNotIn('Active title', window.source_label.text())
+        self.assertIn('Capture A', self.item(window, 'comparisonSource').property('text'))
+        self.assertNotIn('Active title', self.item(window, 'comparisonSource').property('text'))
 
     def test_each_window_zoom_changes_only_preview_size(self):
         # A global zoom or a rescaled export page would corrupt comparison/export.
@@ -107,20 +121,27 @@ class PlotComparisonTests(unittest.TestCase):
         second = self.window()
         first.set_zoom('100%')
         second.set_zoom('150%')
-        self.assertEqual((first.preview.width(), first.preview.height()), (192, 96))
-        self.assertEqual((second.preview.width(), second.preview.height()), (288, 144))
-        first.zoom_combo.setCurrentText('200%')
-        self.assertEqual((first.preview.width(), first.preview.height()), (384, 192))
-        self.assertEqual(second.zoom_combo.currentText(), '150%')
-        self.assertEqual((second.preview.width(), second.preview.height()), (288, 144))
+        first_preview = self.item(first, 'comparisonPreview')
+        second_preview = self.item(second, 'comparisonPreview')
+        self.assertEqual((first_preview.width(), first_preview.height()), (192, 96))
+        self.assertEqual((second_preview.width(), second_preview.height()), (288, 144))
+        first.show()
+        first.requestActivate()
+        QTest.qWait(30)
+        self.item(first, 'comparisonZoom').forceActiveFocus()
+        QTest.keyClick(first, Qt.Key_End)
+        APP.processEvents()
+        self.assertEqual((first_preview.width(), first_preview.height()), (384, 192))
+        self.assertEqual(second.bridge.zoom, '150%')
+        self.assertEqual((second_preview.width(), second_preview.height()), (288, 144))
         first.resize(760, 520)
         first.show()
         first.set_zoom('Fit')
         APP.processEvents()
-        viewport = first.preview_scroll.viewport().size()
-        self.assertLessEqual(first.preview.width(), viewport.width())
-        self.assertLessEqual(first.preview.height(), viewport.height())
-        self.assertAlmostEqual(first.preview.width() / first.preview.height(), 2., delta=.02)
+        viewport = self.item(first, 'comparisonViewport')
+        self.assertLessEqual(first_preview.width(), viewport.width())
+        self.assertLessEqual(first_preview.height(), viewport.height())
+        self.assertAlmostEqual(first_preview.width() / first_preview.height(), 2., delta=.02)
         saved = first.export_svg(Path(self.folder.name) / 'fit.svg')
         self.assertEqual(saved.read_bytes(), SVG_A)
         with self.assertRaisesRegex(ValueError, 'zoom'):
@@ -133,15 +154,18 @@ class PlotComparisonTests(unittest.TestCase):
         window.set_zoom('200%')
         window.show()
         APP.processEvents()
-        canvas = window.preview
-        QTest.mousePress(canvas, Qt.LeftButton, pos=QPoint(55, 90))
-        QTest.mouseMove(canvas, QPoint(90, 110))
-        QTest.mouseRelease(canvas, Qt.LeftButton, pos=QPoint(90, 110))
+        canvas = self.item(window, 'comparisonPreview')
+        start = canvas.mapToScene(QPointF(55, 90)).toPoint()
+        end = canvas.mapToScene(QPointF(90, 110)).toPoint()
+        QTest.mousePress(window, Qt.LeftButton, pos=start)
+        QTest.mouseMove(window, end)
+        QTest.mouseRelease(window, Qt.LeftButton, pos=end)
+        self.item(window, 'comparisonViewport').forceActiveFocus()
         for key in (Qt.Key_Delete, Qt.Key_Backspace, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
-            QTest.keyClick(canvas, key)
+            QTest.keyClick(window, key)
         output = window.export_svg(Path(self.folder.name) / 'untouched.svg')
         self.assertEqual(output.read_bytes(), SVG_A)
-        self.assertEqual(canvas.svg_bytes, SVG_A)
+        self.assertEqual(window.svg_bytes, SVG_A)
         self.assertEqual(metadata['presentation']['annotations'], [{'text': 'Captured annotation A'}])
 
     def test_same_source_different_pages_survive_other_window_close(self):
@@ -154,9 +178,9 @@ class PlotComparisonTests(unittest.TestCase):
         second = self.window(page(SVG_B, owner=('data-a', 4, 5, 8, 12)), parent=owner)
         first.show()
         second.show()
-        self.assertTrue(first.isWindow())
-        self.assertEqual(first.windowModality(), Qt.NonModal)
-        self.assertTrue(first.testAttribute(Qt.WA_DeleteOnClose))
+        self.assertTrue(first.isTopLevel())
+        self.assertEqual(first.modality(), Qt.NonModal)
+        self.assertEqual(first.transientParent(), owner.windowHandle())
         first.close()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         APP.processEvents()
@@ -164,7 +188,7 @@ class PlotComparisonTests(unittest.TestCase):
         self.assertTrue(isValid(owner))
         self.assertEqual(owner.imported_data, imported_data)
         self.assertTrue(second.isVisible())
-        self.assertEqual(second.preview.svg_bytes, SVG_B)
+        self.assertEqual(second.svg_bytes, SVG_B)
         saved = second.export_svg(Path(self.folder.name) / 'second.svg')
         self.assertEqual(saved.read_bytes(), SVG_B)
 
@@ -172,19 +196,19 @@ class PlotComparisonTests(unittest.TestCase):
         # Resolving a source from the output filename would lose original identity.
         window = self.window(png_dpi=144)
         folder = Path(self.folder.name)
-        with patch('spectra_app.plot_comparison.QFileDialog.getSaveFileName',
-                   return_value=(str(folder / 'different-svg-name.svg'), '')):
-            QTest.mouseClick(window.export_svg_btn, Qt.LeftButton)
-        with patch('spectra_app.plot_comparison.QFileDialog.getSaveFileName',
-                   return_value=(str(folder / 'different-png-name.png'), '')):
-            QTest.mouseClick(window.export_png_btn, Qt.LeftButton)
+        with patch.object(window, '_select_export_path',
+                          return_value=str(folder / 'different-svg-name.svg')):
+            self.click(window, 'comparisonExportSvg')
+        with patch.object(window, '_select_export_path',
+                          return_value=str(folder / 'different-png-name.png')):
+            self.click(window, 'comparisonExportPng')
         self.assertEqual((folder / 'different-svg-name.svg').read_bytes(), SVG_A)
         with Image.open(folder / 'different-png-name.png') as image:
             self.assertEqual(image.size, (288, 144))
             self.assertEqual(image.info['Source'], SOURCE)
             self.assertEqual(json.loads(image.info['SpectraAnalyzer'])['source_path'], SOURCE)
-        with patch('spectra_app.plot_comparison.QFileDialog.getSaveFileName', return_value=('', '')):
-            QTest.mouseClick(window.export_svg_btn, Qt.LeftButton)
+        with patch.object(window, '_select_export_path', return_value=''):
+            self.click(window, 'comparisonExportSvg')
         self.assertEqual(len(list(folder.iterdir())), 2)
 
     def test_existing_export_is_preserved_and_dialog_reports_failure(self):
@@ -194,21 +218,23 @@ class PlotComparisonTests(unittest.TestCase):
         output.write_bytes(b'existing file')
         with self.assertRaises(FileExistsError):
             window.export_svg(output)
-        with patch('spectra_app.plot_comparison.QFileDialog.getSaveFileName', return_value=(str(output), '')):
-            QTest.mouseClick(window.export_svg_btn, Qt.LeftButton)
+        with patch.object(window, '_select_export_path', return_value=str(output)):
+            self.click(window, 'comparisonExportSvg')
         self.assertEqual(output.read_bytes(), b'existing file')
-        self.assertIn('Failed', window.status_label.text())
+        self.assertIn('Failed', self.item(window, 'comparisonStatus').property('text'))
 
     def test_capture_label_identifies_source_title_and_versions_and_rejects_invalid_inputs(self):
         # A missing identity or invalid DPI could disguise/export the wrong capture.
         window = self.window()
-        self.assertIn(SOURCE, window.source_label.text())
-        self.assertIn('Capture A', window.source_label.text())
+        self.assertIn(SOURCE, self.item(window, 'comparisonSource').property('text'))
+        self.assertIn('Capture A', self.item(window, 'comparisonSource').property('text'))
         for version in ('3', '5', '7', '11'):
-            self.assertIn(version, window.source_label.text())
-        self.assertIn('comparison', window.windowTitle().lower())
-        self.assertIn('300', window.dimensions_label.text())
-        self.assertEqual(window.source_label.textFormat(), Qt.PlainText)
+            self.assertIn(version, self.item(window, 'comparisonSource').property('text'))
+        self.assertIn('comparison', window.title().lower())
+        self.assertIn('300', self.item(window, 'comparisonDimensions').property('text'))
+        source = self.item(window, 'comparisonSource')
+        plain = QQmlExpression(QQmlEngine.contextForObject(source), source, 'textFormat === TextEdit.PlainText')
+        self.assertEqual(plain.evaluate(), (True, False))
         for source_label in ('', '   ', None):
             with self.subTest(source_label=source_label), self.assertRaisesRegex(ValueError, 'source'):
                 self.window_class(page(), source_label=source_label, metadata={})

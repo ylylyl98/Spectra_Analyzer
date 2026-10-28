@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from .file_picker import FilePicker
+from .quick_ui import ApplicationBridge, CommandAction
+from .common_prompts import PromptAction, prompt_message, prompt_text, prompt_item, prompt_int
+from .ordinary_analysis_bridge import OrdinaryAnalysisBridge
+from .source_navigation import SourceNavigation, SourceServices
+from .project_model import ProjectRow
+from .shared_dat_properties import SharedDatPropertiesBridge, BOUNDS, COLORMAPS
+
 from .signal_titles import (infer_signal_kind, infer_source_signal_kind, automatic_signal_label,
                             display_signal_label, RAW_LABEL, DERIVATIVE_LABEL)
 
@@ -15,58 +23,19 @@ from threading import Event
 from typing import Any
 
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from .analysis_navigation import AnalysisNavigationBridge, AnalysisNavigationController
+from .analysis_canvas import (AnalysisFigureCanvas,
+                              CanvasPointerContext, PeakMenuRequest)
+from matplotlib.backend_bases import ResizeEvent
 from matplotlib.figure import Figure
 from matplotlib import colormaps
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.widgets import LassoSelector
 from scipy.signal import savgol_filter
-from PySide6.QtCore import Qt, QObject, QEvent, QPointF, QSettings, QSignalBlocker, QTimer, Signal, QSize, QMimeData, QUrl, QItemSelection, QItemSelectionModel
-from PySide6.QtGui import QCursor, QDragEnterEvent, QDropEvent, QWheelEvent, QIcon, QImage, QPixmap, QKeySequence, QDesktopServices
-from PySide6.QtWidgets import (
-    QApplication,
-    QAbstractSpinBox,
-    QAbstractSlider,
-    QScrollBar,
-    QTabBar,
-    QAbstractItemView,
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
-    QDialog,
-    QDialogButtonBox,
-    QDockWidget,
-    QFileDialog,
-    QFormLayout,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMenu,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QRadioButton,
-    QScrollArea,
-    QSpinBox,
-    QSplitter,
-    QStackedWidget,
-    QStatusBar,
-    QTabWidget,
-    QToolButton,
-    QTreeWidgetItem,
-    QVBoxLayout,
-    QWidget,
-    QFrame,
-    QSizePolicy,
-    QStyle,
-)
+from PySide6.QtCore import Qt, QObject, QEvent, QPoint, QPointF, QSettings, QSignalBlocker, QTimer, Signal, QSize, QMimeData, QUrl, QItemSelection, QItemSelectionModel, Property, Slot
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QWheelEvent, QIcon, QImage, QPixmap, QKeySequence, QDesktopServices, QGuiApplication
+
 
 from .dat_io import AXIS_OVERRIDE_ITEMS, DataCube, load_dat_cube
 from .background_jobs import (CancelledError, BackgroundJobs, JobContext, DatImportError, LoadRequest,
@@ -87,7 +56,7 @@ from .fitting import (
     _clamp_sg_window,
 )
 from .processing import energy_second_derivative
-from .dataset_state import (ANALYSIS_BINDINGS, AnalysisControls, DatasetDefaults,
+from .dataset_state import (AnalysisControls, DatasetDefaults,
                             DatasetSession, FixedRecipe, ProcessingState, SessionField,
                             Workspace, canonical_path, dataset_display_labels, initialize_dataset,
                             detached_graph_session, graph_export_stem, refresh_graph_colors,
@@ -96,19 +65,19 @@ from .edit_history import (COLOR_FIELDS, RANGE_FIELDS, STYLE_FIELDS, TITLE_FIELD
                            EditCommand, EditHistory, FieldChange, capture_fields, field_changes,
                            restore_fields, capture_peaks)
 from .plot_presentation import NormSpec, PlotPresentation
-from .plot_page import PlotPage
-from .disclosure import DisclosureSection, protect_disclosure_drafts, reveal_editor
-from .graph_documents import GraphDocuments
-from .project_tree import ProjectTreeWidget
+from .formal_plot_controller import FormalPlotController
+from .quick_documents import QuickDocuments
 from .plot_icons import plot_icon
-from .workbook_page import WorkbookPage, WorkbookPlotCommands
-from .xy_plot_page import XYPlotPage
+from .workbook_page import WorkbookController, WorkbookPlotCommandsController
+from .xy_plot_controller import XYPlotController
+from .xy_analysis_controller import XYAnalysisServices
 from .workbook_state import (create_workbook, register_xy_sheet, create_comparison, add_curve,
     remove_workbook, remove_sheet, remove_comparison, ensure_dataset_sheet,
+    add_processing_result, retain_current_processing_result,
     reconcile_dataset_sheets, document_record_key, document_exists, set_sheet_mapping, _source_key)
 from .workbook_state import save_sheet_snapshot, merge_workbooks, sheet_shape, validate_workbook_state
 from .workbook_state import workbook_display_labels, workbook_sources
-from .workbook_state import select_curve_additions, validate_mapping
+from .workbook_state import select_curve_additions, validate_mapping, initialize_comparison_labels
 from .analysis_graph import fit_curve_sheet, marker_curve_sheet, saved_result_records, add_analysis_comparison
 from .analysis_workbench import AnalysisWorkbenchMixin
 from .analysis_document import analysis_owner, graph_presentation, sync_analysis_format
@@ -176,92 +145,167 @@ _STYLE_DANGER = (
 )
 
 
-class _AnalysisNavigationToolbar(NavigationToolbar2QT):
-    """Analysis navigation tools; image exports belong to the formal Plot page."""
-    toolitems = tuple(item for item in NavigationToolbar2QT.toolitems if item[3] != 'save_figure')
+class ApplicationController(AnalysisWorkbenchMixin, QObject):
 
+    shellChanged = Signal()
+    statusChanged = Signal(str)
+    revealProperties = Signal(str, float)
+    inspectorRevealRequested = Signal(int, str)
+    title = Property(str, lambda self: 'Spectra Analyzer' + (' — ' + self._project_path.name if self._project_path else '') + (' *' if self._project_modified else ''), notify=shellChanged)
+    statusText = Property(str, lambda self: self._status_text, notify=shellChanged)
+    projectPath = Property(str, lambda self: str(self._project_path or ''), notify=shellChanged)
+    projectModified = Property(bool, lambda self: self._project_modified, notify=shellChanged)
+    outerView = Property(str, lambda self: self._outer_view, notify=shellChanged)
+    taskIndex = Property(int, lambda self: self._task_index, notify=shellChanged)
+    projectPanelVisible = Property(bool, lambda self: self._project_panel_visible, notify=shellChanged)
+    propertiesVisible = Property(bool, lambda self: self._dat_details_requested, notify=shellChanged)
+    propertiesFloating = Property(bool, lambda self: self._properties_floating, notify=shellChanged)
+    contextKind = Property(str, lambda self: self._context_kind, notify=shellChanged)
+    propertiesController = Property(QObject, lambda self: self._properties_controller, notify=shellChanged)
+    commandController = Property(QObject, lambda self: self._command_controller, notify=shellChanged)
+    formalBridge = Property(QObject, lambda self: self.plot_page.formal, notify=shellChanged)
+    sourceNavigation = Property(QObject, lambda self: self.source_navigation, constant=True)
+    applicationBridge = Property(QObject, lambda self: self.app_bridge, constant=True)
+    sharedDat = Property(QObject, lambda self: self.dat_properties, constant=True)
+    ordinaryAnalysis = Property(QObject, lambda self: self.ordinary_analysis, constant=True)
+    analysisWorkbench = Property(QObject, lambda self: self.analysis_workbench, constant=True)
+    analysisHeader = Property(QObject, lambda self: self.analysis_header, constant=True)
+    analysisNavigation = Property(QObject, lambda self: self.analysis_navigation, constant=True)
+    documents = Property(QObject, lambda self: self.graph_documents, constant=True)
+    workbookCommands = Property(QObject, lambda self: self.workbook_commands, constant=True)
+    xyCommandBridge = Property(QObject, lambda self: self._command_controller.command_bridge if isinstance(self._command_controller, XYPlotController) else None, notify=shellChanged)
+    xyInspectorBridge = Property(QObject, lambda self: self._properties_controller.inspector_bridge if isinstance(self._properties_controller, XYPlotController) else None, notify=shellChanged)
+    xyAnalysisBridge = Property(QObject, lambda self: self._properties_controller.analysis_controller.bridge if isinstance(self._properties_controller, XYPlotController) else None, notify=shellChanged)
+    linecutHeight = Property(float, lambda self: float(self._workbench_linecut_sizes[1]), notify=shellChanged)
+    workbenchActive = Property(bool, lambda self: self._workbench_document() is not None and self._outer_view == 'analysis', notify=shellChanged)
+    linecutVisible = Property(bool, lambda self: self._workbench_aux_linecut_visible, notify=shellChanged)
+    cancelVisible = Property(bool, lambda self: self._cancel_visible, notify=shellChanged)
+    busy = Property(bool, lambda self: self._project_busy(), notify=shellChanged)
+    # Compatibility for canvas/analysis reveal callers; taskIndex owns navigation.
+    inspectorSection = Property(int, lambda self: self._task_index, notify=shellChanged)
+    contextSummary = Property(str, lambda self: self._properties_context_summary(), notify=shellChanged)
+    contextFullSummary = Property(str, lambda self: self._properties_context_summary(detailed=True), notify=shellChanged)
+    menus = Property('QVariantList', lambda self: [dict(title=name, actions=items) for name, items in self._menu_groups.items()], notify=shellChanged)
+    recentProjects = Property('QVariantList', lambda self: [dict(path=value, title=Path(value).name + ' — ' + str(Path(value).parent)) for value in self._recent_project_paths], notify=shellChanged)
 
-class _PageWheelFilter(QObject):
-    """Wheel gestures scroll pages; value controls and plots never consume them."""
-    def eventFilter(self, watched, event):
-        if event.type() != QEvent.Wheel or not isinstance(watched, QWidget):
+    def publish_status(self, text, timeout=0):
+        self._status_text = str(text)
+        self.statusChanged.emit(self._status_text)
+        self.shellChanged.emit()
+
+    def set_project_modified(self, modified):
+        self._project_modified = bool(modified)
+        self.shellChanged.emit()
+
+    def set_cancel_visible(self, visible):
+        self._cancel_visible = bool(visible)
+        self.shellChanged.emit()
+
+    @Slot(int, result=bool)
+    def request_task(self, index):
+        if index not in (0, 1, 2):
             return False
-        widget = watched
-        blocked = False
-        while widget is not None:
-            if isinstance(widget, (QAbstractSpinBox, QComboBox, QTabBar, FigureCanvasQTAgg)):
-                blocked = True
-            if isinstance(widget, QAbstractSlider) and not isinstance(widget, QScrollBar):
-                blocked = True
-            if isinstance(widget, QScrollArea):
-                if blocked:
-                    viewport = widget.viewport()
-                    forwarded = QWheelEvent(
-                        QPointF(viewport.mapFromGlobal(event.globalPosition().toPoint())),
-                        event.globalPosition(), event.pixelDelta(), event.angleDelta(),
-                        event.buttons(), event.modifiers(), event.phase(), event.inverted(),
-                    )
-                    QApplication.sendEvent(viewport, forwarded)
-                    event.accept()
-                    return True
+        previous = self._task_index
+        if isinstance(self._properties_controller, XYPlotController):
+            self._properties_controller.inspector_bridge.suspendBlur()
+        self._task_index = index
+        if self._outer_view == 'analysis':
+            self._analysis_task_index = index
+        else:
+            self._heatmap_task_index = index
+        self.shellChanged.emit()
+        self.app_bridge.navigation.changed.emit()
+        if previous != index:
+            self._activate_visible_xy_analysis()
+        return True
+
+    @Slot(str, result=bool)
+    def request_outer_view(self, view):
+        if view not in ('analysis', 'workspace'):
+            return False
+        if view == self._outer_view:
+            return True
+        if not self._project_installing:
+            try:
+                self._finish_current_document()
+            except ValueError as exc:
+                self.publish_status(str(exc))
                 return False
-            widget = widget.parentWidget()
-        if blocked:
-            event.accept()
-        return blocked
+        if view == 'analysis':
+            self._analysis_return_key = self.graph_documents.registry.active_key
+        self._outer_view = view
+        self._task_index = self._analysis_task_index if view == 'analysis' else self._heatmap_task_index
+        self._outer_view_changed(defer_live_layout=view == 'analysis')
+        return True
 
+    @Slot(bool)
+    def floatProperties(self, floating):
+        self._properties_floating = bool(floating)
+        self.shellChanged.emit()
 
-class GateValueSpinBox(QDoubleSpinBox):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._allowed_values = np.asarray([], dtype=float)
+    @Slot(int)
+    def selectInspectorSection(self, section):
+        self.request_task(section)
 
-    def set_allowed_values(self, values: np.ndarray) -> None:
-        self._allowed_values = np.asarray(values, dtype=float).ravel()
-        if self._allowed_values.size:
-            self.setRange(float(np.nanmin(self._allowed_values)), float(np.nanmax(self._allowed_values)))
+    @Slot(float, float)
+    def rememberLinecutSizes(self, main, linecut):
+        if self.linecutVisible and main > 0 and linecut > 0:
+            self._workbench_linecut_sizes = [round(main), round(linecut)]
 
-    def stepBy(self, steps: int) -> None:
-        if self._allowed_values.size == 0:
-            super().stepBy(steps)
+    def reveal_xy_inspector(self, page, section, field):
+        if page is not self._properties_controller:
             return
-        idx = int(np.argmin(np.abs(self._allowed_values - float(self.value()))))
-        idx = int(np.clip(idx + int(steps), 0, self._allowed_values.size - 1))
-        self.setValue(float(self._allowed_values[idx]))
+        self._set_dat_details_requested(True)
+        self.selectInspectorSection(section)
+        self.inspectorRevealRequested.emit(section, field)
 
+    @Slot(str)
+    def revealInspectorField(self, field):
+        page = self._properties_controller
+        if isinstance(page, XYPlotController):
+            page.inspector_bridge.focusFieldRequested.emit(field)
 
-class _ColorBoundSpinBox(QDoubleSpinBox):
-    """Distinguish native numeric edits from refresh/recipe setValue calls."""
-    userCommitted = Signal()
+    @Slot()
+    def refreshMenus(self):
+        self._refresh_graph_commands()
 
-    def __init__(self):
-        super().__init__()
-        self._edit_start = None
-        self.lineEdit().textEdited.connect(self._begin_edit)
-        self.editingFinished.connect(self._finish_edit)
+    @Slot(str)
+    def openRecent(self, path):
+        self._open_project_path(path)
 
-    def _begin_edit(self, _text):
-        if self._edit_start is None:
-            self._edit_start = self.value()
+    @Slot()
+    def clearRecent(self):
+        self._clear_recent_projects()
 
-    def _finish_edit(self):
-        previous, self._edit_start = self._edit_start, None
-        if previous is not None and previous != self.value():
-            self.userCommitted.emit()
+    @Slot()
+    def cancelOperation(self):
+        self._cancel_background_job()
 
-    def setValue(self, value):
-        self._edit_start = None
-        super().setValue(value)
+    @Slot()
+    def close(self):
+        if self.root_window is not None:
+            self.root_window.close()
 
-    def stepBy(self, steps):
-        previous = self.value()
-        super().stepBy(steps)
-        self._edit_start = None
-        if previous != self.value():
-            self.userCommitted.emit()
+    @Slot('QVariantList', result=bool)
+    def canAcceptDropUrls(self, urls):
+        urls = [QUrl(value) if isinstance(value, str) else value for value in urls]
+        paths = [Path(value.toLocalFile()) for value in urls if value.isLocalFile()]
+        return bool(len(paths) == len(urls) and not self._drop_busy(paths)
+                    and self._supported_drop(paths))
 
+    @Slot('QVariantList', result=bool)
+    def dropUrls(self, urls):
+        if not self.canAcceptDropUrls(urls):
+            self.publish_status(self._drop_rejection_message())
+            return False
+        urls = [QUrl(value) if isinstance(value, str) else value for value in urls]
+        paths = [Path(value.toLocalFile()) for value in urls]
+        if paths[0].suffix.lower() in ('.spectra', '.spextra'):
+            self._open_project_path(paths[0])
+        else:
+            self._import_data_files(paths)
+        return True
 
-class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     # Existing scientific algorithms use these names. The descriptors always
     # read/write the active owner; there is no second window copy of this data.
     current_cube = SessionField('current_cube')
@@ -304,12 +348,26 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         # A coherent owner for existing fixtures/embedded uses that set a cube
         # directly before any source file is registered.
         self._unregistered_session = DatasetSession()
+        self._unregistered_session.analysis_controls = AnalysisControls(
+            linewidth_min=10, linewidth_max=50, peak_move_limit=10, maxfev=20000)
         self._restoring_dataset = False
         self._project_installing = False
-        self.setWindowTitle("Spectra Analyzer (PySide6)")
-        self.setMinimumSize(1000, 680)
-        self.resize(1250, 860)
-        self._sidebar_initial_sizing_pending = True
+        self.root_window = None
+        self._status_text = ''
+        self._project_modified = False
+        self._outer_view = 'workspace'
+        self._task_index = 0
+        self._analysis_task_index = 0
+        self._heatmap_task_index = 2
+        self._cancel_visible = False
+        self._properties_floating = False
+        self._project_panel_visible = True
+        self._project_panel_width = 240
+        self._dat_details_requested = True
+        self._properties_controller = None
+        self._command_controller = None
+        self._context_kind = 'empty'
+        self._closing = False
 
         # ── data state ──────────────────────────────────────────────────────
         self.current_root = ""
@@ -339,8 +397,6 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._has_batch_fit_results: bool = False
 
         # ── UI lock helpers ──────────────────────────────────────────────────
-        self._view_lock_controls: dict[QDoubleSpinBox, QCheckBox] = {}
-        self._fit_lock_controls: dict[QDoubleSpinBox, QCheckBox] = {}
         self._view_callbacks_ready = False
         self._view_syncing = False
         self._heat_mesh = None
@@ -373,6 +429,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
         # ── lasso state ──────────────────────────────────────────────────────
         self._lasso_mode: bool = False
+        self._circle_delete_mode = False
         self._lasso_selector: LassoSelector | None = None
         self._lasso_selected_peak_ids: list[tuple[int, int]] = []
         self._lasso_selection_patch: Any = None
@@ -407,6 +464,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._annotation_edit_timer.setInterval(250)
         self._annotation_edit_timer.timeout.connect(self._finish_annotation_edit)
         self._annotation_edit_pending = False
+        self._annotation_edit_requires_layout = False
+        self._annotation_layout_pending = False
         self._title_source = None
         self._title_presets, self._default_title_settings = self._load_title_preferences()
         self._title_settings = self._copy_title_settings(self._default_title_settings)
@@ -453,8 +512,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._history_restoring = False
         self._history_depth = 0
         self._pending_history_edit = None
+        self._unregistered_session.fixed_recipes['processing'].enabled = self._annotation_settings.value(
+            'fixed_processing/enabled', False, type=bool)
+        self.app_bridge = ApplicationBridge(self)
+        self.processing = self.app_bridge.processing
         self._build_ui()
         self._build_graph_commands()
+        self._build_quick_commands()
         self._build_data_navigator()
         self._build_analysis_workbench()
         self._plot_render_timer = QTimer(self)
@@ -472,35 +536,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._plot_batch_timer.setInterval(0)
         self._plot_batch_timer.timeout.connect(self._step_plot_batch)
         self._refresh_plot_formats()
-        self._job_cancel_button = QPushButton("Cancel operation")
-        self._job_cancel_button.clicked.connect(self._cancel_background_job)
-        self.statusBar().addPermanentWidget(self._job_cancel_button)
-        self._job_cancel_button.hide()
-        if self.fix_processing_chk.isChecked():
+        self.set_cancel_visible(False)
+        if self.processing.fixed:
             self._set_processing_controls(self._fixed_recipe("processing"))
-        if self.fix_regions_chk.isChecked():
+        if (self.workspace.active or self._unregistered_session).fixed_recipes['regions'].enabled:
             regions = self._fixed_recipe("regions")
             self._color_scale_mode = regions.get("mode", "global")
-            with QSignalBlocker(self.color_scale_combo):
-                self.color_scale_combo.setCurrentIndex(
-                    self.color_scale_combo.findData(self._color_scale_mode))
-        app = QApplication.instance()
-        if not hasattr(app, "_page_wheel_filter"):
-            app._page_wheel_filter = _PageWheelFilter(app)
-            app.installEventFilter(app._page_wheel_filter)
-        self.setAcceptDrops(True)
+            self.dat_properties.syncFromOwner()
         self._connect_dataset_control_projection()
         self._connect_control_feedback()
-        for edit in (*self._annotation_edits.values(), self.signal_title_combo.lineEdit(),
-                     self.title_pattern_edit, self.title_angle_map_edit):
-            if edit in (*self._annotation_edits.values(), self.signal_title_combo.lineEdit()):
-                edit.editingFinished.connect(self._finish_annotation_edit)
-            edit.editingFinished.connect(self._finish_history_edit)
-        for spin in self._view_lock_controls:
-            spin.editingFinished.connect(self._finish_history_edit)
         self._connect_project_modified_editors()
         # Select the startup view after its tab-change dependencies are ready.
-        self.plot_tabs.setCurrentWidget(self.graph_documents)
+        self._refresh_workspace_shell()
 
     def _history_for(self, session):
         return self._edit_histories.setdefault(session.dataset_id, EditHistory())
@@ -594,25 +641,25 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def undo_edit(self):
         if self._auxiliary_active():
-            page = self.graph_documents.page_for(self.graph_documents._active_key)
-            return isinstance(page, XYPlotPage) and not self._history_busy() and page.undo()
+            page = self.graph_documents.document_for(self.graph_documents.registry.active_key)
+            return isinstance(page, XYPlotController) and not self._history_busy() and page.undo()
         return self._restore_history_command(redo=False)
 
     def redo_edit(self):
         if self._auxiliary_active():
-            page = self.graph_documents.page_for(self.graph_documents._active_key)
-            return isinstance(page, XYPlotPage) and not self._history_busy() and page.redo()
+            page = self.graph_documents.document_for(self.graph_documents.registry.active_key)
+            return isinstance(page, XYPlotController) and not self._history_busy() and page.redo()
         return self._restore_history_command(redo=True)
 
     def _restore_history_command(self, *, redo):
         session = self.workspace.active
         if session is None or self._history_busy():
-            self.statusBar().showMessage('Wait for the current operation before Undo / Redo.')
+            self.publish_status('Wait for the current operation before Undo / Redo.')
             return False
         try:
             self._finish_graph_editors(capture_science=False)
         except ValueError as exc:
-            self.statusBar().showMessage(str(exc))
+            self.publish_status(str(exc))
             return False
         history = self._history_for(session)
         source = history.redo_stack if redo else history.undo_stack
@@ -621,6 +668,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._refresh_graph_commands()
             return False
         command = source[-1]
+        # Rebuilding the ordinary canvas retires its keyboard owner and QML
+        # releases focus. Retain an actual canvas user's focus across a
+        # successful restore so the next Undo / Redo shortcut remains local.
+        from shiboken6 import isValid
+        root = getattr(self, 'root_window', None)
+        focus = root.activeFocusItem() if root is not None else None
+        focus_owner = (self.ordinary_analysis.ownerToken
+                       if focus is not None and focus.objectName() == 'applicationDatCanvas'
+                       and QGuiApplication.focusWindow() is root and root.isVisible()
+                       and focus.isVisible() and focus.isEnabled()
+                       and self._outer_view == 'analysis' else None)
         self._history_restoring = True
         try:
             self._cancel_graph_interaction()
@@ -647,9 +705,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         finally:
             self._history_restoring = False
         self._refresh_graph_commands()
-        self.statusBar().showMessage(('Redo ' if redo else 'Undo ') + command.label
-                                    + (f' — {session.active_graph.name}' if command.graph_id else '')
-                                    + (f' — {notice}' if notice else ''))
+        self.publish_status(notice or '')
+        if (focus_owner is not None and isValid(root) and isValid(focus)
+                and self.ordinary_analysis.ownerToken == focus_owner
+                and self._outer_view == 'analysis' and root.isVisible()
+                and QGuiApplication.focusWindow() is root
+                and focus.isVisible() and focus.isEnabled()
+                and root.contentItem().isAncestorOf(focus)
+                and self.dat_canvas.allowed(self.dat_canvas.ownerToken)):
+            current_focus = root.activeFocusItem()
+            if current_focus is None or current_focus.isAncestorOf(focus):
+                focus.forceActiveFocus(Qt.ShortcutFocusReason)
         return True
 
     def _project_history_view(self, session, *, normalize_science=True, invalidate=True):
@@ -790,92 +856,49 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._sync_result_sheets(session.dataset_id)
 
     def _connect_control_feedback(self) -> None:
-        for _, name, _, _ in ANALYSIS_BINDINGS:
-            control = getattr(self, name)
-            if isinstance(control, QAbstractSpinBox):
-                control.setKeyboardTracking(False)
-            signal = (control.toggled if isinstance(control, (QCheckBox, QRadioButton))
-                      else control.currentTextChanged if isinstance(control, QComboBox)
-                      else control.valueChanged)
-            signal.connect(self._refresh_analysis_controls)
-        for control in (self.processing_mode_combo, self.processing_smooth_chk,
-                        self.processing_window_spin):
-            signal = (control.currentIndexChanged if isinstance(control, QComboBox)
-                      else control.toggled if isinstance(control, QCheckBox)
-                      else control.valueChanged)
-            signal.connect(self._refresh_processing_controls)
-        self.plot_gate_index_spin.setKeyboardTracking(False)
-        self.processing_window_spin.setKeyboardTracking(False)
-        for spin in (self.peak_smooth_win_spin, self.fit_smooth_win_spin, self.d2_sg_win_spin):
-            spin.setSingleStep(2)
+        self._update_fit_param_unit_labels()
+        self._refresh_axis_status()
+        self._refresh_fit_range_summary()
+        self._refresh_peak_delete_controls()
+        self._update_lasso_actions()
         self._refresh_analysis_controls()
         self._refresh_processing_controls()
 
     def _connect_dataset_control_projection(self) -> None:
-        controls = [getattr(self, name) for _, name, _, _ in ANALYSIS_BINDINGS]
-        controls.extend([self.processing_mode_combo, self.processing_smooth_chk,
-                         self.processing_window_spin, self.cmap_combo,
-                         self.signal_title_combo, self.signal_title_auto_chk,
-                         self.fix_annotations_chk, self.color_scale_combo,
-                         *self._annotation_edits.values(),
-                         *self._view_lock_controls.keys(), *self._view_lock_controls.values()])
-        for control in controls:
-            signal = (control.toggled if isinstance(control, (QCheckBox, QRadioButton))
-                      else control.currentTextChanged if isinstance(control, QComboBox)
-                      else control.textChanged if isinstance(control, QLineEdit)
-                      else control.valueChanged)
-            signal.connect(self._capture_dataset_controls)
-            if control in (*self._view_lock_controls.keys(),
-                           *self._view_lock_controls.values(), self.cmap_combo):
-                signal.connect(self._invalidate_plot_page)
-        self.analysis_text.textChanged.connect(self._capture_dataset_summary)
+        self.ordinary_analysis.draftChanged.connect(self._schedule_project_modified)
 
     def _capture_dataset_summary(self) -> None:
+        # Summary is written directly to the canonical scientific owner.
+        self.ordinary_analysis.refresh()
+
+    def _set_analysis_summary(self, text) -> None:
+        analysis_owner(self.workspace.active or self._unregistered_session).summary = str(text)
+        self.ordinary_analysis.refresh()
         if not self._restoring_dataset:
-            analysis_owner(self.workspace.active or self._unregistered_session).summary = self.analysis_text.toPlainText()
             self._schedule_project_modified()
 
+    def _analysis_controls(self):
+        return analysis_owner(self.workspace.active or self._unregistered_session).analysis_controls
+
+    def _analysis_status(self, **ui):
+        if hasattr(self, 'ordinary_analysis'):
+            self.ordinary_analysis.refresh(**ui)
+
     def _read_analysis_controls(self) -> AnalysisControls:
-        return AnalysisControls(**{field: getattr(getattr(self, name), getter)()
-                                   for field, name, getter, _ in ANALYSIS_BINDINGS})
+        return replace(analysis_owner(self.workspace.active or self._unregistered_session).analysis_controls)
 
     def _capture_dataset_controls(self, *_args, visual_only=False) -> None:
         if self._restoring_dataset:
             return
-        session = self.workspace.active or self._unregistered_session
-        if self._workbench_document() is not None:
-            # The workbench owns its scientific controls. Source format controls
-            # are read-only here and must not capture stale widget projections.
-            self._schedule_project_modified()
-            return
-        analysis = session.analysis_controls if visual_only else self._read_analysis_controls()
-        # Visible X bounds also define detection inputs. Visual capture must
-        # invalidate their jobs before replacing the previous bounds below.
-        if (analysis != session.analysis_controls or any(
-                session.view.bounds.get(name) != getattr(self, name + '_spin').value()
-                for name in ('xmin', 'xmax'))):
-            self._invalidate_analysis_jobs()
-        if not visual_only:
-            session.analysis_controls = analysis
-            pending = ProcessingState(
-                mode=str(self.processing_mode_combo.currentData() or 'original'),
-                smooth=self.processing_smooth_chk.isChecked(),
-                window_length=int(self.processing_window_spin.value()))
-            if pending != session.pending:
-                self._cancel_processing_job()
-            session.pending = pending
-        view = session.view
-        view.colormap = self._selected_colormap()
-        view.annotations = {**{name: edit.text() for name, edit in self._annotation_edits.items()},
-                            'signal_title': self.signal_title_combo.currentText()}
-        view.fix_annotations = self.fix_annotations_chk.isChecked()
-        view.signal_title_auto = self.signal_title_auto_chk.isChecked()
-        view.bounds = {name: getattr(self, f'{name}_spin').value()
-                       for name in ('xmin', 'xmax', 'ymin', 'ymax', 'vmin', 'vmax')}
-        view.locks = {name: getattr(self, f'{name}_lock').isChecked() for name in view.bounds}
+        self.dat_properties.syncFromOwner()
+        self.ordinary_analysis.refresh()
         self._schedule_project_modified()
 
     def capture_active_dataset(self, *, render: bool = True) -> DatasetSession | None:
+        if self._workbench_document() is not None:
+            self._workbench_finish_editors()
+        self.ordinary_analysis.finish_editor()
+        self.processing.finish_editor()
         self._finish_annotation_edit(render=render)
         self._capture_dataset_controls()
         self._finish_history_edit()
@@ -898,43 +921,39 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             raise ValueError('Wait for the current operation or cancel it before changing projects.')
 
     def _capture_project_workspace(self) -> Workspace:
+        shared_candidate = self.dat_properties.validate_editor()
+        gate_candidate = self.analysis_header.validate_editor()
+        ordinary_candidate = self.ordinary_analysis.validate_editor()
+        for page in self.graph_documents.cached_documents():
+            if isinstance(page, FormalPlotController):
+                page.formal.validate_editor()
+        self.plot_page.formal.validate_editor()
         if self._workbench_document() is not None:
             self._workbench_finish_editors()
-        # Interpret all scientific editors before formal projection can replace
-        # controls. Signals are blocked until every pending numeric value is read.
-        controls = [control for control in self.findChildren(QAbstractSpinBox)
-                    if control is not self.imported_dataset_rows_spin]
-        previous_values = {control: control.value() for control in controls}
-        for control in controls:
-            if not control.hasAcceptableInput():
-                raise ValueError('Correct the pending numeric editor before saving the project.')
-        with ExitStack() as stack:
-            for control in controls:
-                stack.enter_context(QSignalBlocker(control))
-                control.interpretText()
-        changed = {control: control.value() for control in controls
-                   if control.value() != previous_values[control]}
-        self._commit_plot_numeric_edits(changed)
-        if self.processing_window_spin in changed:
-            self._remember_fixed_processing()
-        self._finish_bound_plot_editor()
+        self.processing.commit_for_save()
+        self._finish_cached_formal_editors()
+        with self._edit_transaction('DAT numeric properties', RANGE_FIELDS + COLOR_FIELDS + ('view.norm', 'view.color_region_boundaries')):
+            for name in ('vmin', 'vmax'):
+                if name in shared_candidate['numbers']:
+                    self._dat_view().locks[name] = True
+                    self._dat_view().bounds[name] = shared_candidate['numbers'][name]
+            self.ordinary_analysis.commit_candidate(ordinary_candidate)
+            self.analysis_header.commit_candidate(gate_candidate)
+            self.dat_properties.commit_candidate(shared_candidate)
         for key in self.graph_documents.keys():
             if len(key) == 3 and key[0] == 'xy':
-                self.graph_documents.page_for(key).finish_editor()
+                self.graph_documents.document_for(key).finish_editor()
+            elif len(key) == 3 and key[0] == 'workbook':
+                self.graph_documents.document_for(key).finish_editor()
         self.capture_active_dataset(render=False)
         self.plot_page.cancel_interaction()
         self.workspace.graph_workspace = self._graph_workspace_snapshot()
         return self.workspace
 
-    def _update_project_title(self) -> None:
-        title = 'Spectra Analyzer (PySide6)'
-        if self._project_path is not None:
-            title += ' — ' + self._project_path.name
-        if self.isWindowModified():
-            title += ' *'
-        self.setWindowTitle(title)
-        self.setWindowFilePath(str(self._project_path or ''))
-        self.statusBar().setToolTip(str(self._project_path or ''))
+    def _update_project_title(self):
+        self.shellChanged.emit()
+        if self.root_window is not None:
+            self.root_window.setTitle(self.title)
 
     def _schedule_project_modified(self, *_args) -> None:
         if not self._restoring_dataset and not self._project_installing:
@@ -943,17 +962,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _connect_project_modified_editors(self) -> None:
         # Explicit durable controls; search, sidebar state and Rows are preferences.
-        self._project_numeric_editors = [getattr(self, name) for _, name, _, _ in ANALYSIS_BINDINGS
-                                         if isinstance(getattr(self, name), QAbstractSpinBox)]
-        self._project_numeric_editors.extend((self.processing_window_spin, self.plot_gate_spin,
-            self.plot_gate_index_spin, self.linthresh_spin, *self._view_lock_controls,
-            *self.region_boundary_spins))
-        self._project_numeric_editors.extend(self.workbench_controls.findChildren(QAbstractSpinBox))
-        for control in self._project_numeric_editors:
-            control.lineEdit().textChanged.connect(self._schedule_project_modified)
-            control.valueChanged.connect(self._schedule_project_modified)
-        for control in (self.fix_processing_chk, self.fix_regions_chk, self.fix_region_edges_chk):
-            control.toggled.connect(self._schedule_project_modified)
+        self.analysis_header.draftChanged.connect(self._schedule_project_modified)
+        self.analysis_workbench.draftChanged.connect(self._schedule_project_modified)
+        self.dat_properties.draftChanged.connect(self._schedule_project_modified)
 
     @staticmethod
     def _project_spin_has_draft(control) -> bool:
@@ -971,16 +982,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             view = session.view
             session.view = view
             session.analysis_controls = self._read_analysis_controls()
-            session.pending = ProcessingState(mode=str(self.processing_mode_combo.currentData() or 'original'),
-                smooth=self.processing_smooth_chk.isChecked(), window_length=int(self.processing_window_spin.value()))
-            session.summary = self.analysis_text.toPlainText()
-            view.colormap = self._selected_colormap()
-            view.annotations = {**{name: edit.text() for name, edit in self._annotation_edits.items()},
-                                'signal_title': self.signal_title_combo.currentText()}
-            view.fix_annotations = self.fix_annotations_chk.isChecked()
-            view.signal_title_auto = self.signal_title_auto_chk.isChecked()
-            view.bounds = {name: getattr(self, name + '_spin').value() for name in active.view.bounds}
-            view.locks = {name: getattr(self, name + '_lock').isChecked() for name in active.view.bounds}
+            session.summary = analysis_owner(active).summary
             if self._heat_ax is not None and self._heat_mesh is not None:
                 view.x_limits = tuple(map(float, self._heat_ax.get_xlim()))
                 view.y_limits = tuple(map(float, self._heat_ax.get_ylim()))
@@ -1014,15 +1016,19 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 dirty = (runtime_workspace_stamp(self._project_marker_workspace(), self._project_stamp_cache)
                          != self._project_saved_stamp)
                 if self.workspace.datasets:
-                    dirty |= any(self._project_spin_has_draft(control) for control in self._project_numeric_editors)
+                    dirty |= self.ordinary_analysis.has_project_drafts()
                     dirty |= self.plot_page.has_pending_project_edits()
-                dirty |= any(isinstance(page, XYPlotPage) and page.has_pending_project_edits()
-                             for page in self.graph_documents._pages.values())
+                    dirty |= self.processing.has_project_drafts()
+                    dirty |= self.dat_properties.has_project_drafts()
+                    dirty |= self.analysis_workbench.has_project_drafts()
+                    dirty |= self.analysis_header.has_project_drafts()
+                dirty |= any(isinstance(page, (XYPlotController, WorkbookController)) and page.has_pending_project_edits()
+                             for page in self.graph_documents.cached_documents())
             except (ValueError, TypeError, AttributeError, OverflowError):
                 # Invalid drafts are visible as unsaved; exact capture explains
                 # their validation error at Save/Open/New/Close.
                 dirty = True
-        self.setWindowModified(bool(dirty))
+        self.set_project_modified(bool(dirty))
         self._update_project_title()
 
     def _mark_project_saved(self) -> None:
@@ -1030,7 +1036,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._project_stamp_cache.clear()
         self._project_saved_stamp = runtime_workspace_stamp(self._project_marker_workspace(), self._project_stamp_cache)
         self._project_modified_timer.stop()
-        self.setWindowModified(False)
+        self.set_project_modified(False)
         self._update_project_title()
 
     def _remember_recent_project(self, path: Path) -> None:
@@ -1045,22 +1051,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._annotation_settings.remove('projects/recent')
         self._refresh_recent_projects()
 
-    def _refresh_recent_projects(self) -> None:
-        if not hasattr(self, '_recent_projects_menu'):
-            return
-        menu = self._recent_projects_menu
-        menu.clear()
-        for value in self._recent_project_paths:
-            path = Path(value)
-            action = menu.addAction(f'{path.name} — {path.parent}')
-            action.setData(value)
-            action.setToolTip(str(path))
-            action.triggered.connect(lambda checked=False, path=path: self._open_project_path(path))
-        if not self._recent_project_paths:
-            menu.addAction('No recent projects').setEnabled(False)
-        menu.addSeparator()
-        clear = menu.addAction('Clear Recent Projects', self._clear_recent_projects)
-        clear.setEnabled(bool(self._recent_project_paths))
+    def _refresh_recent_projects(self):
+        self.shellChanged.emit()
 
     def _open_project_path(self, path: str | Path) -> bool:
         """All user entry routes share project validation, guard and reporting."""
@@ -1077,8 +1069,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if path is None:
             path = self._project_path
         if path is None:
-            chosen, _ = QFileDialog.getSaveFileName(
-                self, 'Save Spectra project', str(self._output_folder() / 'Untitled.spectra'),
+            chosen, _ = FilePicker.getSaveFileName(self.root_window, 'Save Spectra project', str(self._output_folder() / 'Untitled.spectra'),
                 'Spectra projects (*.spectra)')
             if not chosen:
                 return None
@@ -1096,7 +1087,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._refresh_source_axis_control()
         self._mark_project_saved()
         self._remember_recent_project(path)
-        self.statusBar().showMessage(f'Saved project: {path}')
+        self.publish_status('')
         return path
 
     def _validate_project_colors(self, workspace):
@@ -1106,7 +1097,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         for session in workspace.datasets.values():
             for graph in session.graphs.values():
                 target = detached_graph_session(session)
-                target.active_graph_id = graph.graph_id
+                target.activate_graph(graph.graph_id)
                 view = target.view
                 try:
                     limits = ([region.color_limits for region in snapshot_dataset(target).regions]
@@ -1156,17 +1147,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return work(JobContext(cancelled, context.report))
 
         self._project_io_jobs.start(run, result, on_error=failed)
-        self._job_cancel_button.show()
+        self.set_cancel_visible(True)
         self._refresh_graph_commands()
 
     def _on_project_io_idle(self):
         self._project_io_finalizing = False
         completion, self._project_io_completion = self._project_io_completion, None
-        self._job_cancel_button.hide()
+        self.set_cancel_visible(False)
         self._refresh_graph_commands()
         if self._project_io_cancelled and not self._project_io_committed:
             self._project_io_cancelled = False
-            self.statusBar().showMessage('Project operation cancelled. Current workspace retained.')
+            self.publish_status('Project operation cancelled. Current workspace retained.')
             self._schedule_plot_page_render()
             if self._project_io_close_pending:
                 self._project_io_close_pending = False
@@ -1186,7 +1177,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._require_project_idle()
         path = path or self._project_path
         if path is None:
-            chosen, _ = QFileDialog.getSaveFileName(self, 'Save Spectra project',
+            chosen, _ = FilePicker.getSaveFileName(self.root_window, 'Save Spectra project',
                 str(self._output_folder() / 'Untitled.spectra'), 'Spectra projects (*.spectra)')
             if not chosen:
                 return False
@@ -1216,12 +1207,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 session.sidecar_writes_enabled = False
             self._refresh_source_axis_control()
             self._project_modified_timer.stop()
-            self.setWindowModified(self._project_revision != revision)
+            self.set_project_modified(self._project_revision != revision)
             self._update_project_title()
             self._remember_recent_project(path)
             cancelled = self._project_io_cancel_event.is_set()
-            self.statusBar().showMessage(f'Saved project: {path}' +
-                (' — cancellation arrived after the file was saved.' if cancelled else ''))
+            self.publish_status(
+                f'Saved project: {path} — cancellation arrived after the file was saved.' if cancelled else '')
             if on_saved is not None and not cancelled:
                 # An edit made while compression ran belongs to the live
                 # workspace, not the successfully written older snapshot.
@@ -1267,11 +1258,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         message = 'Save changes to the current project before continuing?'
         if capture_error:
             message += '\n\nThe current edits cannot be saved yet: ' + capture_error
-        choice = QMessageBox.warning(self, 'Unsaved project changes', message,
-            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
-        if choice == QMessageBox.Discard:
+        choice = prompt_message(self.root_window, 'Unsaved project changes', message,
+            (PromptAction.SAVE, PromptAction.DISCARD, PromptAction.CANCEL), PromptAction.CANCEL, kind='warning')
+        if choice == PromptAction.DISCARD:
             continuation()
-        elif choice == QMessageBox.Save:
+        elif choice == PromptAction.SAVE:
             try:
                 if not self._save_project_async(on_saved=continuation):
                     self._schedule_plot_page_render()
@@ -1315,11 +1306,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         message = 'Save changes to the current project before continuing?'
         if capture_error:
             message += '\n\nThe current edits cannot be saved yet: ' + capture_error
-        choice = QMessageBox.warning(self, 'Unsaved project changes', message,
-            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
-        if choice == QMessageBox.Discard:
+        choice = prompt_message(self.root_window, 'Unsaved project changes', message,
+            (PromptAction.SAVE, PromptAction.DISCARD, PromptAction.CANCEL), PromptAction.CANCEL, kind='warning')
+        if choice == PromptAction.DISCARD:
             return True
-        if choice != QMessageBox.Save:
+        if choice != PromptAction.SAVE:
             return False
         try:
             return self.save_project() is not None
@@ -1328,12 +1319,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return False
 
     def _reset_project_runtime(self) -> None:
+        self.dat_properties.retire_owner()
+        self.analysis_header.retire_owner()
+        self.ordinary_analysis.retire_owner()
+        self.processing.reset()
         self._dat_analysis_graph_results.clear()
         self._analysis_return_key = None
         self._last_comparison_id = None
         self._comparison_target_pinned = False
-        with QSignalBlocker(self.workbook_commands.pin_action):
-            self.workbook_commands.pin_action.setChecked(False)
+        self.workbook_commands.set_target_pinned(False)
         self._plot_lifetime += 1
         self._bind_plot_page(self._fallback_plot_page)
         for key in self.graph_documents.keys():
@@ -1349,6 +1343,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._annotation_edit_timer.stop()
         self._project_modified_timer.stop()
         self._annotation_edit_pending = False
+        self._annotation_edit_requires_layout = False
         for name in ('_plot_render_timer', '_plot_batch_timer', '_view_layout_timer', '_tick_contrast_timer'):
             timer = getattr(self, name, None)
             if timer is not None:
@@ -1369,16 +1364,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._plot_batch_basenames = ()
         self.plot_batch_summary = BatchSummary(0, ())
         self.plot_batch_report = ''
-        self.plot_page.batch_progress.setVisible(False)
-        self.plot_page.batch_cancel_btn.setVisible(False)
-        self.plot_page.batch_results_btn.setEnabled(False)
-        self.plot_page.batch_status.clear()
-        self.plot_page.batch_export_btn.setEnabled(True)
+        self.plot_page.set_batch_state(visible=False, cancel_visible=False,
+                                       results_enabled=False, status='', export_enabled=True)
         self.plot_page.preview.cancel_interaction()
         self.plot_page.preview.selected_id = None
         self.plot_page.preview._title_selected = False
-        self.plot_page.preview.snapshot = None
-        self._job_cancel_button.hide()
+        self.plot_page.preview.set_geometry(None, self.plot_page.presentation)
+        self.set_cancel_visible(False)
 
     def _project_installed_workspace(self) -> None:
         self._refresh_imported_datasets()
@@ -1396,7 +1388,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _restore_graph_workspace(self, metadata):
         if metadata is None:
-            self.graph_documents.free_view()
+            self.graph_documents.setMode('free')
             return
         # Cache open pages without activating their datasets or changing each
         # dataset's selected graph. The Analysis owner and last MDI owner can
@@ -1405,26 +1397,26 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if not record['open']:
                 continue
             key = document_record_key(record)
-            if self.graph_documents.page_for(key) is None:
+            if self.graph_documents.document_for(key) is None:
                 if len(key) == 3:
                     page = self._create_auxiliary_page(key)
                 else:
                     page = self._create_plot_page(key)
                     page.set_presentation(self.workspace.datasets[key[0]].graphs[key[1]].presentation)
                     page.invalidate(self._plot_owner_token(key))
-                self.graph_documents.cache_page(key, page)
+                self.graph_documents.cache_document(key, page)
         self.graph_documents.restore_workspace(metadata, self._document_title)
         active = tuple(metadata['active']) if metadata['active'] else None
         if active is not None and len(active) == 3:
             self._last_comparison_id = active[1] if active[0] == 'xy' else None
-            self.plot_tabs.setCurrentWidget(self.graph_documents)
-            self._on_plot_tab_changed(self.plot_tabs.currentIndex())
+            self.request_outer_view('workspace')
+            self._outer_view_changed()
         elif (metadata['stacking'] and metadata['active'] != list(self._document_key())
-                and self.plot_tabs.currentWidget() is self.graph_documents):
+                and self._outer_view == 'workspace'):
             # An Analysis selection can differ from the last active graph.
             # Preserve both saved owners, showing the scientific selection in
             # Analysis until the user explicitly selects a graph again.
-            self.plot_tabs.setCurrentIndex(0)
+            self.request_outer_view('analysis')
         if self._workbench_document() is not None:
             self._workbench_enter(self.workspace.active)
         self._refresh_graph_commands()
@@ -1444,8 +1436,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         previous = (self.workspace, self._unregistered_session, self._project_path,
                     self._project_saved_digest, self.current_folder, self.current_root)
         previous_histories = dict(self._edit_histories)
+        previous_processing_drafts = self.processing.snapshot_editor_drafts()
+        previous_dat_editors = self.dat_properties.snapshot_editor_state()
+        previous_header_editors = self.analysis_header.snapshot_editor_state()
+        previous_analysis_editors = self.ordinary_analysis.snapshot_editor_state()
         previous_target = (self._last_comparison_id, self._comparison_target_pinned)
-        previous_plot_tab = self.plot_tabs.currentIndex()
+        previous_outer_view = self._outer_view
+        previous_tasks = (self._task_index, self._analysis_task_index, self._heatmap_task_index)
         self._bind_plot_page(self._fallback_plot_page)
         previous_documents = self.graph_documents.park()
         previous_render_state = (deepcopy(self._plot_revisions), deepcopy(self._graph_revisions),
@@ -1465,11 +1462,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             (self.workspace, self._unregistered_session, self._project_path,
              self._project_saved_digest, self.current_folder, self.current_root) = previous
             self._reset_project_runtime()
+            self.processing.restore_editor_drafts(previous_processing_drafts)
             self._edit_histories.update(previous_histories)
             (self._plot_revisions, self._graph_revisions, self._plot_cube_owners,
              self._formal_peak_label_signatures) = previous_render_state
             self.graph_documents.restore(previous_documents)
-            for key, page in previous_documents[0].items():
+            for key, page in previous_documents.registry.cached_items():
                 if len(key) == 3:
                     continue
                 owner = self._plot_owner_token(key)
@@ -1485,23 +1483,23 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             # Use the shared projection directly so an injected/failed
             # activation hook cannot prevent rollback of the prior owner.
             if self.workspace.active_dataset_id is not None:
-                MainWindow.activate_dataset(self, self.workspace.active_dataset_id, capture_outgoing=False)
+                ApplicationController.activate_dataset(self, self.workspace.active_dataset_id, capture_outgoing=False)
             else:
                 self._clear_empty_project_view()
             # Projection can reopen a selected-but-closed page. Restore the
             # exact visible set after its editor has been rebound.
-            open_keys = {record[0] for record in previous_documents[1]}
-            for key in self.graph_documents.keys():
-                if key not in open_keys:
-                    self.graph_documents._detach_window(key)
-            self.plot_tabs.setCurrentIndex(previous_plot_tab)
+            self._outer_view = previous_outer_view
+            self._task_index, self._analysis_task_index, self._heatmap_task_index = previous_tasks
+            self.dat_properties.restore_editor_state(previous_dat_editors)
+            self.analysis_header.restore_editor_state(previous_header_editors)
+            self.ordinary_analysis.restore_editor_state(previous_analysis_editors)
             # Reapply normal rectangles/stacking after selected-owner
             # projection, which may have briefly opened a closed graph.
             self.graph_documents.restore(previous_documents)
             self._last_comparison_id, self._comparison_target_pinned = previous_target
             self._refresh_comparison_targets()
             self._refresh_data_navigator()
-            self._on_plot_tab_changed(self.plot_tabs.currentIndex())
+            self._outer_view_changed()
             self._refresh_graph_commands()
             self._refresh_source_axis_control()
             self._update_project_title()
@@ -1511,10 +1509,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self.graph_documents.discard_parked(previous_documents)
         self._project_path, self._project_saved_digest = path, baseline
         self.current_root, self.current_folder = '', str(path.parent)
-        with QSignalBlocker(self.folder_combo), QSignalBlocker(self.imported_dataset_search):
-            self.folder_combo.clear()
-            self.imported_dataset_search.clear()
-        self.file_list.clear()
+        self.source_navigation.reset_inventory()
         self._refresh_imported_datasets()
         self._refresh_data_navigator()
         if async_baseline:
@@ -1533,23 +1528,24 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 if self.workspace is workspace:
                     self._project_saved_digest, self._project_saved_stamp = result
                     self._project_modified_timer.stop()
-                    self.setWindowModified(self._project_revision != revision)
+                    self.set_project_modified(self._project_revision != revision)
                     self._update_project_title()
                     self._remember_recent_project(path)
-                    self.statusBar().showMessage(f'Opened project: {path}')
+                    self.publish_status('')
 
             self._start_project_io(work, finish, error_prefix='Cannot finalize opened project', commits=True)
             # Installation has committed successfully. Complete its saved
             # baseline before accepting another project transition.
             self._project_io_finalizing = True
-            self._job_cancel_button.hide()
+            self.set_cancel_visible(False)
         else:
             self._mark_project_saved()
             self._remember_recent_project(path)
-            self.statusBar().showMessage(f'Opened project: {path}')
+            self.publish_status('')
         return True
 
     def _clear_empty_project_view(self) -> None:
+        self.dat_canvas.retire_interaction()
         self._refresh_graph_selector()
         # _plot_cube returns early for None and leaves the old image visible.
         for name in ('_canvas_click_cid', '_canvas_release_cid', '_canvas_hover_cid', '_motion_cid'):
@@ -1567,50 +1563,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self.canvas.draw_idle()
         self._restoring_dataset = True
         try:
-            self.analysis_text.clear()
+            self._set_analysis_summary('')
             self.plot_page.set_presentation(self._unregistered_session.presentation)
-            with ExitStack() as stack:
-                widgets = [getattr(self, name) for _, name, _, _ in ANALYSIS_BINDINGS]
-                widgets += [self._orig_radio, self._seeds_from_find_peak_radio,
-                            self.processing_mode_combo, self.processing_smooth_chk,
-                            self.processing_window_spin, self.plot_gate_spin,
-                            self.fix_processing_chk, self.fix_regions_chk, self.fix_region_edges_chk,
-                            self.cmap_combo,
-                            self.mapping_combo, self.linthresh_spin, self.color_scale_combo,
-                            self.signal_title_auto_chk, self.fix_annotations_chk,
-                            *self._annotation_edits.values(), self.signal_title_combo,
-                            *self._view_lock_controls.keys(), *self._view_lock_controls.values()]
-                for widget in widgets:
-                    stack.enter_context(QSignalBlocker(widget))
-                for field, name, _, setter in ANALYSIS_BINDINGS:
-                    getattr(getattr(self, name), setter)(getattr(self._unregistered_session.analysis_controls, field))
-                self._orig_radio.setChecked(True)
-                self._seeds_from_find_peak_radio.setChecked(True)
-                self.processing_mode_combo.setCurrentIndex(self.processing_mode_combo.findData('original'))
-                self.processing_smooth_chk.setChecked(True)
-                self.processing_window_spin.setValue(21)
-                for name, checkbox in (('processing', self.fix_processing_chk), ('regions', self.fix_regions_chk),
-                                       ('region_edges', self.fix_region_edges_chk)):
-                    checkbox.setChecked(self._unregistered_session.fixed_recipes[name].enabled)
-                self.cmap_combo.setCurrentIndex(self.cmap_combo.findData(self._unregistered_session.view.colormap))
-                self.mapping_combo.setCurrentIndex(self.mapping_combo.findData('linear'))
-                self.linthresh_spin.setValue(self._unregistered_session.view.norm.linthresh)
-                self.color_scale_combo.setCurrentIndex(self.color_scale_combo.findData('global'))
-                self.signal_title_auto_chk.setChecked(True)
-                self.fix_annotations_chk.setChecked(True)
-                for name, edit in self._annotation_edits.items():
-                    edit.setText(self._unregistered_session.view.annotations[name])
-                self.signal_title_combo.setCurrentText(RAW_LABEL)
-                for name in self._unregistered_session.view.bounds:
-                    getattr(self, name + '_spin').setValue(0)
-                    getattr(self, name + '_lock').setChecked(False)
-                self.plot_gate_spin.setRange(-1e12, 1e12)
-                self.plot_gate_spin.setValue(0)
-            self._csv_path_label.setText('(none loaded)')
-            self._csv_seeds_row.setVisible(False)
+            self.dat_properties.retire_owner()
+            self.analysis_header.retire_owner()
+            self.ordinary_analysis.retire_owner()
             self._sync_gate_controls()
-            self.plot_prev_gate_btn.setEnabled(False)
-            self.plot_next_gate_btn.setEnabled(False)
             self._show_title_settings()
             self._sync_region_controls()
         finally:
@@ -1641,15 +1599,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._project_path = self._project_saved_digest = None
         self._project_saved_stamp = None
         self._project_stamp_cache.clear()
-        self.setWindowModified(False)
+        self.set_project_modified(False)
         self.current_root = self.current_folder = ''
-        with QSignalBlocker(self.folder_combo), QSignalBlocker(self.imported_dataset_search):
-            self.folder_combo.clear()
-            self.imported_dataset_search.clear()
-        self.file_list.clear()
+        self.source_navigation.reset_inventory()
         self._project_installed_workspace()
         self._update_project_title()
-        self.statusBar().showMessage('New project. Import data files to begin.')
+        self.publish_status('')
         return True
 
     def _on_new_project(self) -> None:
@@ -1661,7 +1616,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _on_open_project(self) -> None:
         try:
             self._require_project_idle()
-            chosen, _ = QFileDialog.getOpenFileName(self, 'Open Spectra project',
+            chosen, _ = FilePicker.getOpenFileName(self.root_window, 'Open Spectra project',
                 str(self._output_folder()), 'Spectra projects (*.spectra *.spextra)')
             if chosen:
                 self._open_project_path(chosen)
@@ -1674,7 +1629,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if save_as:
                 default = (self._project_path.with_suffix('.spectra') if self._project_path else
                            self._output_folder() / 'Untitled.spectra')
-                chosen, _ = QFileDialog.getSaveFileName(self, 'Save Spectra project as',
+                chosen, _ = FilePicker.getSaveFileName(self.root_window, 'Save Spectra project as',
                     str(default), 'Spectra projects (*.spectra)')
                 if not chosen:
                     return
@@ -1691,30 +1646,28 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return session.source_path.parent if session.source_path else Path(self.current_folder or '.')
 
     def _refresh_source_axis_control(self) -> None:
-        if not hasattr(self, 'x_axis_override_combo'):
-            return
-        session = self.workspace.active or self._unregistered_session
-        source_owned = session.sidecar_writes_enabled
-        self.x_axis_override_combo.setEnabled(source_owned and not self._dat_import_pending
-                                             and not self._background_jobs.busy)
-        self.x_axis_override_combo.setToolTip(
-            "Override the auto-detected x-axis type. Use 'Auto Detect' unless the detection is wrong."
-            if source_owned else 'This project uses its saved axis interpretation. Import the original DAT into a new project to change its axis interpretation.')
+        if hasattr(self, 'dat_properties'):
+            self.dat_properties.syncFromOwner()
 
     def _source_axis_override_allowed(self) -> bool:
         session = self.workspace.active or self._unregistered_session
-        if session.sidecar_writes_enabled:
+        if session.sidecar_writes_enabled and not session.processing_results:
             return True
         if session.current_cube is not None:
-            with QSignalBlocker(self.x_axis_override_combo):
-                self.x_axis_override_combo.setCurrentIndex(
-                    self.x_axis_override_combo.findData(session.current_cube.x_override))
+            self.dat_properties._axis_override = session.current_cube.x_override
+            self.dat_properties.syncFromOwner()
         self._refresh_source_axis_control()
-        self.statusBar().showMessage('Import the original DAT into a new project to change its axis interpretation.')
+        self.publish_status('Import the original DAT into a new project to change its axis interpretation.')
         return False
 
     def snapshot_dataset_defaults(self) -> DatasetDefaults:
         """Capture global new-file preferences once, before asynchronous import."""
+        ordinary = self.ordinary_analysis.validate_editor()
+        shared = self.dat_properties.validate_editor()
+        gate = self.analysis_header.validate_editor()
+        self.ordinary_analysis.commit_candidate(ordinary)
+        self.analysis_header.commit_candidate(gate)
+        self.dat_properties.commit_candidate(shared)
         self._capture_dataset_controls()
         view = deepcopy((self.workspace.active or self._unregistered_session).view)
         settings = self._annotation_settings
@@ -1760,11 +1713,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         """Confirm and remove one project dataset, without touching its source files."""
         self._require_project_idle()
         session = self.workspace.datasets[dataset_id]
-        choice = QMessageBox.warning(self, 'Remove dataset from project',
+        choice = prompt_message(self.root_window, 'Remove dataset from project',
             f'Remove this dataset and its stored analysis from the project?\n\n{session.source_path}\n\n'
             'Its Sheet and dependent comparison curves will also be removed. The original DAT file will remain unchanged.',
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
-        if choice != QMessageBox.Yes:
+            (PromptAction.YES, PromptAction.CANCEL), PromptAction.CANCEL, kind='warning')
+        if choice != PromptAction.YES:
             return False
         # The modal dialog runs an event loop: a newly started job must still
         # protect its owner at the actual mutation boundary.
@@ -1777,6 +1730,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if self._pending_history_edit and self._pending_history_edit[0] is session:
             self._pending_history_edit = None
         self.workspace.remove(dataset_id)
+        self.dat_properties.retire_owner(dataset_id)
+        self.analysis_header.retire_owner(dataset_id)
+        self.ordinary_analysis.retire_owner(dataset_id)
         self._discard_dataset_documents(dataset_id)
         preview = self.plot_page.preview
         if preview.snapshot is not None and preview.snapshot.owner_token[0] == dataset_id:
@@ -1800,7 +1756,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._refresh_data_navigator()
         self._refresh_graph_commands()
         self._refresh_project_modified()
-        self.statusBar().showMessage(f'Removed from project: {session.source_path.name}')
+        self.publish_status('')
         return True
 
     def _on_remove_dataset(self, dataset_id: str) -> None:
@@ -1818,30 +1774,35 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return session
 
     def _finish_graph_editors(self, *, capture_science=True):
+        gate_candidate = self.analysis_header.validate_editor()
+        ordinary_candidate = self.ordinary_analysis.validate_editor() if capture_science else None
         if self._workbench_document() is not None:
+            self.analysis_workbench.validate_editor()
+            self.plot_page.formal.validate_editor()
+            if capture_science:
+                self.processing.finish_editor()
             self._workbench_finish_editors()
+            self._finish_bound_plot_editor()
+            if ordinary_candidate is not None:
+                self.ordinary_analysis.commit_candidate(ordinary_candidate)
+            self.analysis_header.commit_candidate(gate_candidate)
             return
-        if self.plot_page.presentation_error is not None:
-            raise ValueError('Correct the current plot editor before changing graphs.')
-        spins = tuple(spin for spin in (*self._view_lock_controls, *self.region_boundary_spins,
-                      self.plot_gate_spin, self.plot_gate_index_spin, self.linthresh_spin)
-                      if spin.isEnabled())
-        previous_values = {spin: spin.value() for spin in spins}
-        for spin in spins:
-            if not spin.hasAcceptableInput():
-                raise ValueError('Correct the current range editor before changing graphs.')
-        if any(not spin.hasAcceptableInput() for spin in
-               self.plot_page.control_scroll.findChildren(QAbstractSpinBox)):
-            raise ValueError('Correct the current page editor first: invalid numeric value.')
-        # Read every draft before a value-change handler projects automatic
-        # bounds or redraws the formal page over the other pending editors.
-        with ExitStack() as stack:
-            for spin in spins:
-                stack.enter_context(QSignalBlocker(spin))
-                spin.interpretText()
+        # Collect all candidates before any handler can replace a sibling draft.
+        candidate = self.dat_properties.validate_editor()
+        self.plot_page.formal.validate_editor()
+        if capture_science:
+            self.processing.finish_editor()
         self._finish_bound_plot_editor()
-        self._commit_plot_numeric_edits({spin: spin.value() for spin in spins
-                                        if spin.value() != previous_values[spin]})
+        with self._edit_transaction('DAT numeric properties', RANGE_FIELDS + COLOR_FIELDS + ('view.norm', 'view.color_region_boundaries')):
+            # Color drafts must be fixed before Gate changes can autoscale.
+            for name in ('vmin', 'vmax'):
+                if name in candidate['numbers']:
+                    self._dat_view().locks[name] = True
+                    self._dat_view().bounds[name] = candidate['numbers'][name]
+            if ordinary_candidate is not None:
+                self.ordinary_analysis.commit_candidate(ordinary_candidate)
+            self.analysis_header.commit_candidate(gate_candidate)
+            self.dat_properties.commit_candidate(candidate)
         if capture_science:
             self.capture_active_dataset(render=False)
         else:
@@ -1860,29 +1821,27 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         finally:
             self._binding_graph_document = previous
 
-    def _commit_plot_numeric_edits(self, changed):
-        if self.current_cube is None:
-            return
-        # Lock explicit color drafts before range/gate changes can autoscale.
-        for control in (self.vmin_spin, self.vmax_spin):
-            if control in changed:
-                self._lock_user_color_bound(control)
-        if self.plot_gate_index_spin in changed:
-            self._on_plot_gate_index_changed(changed[self.plot_gate_index_spin])
-        elif self.plot_gate_spin in changed:
-            self._on_plot_gate_spin_changed(changed[self.plot_gate_spin])
-        if self.linthresh_spin in changed:
-            self._on_color_mapping_changed()
-        for index, control in enumerate(self.region_boundary_spins):
-            if control in changed:
-                self._on_color_region_boundary_changed(index, changed[control])
-        xy_changed = next((control for control in (
-            self.xmin_spin, self.xmax_spin, self.ymin_spin, self.ymax_spin) if control in changed), None)
-        if xy_changed is not None:
-            self._on_view_limit_changed(xy_changed)
-        for control in (self.vmin_spin, self.vmax_spin):
-            if control in changed:
-                self._on_view_limit_changed(control)
+    def _finish_cached_formal_editors(self):
+        # Validate hidden pages too, without changing the current document or
+        # applying a cached graph's settings through an ambient session alias.
+        pages = [(key, self.graph_documents.document_for(key)) for key in self.graph_documents.keys()]
+        seen = set()
+        for _key, page in pages:
+            if isinstance(page, FormalPlotController) and page.has_pending_project_edits():
+                page.formal.validate_editor()
+        for key, page in pages:
+            if not isinstance(page, FormalPlotController) or id(page) in seen:
+                continue
+            seen.add(id(page))
+            if page.has_pending_project_edits():
+                previous = self._binding_graph_document
+                self._binding_graph_document = True
+                try:
+                    page.finish_editor()
+                finally:
+                    self._binding_graph_document = previous
+        if id(self.plot_page) not in seen:
+            self._finish_bound_plot_editor()
 
     def _project_selected_graph(self, session):
         if session.active_graph.analysis is not None:
@@ -1897,8 +1856,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._refresh_graph_commands()
         notice = self._save_current_plot_state()
         self._refresh_project_modified()
-        self.statusBar().showMessage(f'Active: {session.source_path.name} — {session.active_graph.name}'
-                                    + (f' — {notice}' if notice else ''))
+        self.publish_status(notice or '')
 
     def create_graph(self, name):
         session = self._graph_owner()
@@ -1910,15 +1868,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def activate_graph(self, graph_id):
         session = self._graph_owner()
         if graph_id == session.active_graph_id:
-            if self.plot_tabs.currentWidget() is self.graph_documents:
+            if self._outer_view == 'workspace':
                 self._select_graph_page(session)
             return
         if graph_id not in session.graphs:
             raise ValueError('The graph no longer exists.')
-        outgoing_analysis = session.active_graph.analysis is not None
         self._finish_graph_editors()
+        previous_cube = session.current_cube
         session.activate_graph(graph_id)
-        if outgoing_analysis and session.active_graph.analysis is None:
+        if session.current_cube is not previous_cube:
+            self._clear_processing_analysis_state()
+        if session.active_graph.analysis is None:
             self._restoring_dataset = True
             try:
                 self.restore_dataset_controls(session)
@@ -1940,47 +1900,48 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         session = self._graph_owner()
         self._finish_graph_editors()
         session.remove_graph(graph_id)
+        self.dat_properties.retire_owner(session.dataset_id, graph_id)
+        self.analysis_header.retire_owner(session.dataset_id, graph_id)
+        self.ordinary_analysis.retire_owner(session.dataset_id, graph_id)
         key = (session.dataset_id, graph_id)
-        if self.plot_page is self.graph_documents.page_for(key):
+        if self.plot_page is self.graph_documents.document_for(key):
             self._bind_plot_page(self._fallback_plot_page)
         self.graph_documents.discard(key)
         self._graph_revisions.pop(key, None)
         self._history_for(session).remove_graph(graph_id)
+        if session.active_graph.analysis is None:
+            self._restoring_dataset = True
+            try:
+                self.restore_dataset_controls(session)
+            finally:
+                self._restoring_dataset = False
         self._project_selected_graph(session)
 
     def _refresh_graph_selector(self):
-        if not hasattr(self, 'graph_combo'):
-            return
-        session = self.workspace.active
-        with QSignalBlocker(self.graph_combo):
-            self.graph_combo.clear()
-            if session is not None:
-                for graph in session.graphs.values():
-                    if graph.published:
-                        self.graph_combo.addItem(graph.name, graph.graph_id)
-                self.graph_combo.setCurrentIndex(self.graph_combo.findData(session.active_graph_id))
-        self._refresh_graph_lifecycle_controls()
+        if hasattr(self, 'source_navigation'):
+            self.source_navigation.sync()
 
     def _refresh_graph_lifecycle_controls(self):
-        if not hasattr(self, 'graph_combo'):
-            return
-        session = self.workspace.active
-        available = bool(session and session.current_cube is not None and not self._project_busy())
-        published = available and session.active_graph.published
-        self.graph_combo.setEnabled(available and self.graph_combo.count() > 0)
-        self.graph_actions_btn.setEnabled(available)
-        self.new_graph_action.setEnabled(available)
-        self.rename_graph_action.setEnabled(published)
-        self.remove_graph_action.setEnabled(published and len(session.graphs) > 1 if session else False)
+        if hasattr(self, 'source_navigation'):
+            self.source_navigation.sync()
 
-    def _on_graph_selected(self, _index):
-        graph_id = self.graph_combo.currentData()
-        if graph_id is not None:
-            try:
-                self.activate_graph(graph_id)
-            except ValueError as exc:
-                self._refresh_graph_selector()
-                self._show_error(str(exc))
+    def _source_dataset_action(self, action, dataset_id):
+        if action == 'copy':
+            self._copy_dataset_source_path(dataset_id)
+        elif action == 'source':
+            self._open_dataset_folder(dataset_id)
+        elif action == 'export':
+            self._open_dataset_folder(dataset_id, export=True)
+        elif action == 'remove':
+            self._on_remove_dataset(dataset_id)
+
+    def _source_graph_action(self, action, dataset_id, graph_id):
+        session = self.workspace.active
+        if (session is None or session.dataset_id != dataset_id
+                or session.active_graph_id != graph_id or self._project_busy()):
+            return
+        {'new': self._on_new_graph, 'rename': self._on_rename_graph,
+         'remove': self._on_remove_graph}[action]()
 
     def _on_new_graph(self):
         try:
@@ -1990,7 +1951,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             names = {graph.name for graph in session.graphs.values()}
             while f'Graph {index}' in names:
                 index += 1
-            name, accepted = QInputDialog.getText(self, 'New Graph',
+            name, accepted = prompt_text(self.root_window, 'New Graph',
                 'Graph name (starts from the current graph settings):', text=f'Graph {index}')
             if accepted and self.workspace.active is session and session.active_graph_id == graph_id:
                 self.create_graph(name)
@@ -2001,7 +1962,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         try:
             session = self._graph_owner()
             graph = session.active_graph
-            name, accepted = QInputDialog.getText(self, 'Rename Graph', 'Graph name:', text=graph.name)
+            name, accepted = prompt_text(self.root_window, 'Rename Graph', 'Graph name:', text=graph.name)
             if (accepted and self.workspace.active is session and session.active_graph is graph):
                 self.rename_graph(graph.graph_id, name)
         except ValueError as exc:
@@ -2011,10 +1972,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         try:
             session = self._graph_owner()
             graph = session.active_graph
-            choice = QMessageBox.warning(self, 'Remove Graph',
+            choice = prompt_message(self.root_window, 'Remove Graph',
                 f'Remove graph “{graph.name}”?\n\nThe DAT data and analysis remain available in the other graphs.',
-                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
-            if choice == QMessageBox.Yes and self.workspace.active is session and session.active_graph is graph:
+                (PromptAction.YES, PromptAction.CANCEL), PromptAction.CANCEL, kind='warning')
+            if choice == PromptAction.YES and self.workspace.active is session and session.active_graph is graph:
                 self.remove_graph(graph.graph_id)
         except ValueError as exc:
             self._show_error(str(exc))
@@ -2030,9 +1991,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._drag_peak_arr_idx = self._drag_current_x = None
         self._drag_scatter = None
         self._cached_d2 = None
-        for button in (self.lasso_mode_btn, self.circle_delete_btn):
-            with QSignalBlocker(button):
-                button.setChecked(False)
+        self._circle_delete_mode = False
+        self._analysis_status()
+        self.toolbar.cancel_interaction()
         self.toolbar._nav_stack.clear()
         self.toolbar.set_history_buttons()
         if self.toolbar.mode == 'pan/zoom':
@@ -2047,30 +2008,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._restore_plot_controls(plot)
         if self.plot_page.presentation != session.presentation:
             self.plot_page.set_presentation(session.presentation)
-        widgets = [getattr(self, name) for _, name, _, _ in ANALYSIS_BINDINGS]
-        widgets += [self._orig_radio, self._seeds_from_find_peak_radio,
-                    self.processing_mode_combo, self.processing_smooth_chk, self.processing_window_spin,
-                    self.fix_processing_chk, self.fix_regions_chk, self.fix_region_edges_chk]
-        with ExitStack() as stack:
-            for widget in widgets:
-                stack.enter_context(QSignalBlocker(widget))
-            for field, name, _, setter in ANALYSIS_BINDINGS:
-                getattr(getattr(self, name), setter)(getattr(science.analysis_controls, field))
-            self._orig_radio.setChecked(not science.analysis_controls.derivative_detection)
-            self._seeds_from_find_peak_radio.setChecked(not science.analysis_controls.csv_source)
-            self.processing_mode_combo.setCurrentIndex(
-                self.processing_mode_combo.findData(science.pending.mode))
-            self.processing_smooth_chk.setChecked(science.pending.smooth)
-            self.processing_window_spin.setValue(science.pending.window_length)
-            for name, checkbox in (('processing', self.fix_processing_chk), ('regions', self.fix_regions_chk),
-                                   ('region_edges', self.fix_region_edges_chk)):
-                checkbox.setChecked(session.fixed_recipes[name].enabled)
-        self._csv_path_label.setText(Path(science.csv_seeds_path).name if science.csv_seeds_path else '(none loaded)')
-        self._csv_seeds_row.setVisible(science.analysis_controls.csv_source)
-        self._on_detect_mode_changed(not science.analysis_controls.derivative_detection)
-        self._on_orig_type_changed(science.analysis_controls.peak_mode)
-        self._on_d2_type_changed(science.analysis_controls.d2_mode)
-        self.analysis_text.setPlainText(science.summary)
+        self.dat_properties.syncFromOwner()
+        self.ordinary_analysis.refresh()
+        self._cached_d2 = None
+        self.processing.syncFromOwner()
 
     def activate_dataset(self, dataset_id: str, *, capture_outgoing: bool = True) -> None:
         previous_id = self.workspace.active_dataset_id
@@ -2101,9 +2042,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._invalidate_analysis_jobs()
         self._clear_dataset_interactions()
         self.workspace.active_dataset_id = dataset_id
-        self._select_graph_page(session)
         self._restoring_dataset = True
+        self._defer_dataset_layout = True
         try:
+            self._select_graph_page(session)
             self.restore_dataset_controls(session)
             # Markers must match before _plot_cube: its default initialization
             # belongs only to first load, never to a cached owner.
@@ -2111,6 +2053,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._sync_batch_peak_coords()
             self._sync_batch_fit_coords()
             self._plot_cube()
+            # Measure labels once, with the incoming owner, controls and exact
+            # limits complete. Earlier page binding and plot construction only
+            # request layout; they must not measure the outgoing/rounded view.
+            self._defer_dataset_layout = False
             self._restore_effective_plot_limits(session.view.plot_recipe(session.current_cube, session.applied,
                                                                           session.presentation))
             self._refresh_axis_status()
@@ -2121,6 +2067,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._update_lasso_actions()
             self._refresh_export_actions()
         finally:
+            self._defer_dataset_layout = False
             self._restoring_dataset = False
         self._refresh_analysis_controls()
         self._refresh_processing_controls()
@@ -2128,1797 +2075,261 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._schedule_plot_page_render()
         self._refresh_imported_datasets()
         self._refresh_graph_selector()
-        self.statusBar().showMessage(f'Active: {session.source_path.name} — {session.active_graph.name}' + (f' — {notice}' if notice else ''))
+        self.publish_status(notice or '')
 
     # =========================================================================
     #  UI construction
     # =========================================================================
 
-    def _build_ui(self) -> None:
-        root = QWidget()
-        self.setCentralWidget(root)
+    def _build_ui(self):
+        self.source_navigation = SourceNavigation(SourceServices(
+            workspace=lambda: self.workspace, busy=lambda: self._project_busy(),
+            import_data=lambda: self._on_import_dats(),
+            activate_dataset=lambda identity: self.activate_dataset(identity),
+            activate_graph=lambda identity: self.activate_graph(identity),
+            browse_root=lambda: self._on_browse_root(), select_folder=lambda folder: self._on_folder_changed(folder),
+            load_paths=lambda paths: self._import_data_files(paths), dataset_action=self._source_dataset_action,
+            graph_action=self._source_graph_action,
+            save_rows=lambda rows: self._annotation_settings.setValue('datasets/list_rows', rows),
+            error=self._show_error), self, visible_rows=self._annotation_settings.value('datasets/list_rows', 8, type=int))
+        self.ordinary_analysis = OrdinaryAnalysisBridge(self)
+        self._build_view_settings()
+        self._build_plot_panel()
+        self.app_bridge.navigation.bind(self)
 
-        # Apply a minimal global stylesheet for consistent widget appearance
-        self.setStyleSheet(
-            "QGroupBox {"
-            "  border: 1px solid #d0d0d0; border-radius: 5px;"
-            "  margin-top: 8px; font-weight: 600; font-size: 11px;"
-            "}"
-            "QGroupBox::title {"
-            "  subcontrol-origin: margin; subcontrol-position: top left;"
-            "  left: 8px; padding: 0 4px; color: #333;"
-            "}"
-            "QTabWidget::pane {"
-            "  border: 1px solid #d0d0d0; border-radius: 3px;"
-            "  top: -1px;"
-            "}"
-            "QTabBar::tab {"
-            "  padding: 4px 12px; font-size: 11px; border: 1px solid #ccc;"
-            "  border-bottom: none; border-top-left-radius: 3px; border-top-right-radius: 3px;"
-            "  background: #f0f0f0; color: #555;"
-            "}"
-            "QTabBar::tab:selected { background: white; color: #1565c0; font-weight: 600; }"
-            "QTabBar::tab:hover:!selected { background: #e8e8e8; }"
-            "QStatusBar { font-size: 10px; color: #555; }"
-            "QScrollArea { border: none; }"
-            "QSplitter::handle { background: #e0e0e0; }"
-            "QSplitter::handle:horizontal { width: 3px; }"
-        )
 
-        split = QSplitter(Qt.Horizontal)
-        self._main_splitter = split
-        split.setChildrenCollapsible(False)
 
-        self.project_panel = QWidget()
-        self.project_panel.setObjectName('project_panel')
-        self.project_panel.setAccessibleName('Project navigation panel')
-        self.project_panel.setMinimumWidth(140)
-        self._project_panel_layout = QVBoxLayout(self.project_panel)
-        self._project_panel_layout.setContentsMargins(0, 0, 0, 0)
-        self._project_panel_width = 240
-        self._dat_details_requested = True
-        details = self._build_left_panel()
-        self._dat_properties = details
-        self._properties_stack = QStackedWidget()
-        self._properties_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        self._properties_stack.setMinimumWidth(320)
-        self._properties_stack.addWidget(details)
-        self._context_properties = QLabel()
-        self._context_properties.setTextFormat(Qt.PlainText)
-        self._context_properties.setWordWrap(True)
-        self._context_properties.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self._context_properties.setMargin(12)
-        self._context_properties.setAccessibleName('Current document properties')
-        self._properties_stack.addWidget(self._context_properties)
-        self.dat_details_dock = QDockWidget('Properties', self)
-        self.dat_details_dock.setObjectName('dat_details_dock')
-        self.dat_details_dock.setAccessibleName('Current document properties')
-        self.dat_details_dock.setAllowedAreas(Qt.RightDockWidgetArea)
-        self.dat_details_dock.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetFloatable)
-        self.dat_details_dock.setWidget(self._properties_stack)
-        self.dat_details_dock.installEventFilter(self)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.dat_details_dock)
-        self.resizeDocks([self.dat_details_dock], [390], Qt.Horizontal)
-        plot_panel = self._build_plot_panel()
 
-        split.addWidget(self.project_panel)
-        split.addWidget(plot_panel)
-        split.setCollapsible(0, True)
-        split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 1)
-        split.setSizes([240, 800])
-        split.splitterMoved.connect(self._project_splitter_moved)
-
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.addWidget(split)
-
-        self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage(
-            "Import data files, open a project, or choose a recent project to begin."
-        )
-
-        # DnD overlay (child of centralWidget so it floats on top)
-        self._dnd_overlay = QLabel(self.centralWidget())
-        self._dnd_overlay.setAlignment(Qt.AlignCenter)
-        self._dnd_overlay.setStyleSheet(
-            "background: rgba(33,150,243,0.18);"
-            "color: #0d47a1; font-size: 20px; font-weight: bold;"
-            "border: 3px dashed #1565c0; border-radius: 10px;"
-        )
-        self._dnd_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._dnd_overlay.setVisible(False)
-
-        # Gate navigation signals (wired here because plot panel builds the widgets)
-        self.plot_gate_spin.valueChanged.connect(self._on_plot_gate_spin_changed)
-        self.plot_gate_spin.editingFinished.connect(self._on_plot_gate_spin_edit_finished)
-        self.plot_gate_index_spin.valueChanged.connect(self._on_plot_gate_index_changed)
-        self.plot_prev_gate_btn.clicked.connect(lambda: self._step_gate_index(-1))
-        self.plot_next_gate_btn.clicked.connect(lambda: self._step_gate_index(1))
-        self._watch_dat_editor_focus(self._sidebar_tabs)
-
-    def resizeEvent(self, event: Any) -> None:
-        super().resizeEvent(event)
-        cw = self.centralWidget()
-        if cw and hasattr(self, "_dnd_overlay"):
-            self._dnd_overlay.setGeometry(0, 0, cw.width(), cw.height())
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if self._sidebar_initial_sizing_pending:
-            self._sidebar_initial_sizing_pending = False
-            split = self._main_splitter
-            QTimer.singleShot(0, self, lambda: split.setSizes([self._project_panel_width,
-                                                             max(1, split.width() - self._project_panel_width)]))
-
-    def changeEvent(self, event):
-        super().changeEvent(event)
-        if (event.type() in (QEvent.FontChange, QEvent.ApplicationFontChange, QEvent.StyleChange)
-                and hasattr(self, '_fallback_plot_page')):
-            self._size_workspace_commands()
-
-    def _size_workspace_commands(self):
-        # Measure the shared row on font/style changes, never on activation.
-        height = max(self._fallback_plot_page.command_bar.sizeHint().height(),
-                     self.workbook_commands.sizeHint().height()) + 4
-        self.graph_command_host.setFixedHeight(max(40, height))
 
     def _set_project_panel_visible(self, visible):
-        split = self._main_splitter
-        if not visible and split.sizes()[0] > 0:
-            self._project_panel_width = split.sizes()[0]
-        self.project_panel.setVisible(visible)
-        if visible:
-            width = max(140, min(self._project_panel_width, max(140, split.width() // 2)))
-            split.setSizes([width, max(1, split.width() - width - split.handleWidth())])
-        with QSignalBlocker(self.project_panel_action):
-            self.project_panel_action.setChecked(visible)
+        self._project_panel_visible = bool(visible)
+        self.shellChanged.emit()
 
-    def _project_splitter_moved(self, *_args):
-        width = self._main_splitter.sizes()[0]
-        if width > 0:
-            self._project_panel_width = width
-        if hasattr(self, 'project_panel_action'):
-            with QSignalBlocker(self.project_panel_action):
-                self.project_panel_action.setChecked(width > 0)
 
     def _set_dat_details_requested(self, visible):
-        self._dat_details_requested = visible
+        previous = self._dat_details_requested
+        self._dat_details_requested = bool(visible)
         self._refresh_workspace_shell()
+        if not previous and self._dat_details_requested:
+            self._activate_visible_xy_analysis()
 
-    def createPopupMenu(self):
-        # Reuse the same visibility intent and draft preservation as View.
-        menu = QMenu(self)
-        menu.setProperty('preserveDatDrafts', True)
-        menu.addAction(self.project_panel_action)
-        menu.addAction(self.dat_details_action)
-        return menu
+    def _activate_visible_xy_analysis(self):
+        page = self._properties_controller
+        if (self._outer_view == 'workspace' and self._dat_details_requested
+                and self._task_index == 1 and isinstance(page, XYPlotController)):
+            # Enter only on a task, owner or visibility transition: activate()
+            # reveals this same section synchronously through request_task().
+            page.analysis_controller.activate(restore_selection=False)
 
-    def _watch_dat_editor_focus(self, root):
-        for editor in [*root.findChildren(QLineEdit), *root.findChildren(QAbstractSpinBox)]:
-            editor.installEventFilter(self)
+    def _properties_context_summary(self, *, detailed=False):
+        page = self._properties_controller
+        if (isinstance(page, WorkbookController) and page.workspace is self.workspace
+                and page.workbook_id in self.workspace.workbooks):
+            return page.context_summary(detailed=detailed)
+        if (isinstance(page, XYPlotController) and page.workspace is self.workspace
+                and page.comparison_id in self.workspace.comparisons):
+            return 'XY graph: ' + page.comparison.name
+        if self._context_kind == 'dat' and self.workspace.active is not None:
+            session = self.workspace.active
+            source = session.source_path.name if session.source_path is not None else 'DAT'
+            return source + ' · ' + session.active_graph.name
+        return 'Open a Workbook or graph from Project.'
+
+
 
     def _refresh_workspace_shell(self):
         if not hasattr(self, 'dat_details_action'):
             return
-        session = self.workspace.active
-        context = 'No DAT source selected.'
-        if session is not None:
-            context = f'Source: {session.source_path.name if session.source_path else "Embedded data"}'
-            if session.active_graph.published:
-                context = f'Graph: {session.active_graph.name}\n' + context
-        self._source_context_label.setText(context)
-        key = self.graph_documents._active_key
-        dat_context = (self.plot_tabs.currentIndex() == 0 or bool(
-            key and len(key) == 2 and self.graph_documents.window_for(key) is not None))
-        page = self.graph_documents.page_for(key)
-        content = self._dat_properties if dat_context else self._context_properties
-        if not dat_context and isinstance(page, XYPlotPage):
-            content = page.inspector
-        elif (not dat_context and isinstance(page, WorkbookPage)
-              and key[1] in self.workspace.workbooks):
-            self._context_properties.setText(page.context_summary())
-            self._context_properties.setToolTip(page.context_summary(detailed=True))
-        elif not dat_context:
-            self._context_properties.setText('No active document.\n\nOpen a Workbook or graph from Project to edit its properties.')
-            self._context_properties.setToolTip('')
-        if self._properties_stack.currentWidget() is not content:
-            self._properties_stack.setCurrentWidget(content)
-        self.dat_details_action.setEnabled(True)
+        previous = self._properties_controller
+        self.source_navigation.sync()
+        key = self.graph_documents.registry.active_key
+        page = self.graph_documents.document_for(key)
+        dat = self._outer_view == 'analysis' or bool(key and len(key) == 2 and key in self.graph_documents.registry.open_keys())
+        self._context_kind = 'dat' if dat else 'xy' if isinstance(page, XYPlotController) else 'workbook' if isinstance(page, WorkbookController) else 'empty'
+        self._properties_controller = self.plot_page if dat else page
         with QSignalBlocker(self.dat_details_action):
             self.dat_details_action.setChecked(self._dat_details_requested)
-        if isinstance(page, XYPlotPage):
-            with QSignalBlocker(page.inspector_toggle_btn):
-                page.inspector_toggle_btn.setChecked(self._dat_details_requested)
-        visible = self._dat_details_requested
-        if visible != (not self.dat_details_dock.isHidden()):
-            # Native spin boxes normalize unfinished text on hide and show.
-            # A panel toggle is presentation only, so preserve both the value
-            # and draft while suppressing the associated editing signals.
-            editors = self.dat_details_dock.findChildren(QLineEdit)
-            spins = self.dat_details_dock.findChildren(QAbstractSpinBox)
-            drafts = [(spin, spin.value(), spin.lineEdit().text()) for spin in spins]
-            with ExitStack() as blockers:
-                for editor in [*editors, *spins]:
-                    blockers.enter_context(QSignalBlocker(editor))
-                self.dat_details_dock.setVisible(visible)
-                for spin, value, text in drafts:
-                    spin.setValue(value)
-                    spin.lineEdit().setText(text)
+        self.app_bridge.commands.sync()
+        if isinstance(page, XYPlotController):
+            page.set_inspector_checked(self._dat_details_requested)
+        self.shellChanged.emit()
+        if previous is not self._properties_controller:
+            self._activate_visible_xy_analysis()
 
-    def eventFilter(self, watched, event):
-        if (watched is getattr(self, 'plot_tabs', None) and event.type() == QEvent.KeyPress
-                and event.key() in (Qt.Key_Tab, Qt.Key_Backtab)
-                and event.modifiers() & Qt.ControlModifier):
-            # This is an internal page container, not user-facing peer tabs.
-            return True
-        if event.type() == QEvent.FocusOut and isinstance(watched, (QLineEdit, QAbstractSpinBox)):
-            # Opening a panel menu must not normalize a
-            # spin-box draft before the visibility action can preserve it.
-            popup = QApplication.activePopupWidget()
-            if ((hasattr(self, '_view_menu') and self._view_menu.isVisible())
-                    or (popup is not None and popup.property('preserveDatDrafts'))):
-                return True
-        if watched is getattr(self, 'dat_details_dock', None) and event.type() == QEvent.Close:
-            self._set_dat_details_requested(False)
-        if (watched is getattr(self, 'data_navigator', None) and event.type() == QEvent.KeyPress
-                and event.key() in (Qt.Key_Return, Qt.Key_Enter)):
-            self._open_navigator_item()
-            return True
-        datasets = getattr(self, 'imported_dataset_list', None)
-        if (datasets is not None and watched is datasets.viewport()
-                and event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease)
-                and event.button() == Qt.RightButton):
-            # A context-menu gesture targets the clicked owner without changing
-            # the single viewer's selection before the menu is shown.
-            return True
-        if watched is getattr(self, 'import_dats_btn', None) and event.type() == QEvent.EnabledChange:
-            if hasattr(self, '_graph_command_actions'):
-                self._graph_command_actions['import'].setEnabled(watched.isEnabled())
-                self._graph_command_actions['import_options'].setEnabled(watched.isEnabled())
-        scroll = getattr(self, 'analysis_scroll', None)
-        if scroll is not None and watched is scroll.viewport() and event.type() in (QEvent.Resize, QEvent.Show):
-            self._schedule_view_layout()
-        return super().eventFilter(watched, event)
 
     # ── expander helper ───────────────────────────────────────────────────────
 
-    def _make_expander(self, title: str, content: QWidget, *, expanded: bool = True) -> QWidget:
-        section = DisclosureSection(title, content, expanded=expanded)
-        protect_disclosure_drafts(content)
-        return section
 
     # ── row / spin helpers ────────────────────────────────────────────────────
 
-    @staticmethod
-    def _hrow(widgets: list) -> QWidget:
-        row = QWidget()
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        for w in widgets:
-            lay.addWidget(w)
-        lay.addStretch(1)
-        return row
 
-    @staticmethod
-    def _view_spin_row(spin: QDoubleSpinBox, lock_box: QCheckBox) -> QWidget:
-        row = QWidget()
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-        # The sidebar permits numeric fields to shrink. Give this field the
-        # available row space so the trailing Fix starts after its real bounds.
-        lay.addWidget(spin, 1)
-        lay.addWidget(lock_box)
-        return row
 
     # ── left panel ────────────────────────────────────────────────────────────
 
-    def _build_left_panel(self) -> QWidget:
-        self._sidebar_tabs = QTabWidget()
-        self._sidebar_tabs.setObjectName('taskSidebarTabs')
-        self._sidebar_tabs.setAccessibleName('Data, analysis and view tasks')
-        self._analysis_sidebar_index = 0
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-
-        panel = QWidget()
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(6, 4, 6, 4)
-        lay.setSpacing(6)
-
-        # ── Data Source (expander, default expanded) ──────────────────────────
-        src_content = QWidget()
-        src_lay = QVBoxLayout(src_content)
-        src_lay.setContentsMargins(2, 4, 2, 4)
-        src_lay.setSpacing(6)
-
-        self.import_dats_btn = QPushButton('Import data…')
-        self.import_dats_btn.setObjectName('importDatsButton')
-        self.import_dats_btn.setAccessibleName('Import data files')
-        self.import_dats_btn.setToolTip('Automatically import full XY tables and Gate matrices into Workspace: first column X, all remaining columns Y. Optional preview: File → Import with options.')
-        src_lay.addWidget(self.import_dats_btn)
-        imported_header = QHBoxLayout()
-        self.imported_dataset_label = QLabel('Imported datasets (0)')
-        self.imported_dataset_label.setObjectName('importedDatasetLabel')
-        self.imported_dataset_label.setWordWrap(True)
-        imported_header.addWidget(self.imported_dataset_label, 1)
-        self.imported_dataset_label.setToolTip(
-            'Use File → Save Project to save the complete workspace as .spectra. Ordinary DAT '
-            'imports save plot settings beside each source as .dat.plot.json until saved into a project.')
-        rows_label = QLabel('Rows:')
-        self.imported_dataset_rows_spin = QSpinBox()
-        self.imported_dataset_rows_spin.setObjectName('importedDatasetRows')
-        self.imported_dataset_rows_spin.setAccessibleName('Imported dataset visible rows')
-        self.imported_dataset_rows_spin.setRange(4, 12)
-        self.imported_dataset_rows_spin.setKeyboardTracking(False)
-        self.imported_dataset_rows_spin.setValue(self._annotation_settings.value('datasets/list_rows', 8, type=int))
-        self.imported_dataset_rows_spin.setToolTip('Visible rows in the dataset list')
-        rows_label.setBuddy(self.imported_dataset_rows_spin)
-        imported_header.addWidget(rows_label)
-        imported_header.addWidget(self.imported_dataset_rows_spin)
-        src_lay.addLayout(imported_header)
-        search_row = QHBoxLayout()
-        search_label = QLabel('Search:')
-        self.imported_dataset_search = QLineEdit()
-        self.imported_dataset_search.setObjectName('importedDatasetSearch')
-        self.imported_dataset_search.setAccessibleName('Search imported datasets')
-        self.imported_dataset_search.setPlaceholderText('Filename or folder path…')
-        self.imported_dataset_search.setClearButtonEnabled(True)
-        self.imported_dataset_search.setToolTip('Filter by filename or folder path; the active dataset stays open')
-        search_label.setBuddy(self.imported_dataset_search)
-        search_row.addWidget(search_label)
-        search_row.addWidget(self.imported_dataset_search, 1)
-        src_lay.addLayout(search_row)
-        self.imported_dataset_list = QListWidget()
-        self.imported_dataset_list.setObjectName('importedDatasetList')
-        self.imported_dataset_list.setAccessibleName('Imported datasets')
-        self.imported_dataset_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.imported_dataset_list.viewport().installEventFilter(self)
-        self.imported_dataset_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.imported_dataset_list.customContextMenuRequested.connect(self._show_dataset_context_menu)
-        self.imported_dataset_rows_spin.valueChanged.connect(self._resize_imported_dataset_list)
-        self._resize_imported_dataset_list()
-        self.imported_dataset_list.setToolTip('Select a dataset to restore its cached plot and analysis')
-        self.imported_dataset_label.setBuddy(self.imported_dataset_list)
-        src_lay.addWidget(self.imported_dataset_list)
-        graph_row = QHBoxLayout()
-        graph_label = QLabel('Graph name:')
-        self.graph_combo = QComboBox()
-        self.graph_combo.setObjectName('graphSelector')
-        self.graph_combo.setAccessibleName('Named graph for the active DAT')
-        self.graph_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.graph_combo.setMinimumContentsLength(14)
-        self.graph_combo.setToolTip('Each graph keeps its own ranges, gate, titles and style')
-        graph_label.setBuddy(self.graph_combo)
-        self.graph_actions_btn = QToolButton()
-        self.graph_actions_btn.setText('Graphs')
-        self.graph_actions_btn.setAccessibleName('Graph actions')
-        self.graph_actions_btn.setPopupMode(QToolButton.InstantPopup)
-        graph_menu = QMenu(self.graph_actions_btn)
-        self.new_graph_action = graph_menu.addAction('New Graph…', self._on_new_graph)
-        self.rename_graph_action = graph_menu.addAction('Rename Graph…', self._on_rename_graph)
-        self.remove_graph_action = graph_menu.addAction('Remove Graph…', self._on_remove_graph)
-        self.graph_actions_btn.setMenu(graph_menu)
-        self.graph_combo.currentIndexChanged.connect(self._on_graph_selected)
-        graph_row.addWidget(graph_label)
-        graph_row.addWidget(self.graph_combo, 1)
-        graph_row.addWidget(self.graph_actions_btn)
-        src_lay.addLayout(graph_row)
-        self._refresh_graph_selector()
-        self.imported_dataset_filter_status_label = QLabel('No matches. Clear search to show all datasets.')
-        self.imported_dataset_filter_status_label.setObjectName('importedDatasetFilterStatusLabel')
-        self.imported_dataset_filter_status_label.setAccessibleName('Dataset search status')
-        self.imported_dataset_filter_status_label.setWordWrap(True)
-        self.imported_dataset_filter_status_label.hide()
-        src_lay.addWidget(self.imported_dataset_filter_status_label)
-        self.dat_import_status_label = QLabel('No imported datasets. Import or drop DAT files to begin.')
-        self.dat_import_status_label.setObjectName('datImportStatusLabel')
-        self.dat_import_status_label.setAccessibleName('DAT import status')
-        self.dat_import_status_label.setWordWrap(True)
-        src_lay.addWidget(self.dat_import_status_label)
-
-        # Folder inventory stays available as a secondary data workflow.
-        folder_content = QWidget()
-        folder_lay = QVBoxLayout(folder_content)
-        folder_lay.setContentsMargins(0, 0, 0, 0)
-        folder_lay.setSpacing(6)
-        # Root folder row
-        root_row = QHBoxLayout()
-        root_row.setSpacing(6)
-        self.root_edit = QLineEdit()
-        self.root_edit.setReadOnly(True)
-        self.root_edit.setPlaceholderText("Root folder path…")
-        self.root_edit.setToolTip("Path to the root folder containing .dat experiment folders")
-        self.browse_btn = QPushButton("Browse…")
-        self.browse_btn.setToolTip("Open a dialog to choose the root folder")
-        self.browse_btn.setMinimumWidth(72)
-        self.browse_btn.setStyleSheet(_STYLE_PRIMARY)
-        root_row.addWidget(self.root_edit, 1)
-        root_row.addWidget(self.browse_btn)
-        folder_lay.addLayout(root_row)
-
-        # Process folder row
-        folder_row = QHBoxLayout()
-        folder_row.setSpacing(6)
-        folder_lbl = QLabel("Folder:")
-        folder_lbl.setFixedWidth(48)
-        folder_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
-        self.folder_combo = QComboBox()
-        self.folder_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.folder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.folder_combo.setToolTip("Select the process sub-folder to list .dat files from")
-        folder_row.addWidget(folder_lbl)
-        folder_row.addWidget(self.folder_combo, 1)
-        folder_lay.addLayout(folder_row)
-
-        # Separator
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.HLine)
-        sep1.setFrameShadow(QFrame.Sunken)
-        sep1.setStyleSheet("color: #ddd;")
-        folder_lay.addWidget(sep1)
-
-        # File list
-        folder_lay.addWidget(QLabel('Folder files (inventory)'))
-        self.file_list = QListWidget()
-        self.file_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.file_list.setMinimumHeight(55)
-        self.file_list.setMaximumHeight(80)
-        self.file_list.setToolTip("Double-click or select and press Load to open a .dat file")
-        self.file_list.setStyleSheet(
-            "QListWidget { border: 1px solid #ddd; border-radius: 3px; font-size: 11px; }"
-            "QListWidget::item:selected { background: #1976d2; color: white; }"
-        )
-        folder_lay.addWidget(self.file_list)
-
-        self.load_btn = QPushButton("Load Selected File")
-        self.load_btn.setToolTip("Load the highlighted .dat file (double-click also works)")
-        self.load_btn.setStyleSheet(_STYLE_PRIMARY)
-        folder_lay.addWidget(self.load_btn)
-        src_lay.addWidget(self._make_expander('Folder inventory', folder_content, expanded=False))
-
-        self._source_context_label = QLabel('No DAT source selected.')
-        self._source_context_label.setTextFormat(Qt.PlainText)
-        self._source_context_label.setWordWrap(True)
-        self._source_context_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        lay.addWidget(self._source_context_label)
-        self._source_navigation_content = src_content
-        lay.addWidget(self._make_expander('Advanced source navigation', src_content, expanded=False))
-
-        # ── Data Processing (expander, default expanded) ─────────────────────
-        processing_content = self._build_data_processing()
-        self._processing_content = processing_content
-        lay.addStretch(1)
-
-        # ── View Settings (expander, default expanded) ────────────────────────
-        view_content = self._build_view_settings()
-
-        # ── Spectrum Analysis ─────────────────────────────────────────────────
-        analysis_box = QWidget()
-        ao_lay = QVBoxLayout(analysis_box)
-        ao_lay.setContentsMargins(0, 0, 0, 0)
-        ao_lay.setSpacing(4)
-
-        self._analysis_tabs = QTabWidget()
-        self._analysis_tabs.addTab(self._build_find_peak_tab(), "Find Peaks")
-        self._analysis_tabs.addTab(self._build_lorentz_fit_tab(), "Peak Fit")
-        ao_lay.addWidget(self._analysis_tabs)
-
-        # Analysis output label
-        out_hdr = QLabel("Analysis Output")
-        out_hdr.setStyleSheet("font-weight: 600; color: #444; font-size: 11px; margin-top: 2px;")
-        ao_lay.addWidget(out_hdr)
-        self.create_analysis_graph_btn = QPushButton('Create analysis graph')
-        self.create_analysis_graph_btn.setToolTip(
-            'Create an editable Workspace graph from current Gate peaks/dips or a completed fit, with applied source values.')
-        self.create_analysis_graph_btn.clicked.connect(self._on_create_analysis_graph)
-        ao_lay.addWidget(self.create_analysis_graph_btn)
-
-        self.analysis_text = QPlainTextEdit()
-        self.analysis_text.setReadOnly(True)
-        self.analysis_text.setMinimumHeight(60)
-        self.analysis_text.setMaximumHeight(105)
-        self.analysis_text.setStyleSheet(
-            "QPlainTextEdit {"
-            "  background: #f8f9fa; border: 1px solid #dee2e6;"
-            "  border-radius: 3px; font-family: Consolas, monospace; font-size: 10px;"
-            "  padding: 4px;"
-            "}"
-        )
-        ao_lay.addWidget(self.analysis_text)
-
-        analysis_panel = QWidget()
-        analysis_lay = QVBoxLayout(analysis_panel)
-        analysis_lay.setContentsMargins(6, 4, 6, 4)
-        analysis_lay.addWidget(self._make_expander('Data Processing', processing_content, expanded=True))
-        analysis_lay.addWidget(analysis_box)
-        analysis_lay.addStretch(1)
-        self._analysis_sidebar_scroll = QScrollArea()
-        self._analysis_sidebar_scroll.setWidgetResizable(True)
-        self._analysis_sidebar_scroll.setWidget(analysis_panel)
-        self._view_sidebar_scroll = QScrollArea()
-        self._view_sidebar_scroll.setWidgetResizable(True)
-        self._view_sidebar_scroll.setWidget(view_content)
-
-        # ── wire up non-tab signals ───────────────────────────────────────────
-        self.browse_btn.clicked.connect(self._on_browse_root)
-        self.import_dats_btn.clicked.connect(self._on_import_dats)
-        self.imported_dataset_search.textChanged.connect(self._filter_imported_datasets)
-        self.imported_dataset_list.currentItemChanged.connect(self._on_imported_dataset_changed)
-        self.folder_combo.currentIndexChanged.connect(self._on_folder_changed)
-        self.load_btn.clicked.connect(self._on_load_selected_file)
-        self.file_list.itemDoubleClicked.connect(lambda _: self._on_load_selected_file())
-        self.x_axis_override_combo.currentIndexChanged.connect(self._on_x_axis_override_async)
-        self.processing_mode_combo.currentIndexChanged.connect(self._on_processing_mode_changed)
-        self.generate_heatmap_btn.clicked.connect(self._on_generate_heatmap)
-        self.cmap_combo.currentIndexChanged.connect(self._on_colormap_changed)
-        self.cmap_combo.activated.connect(lambda _index: setattr(self, '_colormap_manual', True))
-        self.lw_min_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
-        self.lw_max_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
-        self.peak_move_limit_spin.valueChanged.connect(lambda _: self._update_fit_param_unit_labels())
-        self.fit_model_combo.currentTextChanged.connect(lambda _: self._update_fit_param_unit_labels())
-        for spin in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
-                     self.ymax_spin, self.vmin_spin, self.vmax_spin):
-            spin.valueChanged.connect(
-                lambda _value, changed_spin=spin: self._on_view_limit_changed(changed_spin)
-            )
-        self.apply_view_btn.clicked.connect(self._plot_cube)
-        self.auto_view_btn.clicked.connect(self._on_auto_view)
-
-        scroll.setWidget(panel)
-        self._data_sidebar_scroll = scroll
-        self._sidebar_tabs.addTab(scroll, 'Data')
-        self._sidebar_tabs.addTab(self._analysis_sidebar_scroll, 'Analysis')
-        self._sidebar_tabs.addTab(self._view_sidebar_scroll, 'View')
-        # Forms wrap labels above fields when the adjustable sidebar narrows.
-        for form in self._sidebar_tabs.findChildren(QFormLayout):
-            form.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        for label in self._sidebar_tabs.findChildren(QLabel):
-            label.setWordWrap(True)
-        for combo in self._sidebar_tabs.findChildren(QComboBox):
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        # The active name may be arbitrarily long; let this row fit the sidebar.
-        self.graph_combo.setMinimumContentsLength(0)
-        self.graph_combo.setMinimumWidth(0)
-        self.graph_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        for spin in self._sidebar_tabs.findChildren(QAbstractSpinBox):
-            spin.setMinimumWidth(min(90, spin.maximumWidth()))
-            spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        # Header rows must reserve their spinner width; the form-field policy
-        # above lets QHBoxLayout allocate zero width and clips this preference.
-        self.imported_dataset_rows_spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.imported_dataset_rows_spin.setMinimumWidth(self.imported_dataset_rows_spin.minimumSizeHint().width())
-        # Inline conversions must also reserve the numeric editor's width.
-        for spin in (self.lw_min_spin, self.lw_max_spin, self.peak_move_limit_spin):
-            spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            spin.setMinimumWidth(spin.minimumSizeHint().width())
-        return self._sidebar_tabs
 
     # ── view settings content (used inside expander) ──────────────────────────
 
-    def _build_data_processing(self) -> QWidget:
-        """Build the current-data transform controls for the heatmap."""
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(2, 2, 2, 4)
-        lay.setSpacing(4)
 
-        form = QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(4)
-        form.setHorizontalSpacing(8)
-        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        self.processing_mode_combo = QComboBox()
-        self.processing_mode_combo.addItem("Original", "original")
-        self.processing_mode_combo.addItem("Energy 2nd derivative", "energy_second_derivative")
-        self.processing_mode_combo.setToolTip(
-            "Choose the data represented by the heatmap and accompanying spectrum."
-        )
-        self.fix_processing_chk = QCheckBox("Fix")
-        self.fix_processing_chk.setChecked(self._annotation_settings.value(
-            "fixed_processing/enabled", False, type=bool))
-        self.fix_processing_chk.setToolTip("Carry mode and smoothing settings across files and restarts.")
-        mode_row = QWidget()
-        mode_layout = QHBoxLayout(mode_row)
-        mode_layout.setContentsMargins(0, 0, 0, 0)
-        mode_layout.addWidget(self.processing_mode_combo, 1)
-        mode_layout.addWidget(self.fix_processing_chk)
-        form.addRow("Mode:", mode_row)
-
-        self.processing_smooth_chk = QCheckBox("SG smoothing")
-        self.processing_smooth_chk.setChecked(True)
-        self.processing_smooth_chk.setToolTip(
-            "Compute the second derivative directly from a local polynomial fit (SG). "
-            "When disabled, use ordinary finite differences."
-        )
-        form.addRow("", self.processing_smooth_chk)
-
-        self.processing_window_spin = QSpinBox()
-        self.processing_window_spin.setRange(5, 1001)
-        self.processing_window_spin.setSingleStep(2)
-        self.processing_window_spin.setValue(21)
-        self.processing_window_spin.setToolTip("Odd smoothing window length in energy points.")
-        form.addRow("Window points:", self.processing_window_spin)
-        self.fix_processing_chk.toggled.connect(self._remember_fixed_processing)
-        self.processing_mode_combo.currentIndexChanged.connect(self._remember_fixed_processing)
-        self.processing_smooth_chk.toggled.connect(self._remember_fixed_processing)
-        self.processing_window_spin.valueChanged.connect(self._remember_fixed_processing)
-        lay.addLayout(form)
-
-        self.processing_status_label = QLabel('Applied: Original — no data loaded.')
-        self.processing_status_label.setWordWrap(True)
-        self.processing_status_label.setAccessibleName('Applied and pending data processing')
-        lay.addWidget(self.processing_status_label)
-        self.generate_heatmap_btn = QPushButton('Apply processing')
-        self.generate_heatmap_btn.setAccessibleName('Apply processing')
-        self.generate_heatmap_btn.setStyleSheet(_STYLE_PRIMARY)
-        self.generate_heatmap_btn.setToolTip(
-            "Apply the selected transform to the current loaded data."
-        )
-        lay.addWidget(self.generate_heatmap_btn)
-        return w
-
-    def _build_view_settings(self) -> QWidget:
-        """Build the View Settings panel content (X-axis, colormap, bounds, gate)."""
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        self._view_settings_layout = lay
-        lay.setContentsMargins(2, 2, 2, 4)
-        lay.setSpacing(6)
-
-        # ── Frequently used view and annotation controls ─────────────────────
-        self.x_axis_override_combo = QComboBox()
-        for value, label in AXIS_OVERRIDE_ITEMS:
-            self.x_axis_override_combo.addItem(label, value)
-        self.x_axis_override_combo.setToolTip(
-            "Override the auto-detected x-axis type. Use 'Auto Detect' unless the detection is wrong."
-        )
-
-        self.cmap_combo = QComboBox()
-        self.cmap_combo.setIconSize(QSize(48, 12))
-        for label, name in COMMON_COLORMAPS:
-            resolved = resolve_colormap(name)
-            palette = colormaps[resolved] if isinstance(resolved, str) else resolved
-            rgba = np.asarray(palette(np.linspace(0, 1, 72)) * 255, dtype=np.uint8)
-            pixels = np.ascontiguousarray(np.repeat(rgba[None, :, :], 12, axis=0))
-            preview = QImage(pixels.data, 72, 12, pixels.strides[0], QImage.Format_RGBA8888).copy()
-            self.cmap_combo.addItem(QIcon(QPixmap.fromImage(preview)), label, name)
-        self.cmap_combo.insertSeparator(self.cmap_combo.count())
-        for name in ('turbo', 'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'RdBu_r_p0p45'):
-            self.cmap_combo.addItem(name, name)
-        self.cmap_combo.setCurrentText("RdBu_r")
-        self._colormap_manual = False
-        self.cmap_combo.setToolTip("Colormap used for the intensity heatmap")
-
-        self.color_scale_combo = QComboBox()
-        self.color_scale_combo.addItem("Global", "global")
-        self.color_scale_combo.addItem("2 regions", "2")
-        self.color_scale_combo.addItem("3 regions", "3")
-        self.color_scale_combo.setToolTip(
-            "Use one color scale or independent scales across contiguous photon-energy regions."
-        )
-
-        top_form = QFormLayout()
-        top_form.setContentsMargins(0, 0, 0, 0)
-        top_form.setSpacing(4)
-        top_form.setHorizontalSpacing(8)
-        top_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        top_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.fix_annotations_chk = QCheckBox("Fix annotations")
-        self.fix_annotations_chk.setChecked(
-            self._annotation_settings.value("plot_annotations/fixed", True, type=bool))
-        self.fix_annotations_chk.setToolTip(
-            "Keep Y/Z annotations for new files. In Manual title mode, also keep the title. "
-            "Templates always generate a fresh title for each new file; edits override only that DAT. "
-            "Previously opened files always recall their own saved plot settings.")
-        template_content = QWidget()
-        template_form = QFormLayout(template_content)
-        template_form.setContentsMargins(4, 4, 4, 4)
-        template_form.addRow(self.fix_annotations_chk)
-        self.plot_title_edit = QLineEdit()
-        self.plot_title_edit.setPlaceholderText("Optional plot title (blank by default)")
-        self.plot_title_edit.setMaxLength(2147483647)
-        self.y_axis_name_edit = QLineEdit()
-        self.y_axis_unit_edit = QLineEdit()
-        self.y_axis_unit_edit.setPlaceholderText("Optional unit")
-        self._annotation_edits = {
-            "plot_title": self.plot_title_edit,
-            "y_axis_name": self.y_axis_name_edit,
-            "y_axis_unit": self.y_axis_unit_edit,
-        }
-        for field, edit in self._annotation_edits.items():
-            edit.setToolTip("Plot annotation only; does not change the data or its units.")
-            if self.fix_annotations_chk.isChecked():
-                edit.setText(self._annotation_settings.value(f"plot_annotations/{field}", "", type=str))
-            edit.textChanged.connect(
-                lambda text, field=field: self._save_plot_annotation(field, text))
-        top_form.addRow("Plot title:", self.plot_title_edit)
-        self._build_title_controls(template_form)
-        top_form.addRow("Y-axis label:", self.y_axis_name_edit)
-        top_form.addRow("Y-axis unit:", self.y_axis_unit_edit)
-        self.signal_title_combo = QComboBox()
-        self.signal_title_combo.setEditable(True)
-        self.signal_title_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.signal_title_combo.addItems([RAW_LABEL, DERIVATIVE_LABEL, 'PL (arb. units)',
-                                         'Signal (arb. units)'])
-        self.signal_title_combo.setToolTip(
-            "Colorbar annotation only; choosing a derivative label does not process the data.")
-        if self.fix_annotations_chk.isChecked():
-            self.signal_title_combo.setCurrentText(self._annotation_settings.value(
-                "plot_annotations/signal_title", RAW_LABEL, type=str))
-        self.signal_title_combo.currentTextChanged.connect(
-            lambda text: self._save_plot_annotation("signal_title", text))
-        self.signal_title_combo.activated.connect(lambda _index: self._finish_annotation_edit())
-        self.signal_title_auto_chk = QCheckBox("Auto from data")
-        self.signal_title_auto_chk.setChecked(self._annotation_settings.value(
-            "plot_annotations/signal_auto",
-            not self._annotation_settings.contains("plot_annotations/signal_title"), type=bool)
-            if self.fix_annotations_chk.isChecked() else True)
-        self.signal_title_auto_chk.toggled.connect(self._on_signal_auto_toggled)
-        top_form.addRow("Colorbar label:", self.signal_title_combo)
-        top_form.addRow('', self.signal_title_auto_chk)
-        self.fix_annotations_chk.toggled.connect(self._on_fix_annotations_toggled)
-        # Axis status label
-        self.axis_status_label = QLabel("X-axis: no file loaded.")
-        self.axis_status_label.setWordWrap(True)
-        self.axis_status_label.setStyleSheet(
-            "color: #607d8b; font-size: 10px;"
-            "background: #f0f4f8; border-radius: 3px; padding: 3px 5px;"
-        )
-        # ── View bounds grid (Min / Max per axis) ─────────────────────────────
-        self.xmin_spin = QDoubleSpinBox()
-        self.xmax_spin = QDoubleSpinBox()
-        self.ymin_spin = QDoubleSpinBox()
-        self.ymax_spin = QDoubleSpinBox()
-        self.vmin_spin = _ColorBoundSpinBox()
-        self.vmax_spin = _ColorBoundSpinBox()
-        for sp in (self.xmin_spin, self.xmax_spin, self.ymin_spin,
-                   self.ymax_spin, self.vmin_spin, self.vmax_spin):
-            sp.setDecimals(4)
-            sp.setKeyboardTracking(False)
-            sp.setRange(-1e12, 1e12)
-            sp.setSingleStep(0.01)
-            sp.setMinimumWidth(90)
-            sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        self.xmin_lock = QCheckBox("Fix")
-        self.xmax_lock = QCheckBox("Fix")
-        self.ymin_lock = QCheckBox("Fix")
-        self.ymax_lock = QCheckBox("Fix")
-        self.vmin_lock = QCheckBox("Fix")
-        self.vmax_lock = QCheckBox("Fix")
-        for ck in (self.xmin_lock, self.xmax_lock, self.ymin_lock,
-                   self.ymax_lock, self.vmin_lock, self.vmax_lock):
-            ck.setToolTip("Fix this bound; Auto View and automatic color limits leave it unchanged")
-        self._view_lock_controls = {
-            self.xmin_spin: self.xmin_lock, self.xmax_spin: self.xmax_lock,
-            self.ymin_spin: self.ymin_lock, self.ymax_spin: self.ymax_lock,
-            self.vmin_spin: self.vmin_lock, self.vmax_spin: self.vmax_lock,
-        }
-        for spin in (self.vmin_spin, self.vmax_spin):
-            spin.userCommitted.connect(lambda changed_spin=spin: self._lock_user_color_bound(changed_spin))
-        for lock_box in self._view_lock_controls.values():
-            lock_box.toggled.connect(
-                lambda checked, changed_lock=lock_box: self._on_view_lock_toggled(changed_lock, checked)
-            )
-
-        bounds_box = QWidget()
-        bounds_grid = QFormLayout(bounds_box)
-        bounds_grid.setContentsMargins(0, 0, 0, 0)
-        bounds_grid.setSpacing(4)
-        bounds_grid.setHorizontalSpacing(5)
-
-        bounds_grid.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        bounds_grid.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        for label, spin, lock in (
-            ('X minimum:', self.xmin_spin, self.xmin_lock),
-            ('X maximum:', self.xmax_spin, self.xmax_lock),
-            ('Y minimum:', self.ymin_spin, self.ymin_lock),
-            ('Y maximum:', self.ymax_spin, self.ymax_lock),
-        ):
-            bounds_grid.addRow(label, self._view_spin_row(spin, lock))
-
-        region_edges_label = QLabel("Region edges")
-        region_edges_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        region_edges_label.setStyleSheet("font-size: 10px; color: #444;")
-        region_edges_label.setToolTip("Internal photon-energy boundaries, snapped to heatmap cell edges")
-        self.region_boundary_spins: list[QDoubleSpinBox] = []
-        boundary_row = QWidget()
-        boundary_lay = QFormLayout(boundary_row)
-        boundary_lay.setContentsMargins(0, 0, 0, 0)
-        boundary_lay.setSpacing(4)
-        boundary_lay.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        for idx in range(2):
-            spin = QDoubleSpinBox()
-            spin.setDecimals(4)
-            spin.setRange(-1e12, 1e12)
-            spin.setSingleStep(0.01)
-            spin.setMinimumWidth(90)
-            spin.setKeyboardTracking(False)
-            spin.setToolTip("Boundary is snapped to a valid photon-energy cell edge")
-            spin.valueChanged.connect(
-                lambda value, boundary_idx=idx: self._on_color_region_boundary_changed(boundary_idx, value)
-            )
-            self.region_boundary_spins.append(spin)
-            boundary_lay.addRow(f'Edge {idx + 1}:', spin)
-        self._region_edges_row = QWidget()
-        region_row_lay = QVBoxLayout(self._region_edges_row)
-        region_row_lay.setContentsMargins(0, 0, 0, 0)
-        region_row_lay.setSpacing(5)
-        region_row_lay.addWidget(region_edges_label)
-        region_row_lay.addWidget(boundary_row, 1)
-        self.fix_region_edges_chk = QCheckBox("Fix")
+    def _build_view_settings(self):
+        self.dat_properties = SharedDatPropertiesBridge(self)
+        view = self._dat_view()
+        view.colormap = 'RdBu_r'
         settings = self._annotation_settings
-        if not settings.contains("fixed_region_edges/enabled"):
-            settings.setValue("fixed_region_edges/enabled", settings.value(
-                "fixed_regions/enabled", False, type=bool))
-            settings.setValue("fixed_region_edges/recipe", json.dumps({
-                "boundaries": self._fixed_recipe("regions").get("boundaries", []),
-            }))
-        self.fix_region_edges_chk.setChecked(settings.value(
-            "fixed_region_edges/enabled", False, type=bool))
-        self.fix_region_edges_chk.setToolTip(
-            "Carry energy boundaries across files with the same region count; intensity ranges remain automatic.")
-        self.fix_region_edges_chk.toggled.connect(self._remember_fixed_region_edges)
-        region_row_lay.addWidget(self.fix_region_edges_chk)
-        self._region_edges_row.setVisible(False)
+        view.fix_annotations = settings.value('plot_annotations/fixed', True, type=bool)
+        if view.fix_annotations:
+            for name in view.annotations:
+                view.annotations[name] = settings.value('plot_annotations/' + name, view.annotations[name], type=str)
+            view.signal_title_auto = settings.value('plot_annotations/signal_auto', not settings.contains('plot_annotations/signal_title'), type=bool)
+        if not settings.contains('fixed_region_edges/enabled'):
+            settings.setValue('fixed_region_edges/enabled', settings.value('fixed_regions/enabled', False, type=bool))
+            settings.setValue('fixed_region_edges/recipe', json.dumps({'boundaries': self._fixed_recipe('regions').get('boundaries', [])}))
+        for key in ('regions', 'region_edges'):
+            (self.workspace.active or self._unregistered_session).fixed_recipes[key].enabled = settings.value('fixed_' + key + '/enabled', False, type=bool)
+        self._colormap_manual = False
 
-        # View action buttons
-        btn_row = QVBoxLayout()
-        btn_row.setSpacing(6)
-        self.apply_view_btn = QPushButton("Apply View")
-        self.apply_view_btn.setToolTip("Apply the current bounds to the heatmap")
-        self.apply_view_btn.setStyleSheet(_STYLE_MUTED)
-        self.auto_view_btn = QPushButton("Auto View")
-        self.auto_view_btn.setToolTip(
-            "Reset unfixed X/Y bounds to the full data and update unfixed intensity bounds from the visible heatmap"
-        )
-        self.auto_view_btn.setStyleSheet(_STYLE_MUTED)
-        btn_row.addWidget(self.apply_view_btn, 1)
-        btn_row.addWidget(self.auto_view_btn, 1)
-        bounds_grid.addRow(btn_row)
+    def _reveal_ordinary_analysis_y(self, y):
+        self.request_task(1)
+        self.revealProperties.emit('ordinary', float(y))
 
-        # Keep the most frequently adjusted color controls together.
-        color_box = QGroupBox("Color Scale")
-        self._shared_color_scale_box = color_box
-        color_lay = QVBoxLayout(color_box)
-        color_lay.setContentsMargins(8, 14, 8, 6)
-        color_lay.setSpacing(4)
-        color_form = QFormLayout()
-        color_form.setContentsMargins(0, 0, 0, 0)
-        color_form.setSpacing(4)
-        color_form.setHorizontalSpacing(8)
-        color_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        color_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        color_form.addRow("Colormap:", self.cmap_combo)
-        self.mapping_combo = QComboBox()
-        for label, kind in (('Linear', 'linear'), ('Log', 'log'), ('SymLog', 'symlog'),
-                            ('Zero-centered', 'zero-centered')):
-            self.mapping_combo.addItem(label, kind)
-        self.mapping_combo.setToolTip('Display mapping only; preserves scientific data and completed fits.')
-        color_form.addRow('Mapping:', self.mapping_combo)
-        self.linthresh_spin = QDoubleSpinBox()
-        self.linthresh_spin.setDecimals(8)
-        self.linthresh_spin.setRange(1e-8, 1e12)
-        self.linthresh_spin.setValue(1.0)
-        self.linthresh_spin.setKeyboardTracking(False)
-        self.linthresh_spin.setEnabled(False)
-        color_form.addRow('SymLog threshold:', self.linthresh_spin)
-        self.mapping_status_label = QLabel()
-        self.mapping_status_label.setWordWrap(True)
-        self.mapping_status_label.hide()
-        color_form.addRow(self.mapping_status_label)
-        self.mapping_combo.currentIndexChanged.connect(self._on_color_mapping_changed)
-        self.linthresh_spin.valueChanged.connect(self._on_color_mapping_changed)
-        self.fix_regions_chk = QCheckBox("Fix")
-        self.fix_regions_chk.setChecked(self._annotation_settings.value(
-            "fixed_regions/enabled", False, type=bool))
-        self.fix_regions_chk.setToolTip(
-            "Carry region count across files; intensity ranges remain automatic.")
-        self.fix_regions_chk.toggled.connect(self._remember_fixed_regions)
-        scale_row = QWidget()
-        scale_layout = QHBoxLayout(scale_row)
-        scale_layout.setContentsMargins(0, 0, 0, 0)
-        scale_layout.addWidget(self.color_scale_combo, 1)
-        scale_layout.addWidget(self.fix_regions_chk)
-        color_form.addRow("Color scale:", scale_row)
-        color_lay.addLayout(color_form)
+    def _reveal_dat_property_y(self, y):
+        self.request_task(2)
+        self.revealProperties.emit('dat', float(y))
 
-        color_grid = QFormLayout()
-        color_grid.setContentsMargins(0, 0, 0, 0)
-        color_grid.setSpacing(4)
-        color_grid.setHorizontalSpacing(5)
-        color_grid.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        color_grid.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        color_grid.addRow('Minimum:', self._view_spin_row(self.vmin_spin, self.vmin_lock))
-        color_grid.addRow('Maximum:', self._view_spin_row(self.vmax_spin, self.vmax_lock))
-        color_grid.addRow(self._region_edges_row)
-        color_lay.addLayout(color_grid)
-        self.auto_color_btn = QPushButton('Auto / recalculate\ncolors')
-        self.auto_color_btn.setToolTip('Unlock both color endpoints and recalculate 0.5–99.5 percentiles from the visible current heatmap.')
-        self.auto_color_btn.clicked.connect(self._on_auto_colors)
-        color_lay.addWidget(self.auto_color_btn)
-        self.color_range_status = QLabel()
-        self.color_range_status.setWordWrap(True)
-        color_lay.addWidget(self.color_range_status)
-        self.color_clipping_status = QLabel()
-        self.color_clipping_status.setWordWrap(True)
-        color_lay.addWidget(self.color_clipping_status)
+    def _dat_view(self):
+        return (self.workspace.active or self._unregistered_session).view
 
-        # X interpretation, bounds and actions form one view-range task.
-        view_box = QGroupBox("View Range")
-        self._shared_view_range_box = view_box
-        view_lay = QVBoxLayout(view_box)
-        view_lay.setContentsMargins(8, 14, 8, 6)
-        view_lay.setSpacing(4)
-        axis_content = QWidget()
-        axis_form = QFormLayout(axis_content)
-        axis_form.setContentsMargins(0, 0, 0, 0)
-        axis_form.setSpacing(4)
-        axis_form.setHorizontalSpacing(8)
-        axis_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        axis_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        axis_form.addRow("X-axis:", self.x_axis_override_combo)
-        axis_form.addRow(self.axis_status_label)
-        view_lay.addWidget(bounds_box)
-        view_lay.addWidget(self._make_expander('X-axis interpretation', axis_content, expanded=False))
+    def _dat_number(self, field):
+        return self.dat_properties.number(field)
 
-        annotation_box = QGroupBox("Labels")
-        self._shared_annotations_box = annotation_box
-        top_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        annotation_lay = QVBoxLayout(annotation_box)
-        annotation_lay.setContentsMargins(8, 14, 8, 6)
-        annotation_lay.setSpacing(4)
-        annotation_lay.addLayout(top_form)
-        annotation_lay.addWidget(self._make_expander('Label templates', template_content, expanded=False))
+    def _dat_project_number(self, field, value):
+        view = self._dat_view()
+        view.bounds[field] = float(value)
+        if field in ('xmin', 'xmax'):
+            view.x_limits = (view.bounds['xmin'], view.bounds['xmax'])
+        elif field in ('ymin', 'ymax'):
+            view.y_limits = (view.bounds['ymin'], view.bounds['ymax'])
 
-        lay.addWidget(color_box)
-        lay.addWidget(view_box)
-        lay.addWidget(annotation_box)
+    def _dat_lock(self, field):
+        return bool(self._dat_view().locks[field])
 
-        self.color_scale_combo.currentIndexChanged.connect(self._on_color_scale_changed)
-        self._sync_region_controls()
-        protect_disclosure_drafts(w)
+    def _dat_annotation(self, field):
+        return self._dat_view().annotations[field]
 
-        return w
+    def _dat_status(self, field, text):
+        self.dat_properties.status(field, text)
+
+    def _commit_dat_numbers(self, numbers):
+        with self._edit_transaction('DAT numeric properties', RANGE_FIELDS + COLOR_FIELDS + ('view.norm', 'view.color_region_boundaries')):
+            view = self._dat_view()
+            # Install every numeric draft before an automatic handler reads one.
+            for field, value in numbers.items():
+                if field in BOUNDS:
+                    view.bounds[field] = value
+            for field in ('vmin', 'vmax'):
+                if field in numbers:
+                    view.locks[field] = True
+            if 'linthresh' in numbers:
+                view.norm = NormSpec(view.norm.kind, numbers['linthresh'])
+            for field in ('edge0', 'edge1'):
+                if field in numbers:
+                    self._on_color_region_boundary_changed(int(field[-1]), numbers[field], render=False)
+            xy = next((field for field in ('xmin', 'xmax', 'ymin', 'ymax') if field in numbers), None)
+            if xy is not None:
+                self._on_view_limit_changed(xy)
+            elif 'linthresh' in numbers:
+                self._on_color_mapping_changed()
+            for field in ('vmin', 'vmax'):
+                if field in numbers:
+                    # Restore explicit drafts after automatic regional/range work.
+                    view.bounds[field] = numbers[field]
+                    self._on_view_limit_changed(field)
+            if any(field in numbers for field in ('edge0', 'edge1')):
+                self._plot_cube()
+            self._capture_dataset_controls(visual_only=True)
+
 
     # ── Find Peaks tab ────────────────────────────────────────────────────────
 
-    def _build_find_peak_tab(self) -> QWidget:
-        tab = QWidget()
-        lay = QVBoxLayout(tab)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(5)
-
-        # ── Detection Mode ────────────────────────────────────────────────────
-        mode_box = QGroupBox("Detection Mode")
-        mode_l = QVBoxLayout(mode_box)
-        mode_l.setContentsMargins(10, 14, 10, 8)
-        mode_l.setSpacing(16)
-        self._orig_radio = QRadioButton("Original Spectrum")
-        self._d2_radio = QRadioButton("2nd Derivative")
-        self._orig_radio.setToolTip(
-            "Find peaks directly from the spectrum intensity.\nBest for clean, well-separated traces."
-        )
-        self._d2_radio.setToolTip(
-            "Compute the second derivative to locate shoulders and overlapping peaks.\n"
-            "More robust for noisy or closely spaced features."
-        )
-        self._orig_radio.setChecked(True)
-        mode_l.addWidget(self._orig_radio)
-        mode_l.addWidget(self._d2_radio)
-        mode_l.addStretch(1)
-        lay.addWidget(mode_box)
-
-        # ── Original spectrum params ──────────────────────────────────────────
-        self._orig_params_widget = QWidget()
-        orig_form = QFormLayout(self._orig_params_widget)
-        orig_form.setContentsMargins(2, 2, 2, 2)
-        orig_form.setSpacing(3)
-        orig_form.setHorizontalSpacing(8)
-        orig_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        orig_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        self.peak_mode_combo = QComboBox()
-        self.peak_mode_combo.addItems(["Peaks", "Dips", "Both"])
-        self.peak_mode_combo.setToolTip("Peaks = maxima; Dips = minima; Both = detect each independently.")
-
-        self.prom_spin = QDoubleSpinBox()
-        self.prom_spin.setDecimals(4)
-        self.prom_spin.setRange(0.0, 1.0)
-        self.prom_spin.setSingleStep(0.005)
-        self.prom_spin.setValue(0.05)
-        self.prom_spin.setToolTip(
-            "Minimum prominence as a fraction of the signal range.\n"
-            "Higher = only the tallest peaks pass; Lower = more sensitive."
-        )
-
-        self.distance_spin = QSpinBox()
-        self.distance_spin.setRange(1, 1000)
-        self.distance_spin.setValue(5)
-        self.distance_spin.setToolTip("Minimum separation between peaks in sample points.")
-
-        self.max_peaks_spin = QSpinBox()
-        self.max_peaks_spin.setRange(1, 30)
-        self.max_peaks_spin.setValue(6)
-        self.max_peaks_spin.setToolTip("Keep at most this many peaks after sorting by prominence.")
-
-        self.max_dips_spin = QSpinBox()
-        self.max_dips_spin.setRange(1, 30)
-        self.max_dips_spin.setValue(6)
-        self.max_dips_spin.setToolTip("Keep at most this many dips after sorting by prominence (Both mode only).")
-
-        self.peak_smooth_chk = QCheckBox("Enable")
-        self.peak_smooth_chk.setToolTip("Smooth the trace before peak finding to suppress noise spikes.")
-        self.peak_smooth_win_spin = QSpinBox()
-        self.peak_smooth_win_spin.setRange(3, 501)
-        self.peak_smooth_win_spin.setValue(11)
-        self.peak_smooth_win_spin.setMaximumWidth(65)
-        self.peak_smooth_win_spin.setToolTip("Savitzky-Golay window length (must be odd).")
-        smooth_row = self._hrow([self.peak_smooth_chk, QLabel("Win:"), self.peak_smooth_win_spin])
-
-        orig_form.addRow("Type:", self.peak_mode_combo)
-        orig_form.addRow("Prominence:", self.prom_spin)
-        orig_form.addRow("Min Distance:", self.distance_spin)
-        orig_form.addRow("Max Peaks:", self.max_peaks_spin)
-        orig_form.addRow("Max Dips:", self.max_dips_spin)
-        orig_form.addRow("Pre-smooth:", smooth_row)
-        # Hide Max Dips row until "Both" is selected
-        orig_form.labelForField(self.max_dips_spin).setVisible(False)
-        self.max_dips_spin.setVisible(False)
-
-        # ── Second-derivative params ──────────────────────────────────────────
-        self._d2_params_widget = QWidget()
-        d2_form = QFormLayout(self._d2_params_widget)
-        d2_form.setContentsMargins(2, 2, 2, 2)
-        d2_form.setSpacing(3)
-        d2_form.setHorizontalSpacing(8)
-        d2_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        d2_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        self.d2_mode_combo = QComboBox()
-        self.d2_mode_combo.addItems(["Peaks", "Dips", "Both"])
-        self.d2_mode_combo.setToolTip("Peaks = maxima; Dips = minima; Both = detect each independently.")
-
-        self.d2_sg_win_spin = QSpinBox()
-        self.d2_sg_win_spin.setRange(3, 501)
-        self.d2_sg_win_spin.setValue(11)
-        self.d2_sg_win_spin.setToolTip("Savitzky-Golay window for computing the second derivative (must be odd).")
-
-        self.d2_sg_poly_spin = QSpinBox()
-        self.d2_sg_poly_spin.setRange(1, 6)
-        self.d2_sg_poly_spin.setValue(3)
-        self.d2_sg_poly_spin.setToolTip("Polynomial order for the Savitzky-Golay filter.")
-
-        self.d2_prom_spin = QDoubleSpinBox()
-        self.d2_prom_spin.setDecimals(4)
-        self.d2_prom_spin.setRange(0.0, 1.0)
-        self.d2_prom_spin.setSingleStep(0.005)
-        self.d2_prom_spin.setValue(0.03)
-        self.d2_prom_spin.setToolTip("Prominence threshold as fraction of the d² signal range.")
-
-        self.d2_dist_spin = QSpinBox()
-        self.d2_dist_spin.setRange(1, 1000)
-        self.d2_dist_spin.setValue(3)
-        self.d2_dist_spin.setToolTip("Minimum separation between detected peaks in sample points.")
-
-        self.d2_sep_spin = QDoubleSpinBox()
-        self.d2_sep_spin.setDecimals(5)
-        self.d2_sep_spin.setRange(0.0, 100.0)
-        self.d2_sep_spin.setSingleStep(0.001)
-        self.d2_sep_spin.setValue(0.0)
-        self.d2_sep_spin.setToolTip("Minimum peak separation in energy units. 0 = use sample-point distance only.")
-
-        self.d2_max_peaks_spin = QSpinBox()
-        self.d2_max_peaks_spin.setRange(1, 30)
-        self.d2_max_peaks_spin.setValue(6)
-        self.d2_max_peaks_spin.setToolTip("Maximum candidates to keep after sorting by d² prominence.")
-
-        self.d2_max_dips_spin = QSpinBox()
-        self.d2_max_dips_spin.setRange(1, 30)
-        self.d2_max_dips_spin.setValue(6)
-        self.d2_max_dips_spin.setToolTip("Maximum dip candidates to keep by d² prominence (Both mode only).")
-
-        self.d2_target_spin = QSpinBox()
-        self.d2_target_spin.setRange(0, 30)
-        self.d2_target_spin.setValue(0)
-        self.d2_target_spin.setToolTip(
-            "0 = keep top-N by Max Peaks.\n"
-            "N > 0 = keep exactly N candidates sorted by d² prominence."
-        )
-
-        d2_form.addRow("Type:", self.d2_mode_combo)
-        d2_form.addRow("SG Window:", self.d2_sg_win_spin)
-        d2_form.addRow("SG Poly Order:", self.d2_sg_poly_spin)
-        d2_form.addRow("D² Prominence:", self.d2_prom_spin)
-        d2_form.addRow("Min Distance:", self.d2_dist_spin)
-        d2_form.addRow("Min Sep (energy):", self.d2_sep_spin)
-        d2_form.addRow("Max Peaks:", self.d2_max_peaks_spin)
-        d2_form.addRow("Max Dips:", self.d2_max_dips_spin)
-        d2_form.addRow("Target Count:", self.d2_target_spin)
-        # Hide Max Dips row until "Both" is selected
-        d2_form.labelForField(self.d2_max_dips_spin).setVisible(False)
-        self.d2_max_dips_spin.setVisible(False)
-        self._d2_params_widget.setVisible(False)
-
-        params_box = QGroupBox("Detection Parameters")
-        params_l = QVBoxLayout(params_box)
-        params_l.setContentsMargins(8, 14, 8, 8)
-        params_l.setSpacing(4)
-        params_l.addWidget(self._orig_params_widget)
-        params_l.addWidget(self._d2_params_widget)
-        lay.addWidget(params_box)
-
-        # ── Primary Actions ───────────────────────────────────────────────────
-        action_row = QVBoxLayout()
-        action_row.setSpacing(6)
-        self.find_btn = QPushButton("Find Peaks (This Gate)")
-        self.batch_find_btn = QPushButton("Find Peaks — All Gates")
-        self.find_btn.setToolTip(
-            "Detect peaks on the currently displayed spectrum trace only.\n"
-            "Result appears as markers on the spectrum plot."
-        )
-        self.batch_find_btn.setToolTip(
-            "Run peak detection on every gate and overlay results on the heatmap.\n"
-            "Use this before 'Batch Fit All Gates' in the Peak Fit tab."
-        )
-        self.find_btn.setStyleSheet(_STYLE_PRIMARY)
-        self.batch_find_btn.setStyleSheet(_STYLE_PRIMARY)
-        action_row.addWidget(self.find_btn, 1)
-        action_row.addWidget(self.batch_find_btn, 1)
-        lay.insertLayout(0, action_row)
-        self.peak_validation_label = QLabel()
-        self.peak_validation_label.setWordWrap(True)
-        self.peak_validation_label.setAccessibleName('Peak detection input guidance')
-        lay.insertWidget(1, self.peak_validation_label)
-
-        # ── Heatmap Tools ─────────────────────────────────────────────────────
-        heatmap_box = QGroupBox("Heatmap Peak Editing")
-        heatmap_l = QVBoxLayout(heatmap_box)
-        heatmap_l.setContentsMargins(8, 14, 8, 8)
-        heatmap_l.setSpacing(5)
-
-        # Lasso + circle toggles row
-        mode_btn_row = QVBoxLayout()
-        mode_btn_row.setSpacing(6)
-        self.lasso_mode_btn = QPushButton("Lasso Select")
-        self.lasso_mode_btn.setCheckable(True)
-        self.lasso_mode_btn.setToolTip(
-            "Enable lasso mode: drag a freehand region on the heatmap to select\n"
-            "all-gate peaks inside it. Normal gate selection is temporarily disabled."
-        )
-        self.lasso_mode_btn.setStyleSheet(_STYLE_TOGGLE)
-        self.circle_delete_btn = QPushButton("Circle Delete")
-        self.circle_delete_btn.setCheckable(True)
-        self.circle_delete_btn.setToolTip(
-            "Enable circle-delete mode: drag on the heatmap to define a circle\n"
-            "and delete all all-gate peaks inside it."
-        )
-        self.circle_delete_btn.setStyleSheet(_STYLE_TOGGLE)
-        mode_btn_row.addWidget(self.lasso_mode_btn, 1)
-        mode_btn_row.addWidget(self.circle_delete_btn, 1)
-        heatmap_l.addLayout(mode_btn_row)
-
-        # Lasso helper hint (shown only when lasso is active)
-        self.lasso_helper_label = QLabel(
-            "Lasso active — drag on the heatmap to select peaks, then delete or clear below."
-        )
-        self.lasso_helper_label.setWordWrap(True)
-        self.lasso_helper_label.setStyleSheet(
-            "color: #e65100; font-size: 10px;"
-            "background: #fff3e0; border-radius: 3px; padding: 3px 5px;"
-        )
-        self.lasso_helper_label.setVisible(False)
-        heatmap_l.addWidget(self.lasso_helper_label)
-
-        # Lasso action row
-        lasso_action_row = QVBoxLayout()
-        lasso_action_row.setSpacing(6)
-        self.delete_lasso_btn = QPushButton("Delete Lasso\nSelection")
-        self.delete_lasso_btn.setEnabled(False)
-        self.delete_lasso_btn.setToolTip("Delete every heatmap peak inside the current lasso selection.")
-        self.delete_lasso_btn.setStyleSheet(_STYLE_DANGER)
-        self.clear_lasso_btn = QPushButton("Clear Selection")
-        self.clear_lasso_btn.setEnabled(False)
-        self.clear_lasso_btn.setToolTip("Keep the peaks but clear the lasso highlight.")
-        self.clear_lasso_btn.setStyleSheet(_STYLE_MUTED)
-        lasso_action_row.addWidget(self.delete_lasso_btn, 1)
-        lasso_action_row.addWidget(self.clear_lasso_btn, 1)
-        heatmap_l.addLayout(lasso_action_row)
-
-        # Global cleanup row
-        global_row = QVBoxLayout()
-        global_row.setSpacing(6)
-        self.clear_batch_peaks_btn = QPushButton("Clear All\nHeatmap Peaks")
-        self.clear_batch_peaks_btn.setToolTip(
-            "Remove every detected all-gates peak from the heatmap overlay.\n"
-            "This does not affect single-gate trace peaks."
-        )
-        self.clear_batch_peaks_btn.setStyleSheet(_STYLE_DANGER)
-        self.save_peaks_csv_btn = QPushButton("Save Peaks CSV")
-        self.save_peaks_csv_btn.setToolTip(
-            "Save the peaks currently overlaid on the heatmap to a CSV file.\n"
-            "If no all-gates overlay exists, exports the current gate peaks only."
-        )
-        self.save_peaks_csv_btn.setStyleSheet(_STYLE_MUTED)
-        global_row.addWidget(self.clear_batch_peaks_btn, 1)
-        global_row.addWidget(self.save_peaks_csv_btn, 1)
-        heatmap_l.addLayout(global_row)
-        lay.addWidget(heatmap_box)
-
-        # ── Current Trace Editing ─────────────────────────────────────────────
-        trace_box = QGroupBox("Current-Trace Peak Editing")
-        trace_l = QVBoxLayout(trace_box)
-        trace_l.setContentsMargins(8, 14, 8, 8)
-        trace_l.setSpacing(5)
-
-        self.peak_delete_spin = QSpinBox()
-        self.peak_delete_spin.setRange(1, 1)
-        self.peak_delete_spin.setValue(1)
-        self.peak_delete_spin.setMaximumWidth(60)
-        self.peak_delete_spin.setToolTip("Choose which numbered peak to remove from the current gate trace.")
-
-        self.delete_peak_btn = QPushButton("Delete Peak #")
-        self.delete_peak_btn.setToolTip("Delete the peak selected by the spinner above from the current trace.")
-        self.delete_peak_btn.setStyleSheet(_STYLE_DANGER)
-
-        self.clear_peaks_btn = QPushButton("Clear All Trace Peaks")
-        self.clear_peaks_btn.setToolTip("Remove all peaks from the current gate trace.")
-        self.clear_peaks_btn.setStyleSheet(_STYLE_DANGER)
-
-        del_row = QVBoxLayout()
-        del_row.setSpacing(6)
-        del_row.addWidget(QLabel("Peak #:"))
-        del_row.addWidget(self.peak_delete_spin)
-        del_row.addWidget(self.delete_peak_btn, 1)
-        trace_l.addLayout(del_row)
-        trace_l.addWidget(self.clear_peaks_btn)
-        lay.addWidget(trace_box)
-
-        # ── Interaction hint ──────────────────────────────────────────────────
-        hint = QLabel(
-            "Spectrum: L-click = add peak  |  R-click = remove nearest  |  Drag near peak = move\n"
-            "Heatmap: L-click = jump to gate  |  R-click = remove peak on gate line"
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet(
-            "color: #607d8b; font-size: 10px;"
-            "background: #f0f4f8; border-radius: 3px; padding: 3px 5px;"
-        )
-        lay.addWidget(hint)
-        lay.addStretch(1)
-
-        # ── wire signals ──────────────────────────────────────────────────────
-        self._orig_radio.toggled.connect(self._on_detect_mode_changed)
-        self.peak_mode_combo.currentTextChanged.connect(self._on_orig_type_changed)
-        self.d2_mode_combo.currentTextChanged.connect(self._on_d2_type_changed)
-        self.find_btn.clicked.connect(self._on_find_peaks)
-        self.batch_find_btn.clicked.connect(self._on_batch_find_peaks_all_gates)
-        self.lasso_mode_btn.toggled.connect(self._on_lasso_mode_toggled)
-        self.delete_lasso_btn.clicked.connect(self._on_delete_lasso_selection)
-        self.clear_lasso_btn.clicked.connect(self._on_clear_lasso_selection)
-        self.save_peaks_csv_btn.clicked.connect(self._on_save_peaks_csv)
-        self.circle_delete_btn.toggled.connect(self._on_toggle_circle_delete_mode)
-        self.clear_batch_peaks_btn.clicked.connect(self._on_clear_batch_peaks)
-        self.peak_delete_spin.valueChanged.connect(lambda _: self._update_spectrum_only())
-        self.delete_peak_btn.clicked.connect(self._on_delete_peak_by_number)
-        self.clear_peaks_btn.clicked.connect(self._on_clear_peaks)
-
-        self._refresh_peak_delete_controls()
-        return tab
-
-    # ── Peak Fit tab ──────────────────────────────────────────────────────────
-
-    def _build_lorentz_fit_tab(self) -> QWidget:
-        tab = QWidget()
-        lay = QVBoxLayout(tab)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(8)
-
-        # ── Seeds Source ──────────────────────────────────────────────────────
-        seeds_box = QGroupBox("Initial Peak Seeds")
-        seeds_l = QVBoxLayout(seeds_box)
-        seeds_l.setContentsMargins(8, 14, 8, 8)
-        seeds_l.setSpacing(5)
-
-        self._seeds_from_find_peak_radio = QRadioButton("From Find Peaks tab")
-        self._seeds_from_csv_radio = QRadioButton("From CSV file")
-        self._seeds_from_find_peak_radio.setToolTip(
-            "Use the peaks detected in the Find Peaks tab as initial centers for fitting.\n"
-            "Run 'Find Peaks – All Gates' first for batch fitting."
-        )
-        self._seeds_from_csv_radio.setToolTip(
-            "Load a CSV with columns [gate, peak_energy] to use as fit seeds.\n"
-            "Useful when you have known peak positions from a reference."
-        )
-        self._seeds_from_find_peak_radio.setChecked(True)
-        seeds_l.addWidget(self._seeds_from_find_peak_radio)
-        seeds_l.addWidget(self._seeds_from_csv_radio)
-
-        self._csv_seeds_row = QWidget()
-        csv_row_l = QHBoxLayout(self._csv_seeds_row)
-        csv_row_l.setContentsMargins(0, 2, 0, 0)
-        csv_row_l.setSpacing(6)
-        self.load_seeds_csv_btn = QPushButton("Load Seeds CSV…")
-        self.load_seeds_csv_btn.setToolTip("Open a CSV file with [gate, peak_energy] columns.")
-        self.load_seeds_csv_btn.setStyleSheet(_STYLE_MUTED)
-        self._csv_path_label = QLabel("(none loaded)")
-        self._csv_path_label.setStyleSheet(
-            "color: #607d8b; font-size: 10px; font-style: italic;"
-        )
-        csv_row_l.addWidget(self.load_seeds_csv_btn)
-        csv_row_l.addWidget(self._csv_path_label, 1)
-        self._csv_seeds_row.setVisible(False)
-        seeds_l.addWidget(self._csv_seeds_row)
-        lay.addWidget(seeds_box)
-
-        # Axis info label
-        self.fit_axis_label = QLabel("Analysis axis: no file loaded.")
-        self.fit_axis_label.setWordWrap(True)
-        self.fit_axis_label.setStyleSheet(
-            "color: #607d8b; font-size: 10px;"
-            "background: #f0f4f8; border-radius: 3px; padding: 3px 5px;"
-        )
-        lay.addWidget(self.fit_axis_label)
-
-        # ── Fit Range ─────────────────────────────────────────────────────────
-        range_box = QGroupBox("Fit Range")
-        range_form = QFormLayout(range_box)
-        range_form.setContentsMargins(8, 14, 8, 8)
-        range_form.setSpacing(5)
-        range_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-
-        self.fit_xmin_spin = QDoubleSpinBox()
-        self.fit_xmax_spin = QDoubleSpinBox()
-        for sp in (self.fit_xmin_spin, self.fit_xmax_spin):
-            sp.setDecimals(6)
-            sp.setRange(-1e12, 1e12)
-            sp.setSingleStep(0.01)
-            sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            sp.setToolTip(
-                "Constrain the fit to this x-axis window.\n"
-                "Data outside this range is ignored by the optimizer."
-            )
-        self.fit_xmin_lock = QCheckBox("Fix")
-        self.fit_xmax_lock = QCheckBox("Fix")
-        for ck in (self.fit_xmin_lock, self.fit_xmax_lock):
-            ck.setToolTip("When checked, this limit is not overwritten by 'Full Range'")
-        self._fit_lock_controls = {
-            self.fit_xmin_spin: self.fit_xmin_lock,
-            self.fit_xmax_spin: self.fit_xmax_lock,
-        }
-
-        self.fit_full_btn = QPushButton("Full Range")
-        self.fit_full_btn.setToolTip("Reset the fit range to the full x-axis span of the loaded file.")
-        self.fit_full_btn.setStyleSheet(_STYLE_MUTED)
-
-        self.use_current_x_range_btn = QPushButton("Use Current X Range")
-        self.use_current_x_range_btn.setToolTip(
-            "Copy the currently visible heatmap X bounds into the independent fit range."
-        )
-        self.use_current_x_range_btn.setStyleSheet(_STYLE_MUTED)
-
-        xmax_w = QWidget()
-        xmax_l = QHBoxLayout(xmax_w)
-        xmax_l.setContentsMargins(0, 0, 0, 0)
-        xmax_l.setSpacing(4)
-        xmax_l.addWidget(self._view_spin_row(self.fit_xmax_spin, self.fit_xmax_lock))
-
-        self.fit_smooth_chk = QCheckBox("Enable")
-        self.fit_smooth_chk.setToolTip(
-            "Apply Savitzky-Golay smoothing to the trace before fitting.\n"
-            "Helps when noise is destabilizing curve_fit convergence."
-        )
-        self.fit_smooth_win_spin = QSpinBox()
-        self.fit_smooth_win_spin.setRange(3, 501)
-        self.fit_smooth_win_spin.setValue(11)
-        self.fit_smooth_win_spin.setMaximumWidth(65)
-        self.fit_smooth_win_spin.setToolTip("Savitzky-Golay window length (must be odd).")
-        smooth_row = self._hrow([self.fit_smooth_chk, QLabel("Win:"), self.fit_smooth_win_spin])
-
-        range_form.addRow("xmin:", self._view_spin_row(self.fit_xmin_spin, self.fit_xmin_lock))
-        range_form.addRow("xmax:", xmax_w)
-        range_form.addRow(self.fit_full_btn)
-        range_form.addRow("Visible X:", self.use_current_x_range_btn)
-        self.fit_range_summary_label = QLabel("Detection range: —\nFit range: —")
-        self.fit_range_summary_label.setWordWrap(True)
-        self.fit_range_summary_label.setStyleSheet(
-            "color: #607d8b; font-size: 10px; background: #f0f4f8;"
-            " border-radius: 3px; padding: 3px 5px;"
-        )
-        range_form.addRow(self.fit_range_summary_label)
-        range_form.addRow("Pre-smooth:", smooth_row)
-        lay.addWidget(range_box)
-
-        # ── Fit Parameters ────────────────────────────────────────────────────
-        params_box = QGroupBox("Fit Parameters")
-        params_form = QFormLayout(params_box)
-        params_form.setContentsMargins(8, 14, 8, 8)
-        params_form.setSpacing(5)
-        params_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-
-        self.fit_model_combo = QComboBox()
-        self.fit_model_combo.addItems(["Lorentzian", "Gaussian", "Voigt"])
-        self.fit_model_combo.setCurrentText("Lorentzian")
-        self.fit_model_combo.setToolTip(
-            "Lorentzian: Cauchy-Lorentz lineshape — wider tails, typical for spectral lines.\n"
-            "Gaussian: Gaussian lineshape — narrower tails, typical for inhomogeneous broadening."
-        )
-
-        self.lw_min_spin = QSpinBox()
-        self.lw_min_spin.setRange(0, 10000)
-        self.lw_min_spin.setSingleStep(1)
-        self.lw_min_spin.setValue(10)
-        self.lw_min_spin.setSuffix(" pt")
-        self.lw_min_value_label = QLabel(self._format_pts_conversion(int(self.lw_min_spin.value())))
-        self.lw_min_value_label.setStyleSheet("color: #607d8b; font-size: 10px;")
-
-        self.lw_max_spin = QSpinBox()
-        self.lw_max_spin.setRange(0, 10000)
-        self.lw_max_spin.setSingleStep(1)
-        self.lw_max_spin.setValue(50)
-        self.lw_max_spin.setSuffix(" pt")
-        self.lw_max_value_label = QLabel(self._format_pts_conversion(int(self.lw_max_spin.value())))
-        self.lw_max_value_label.setStyleSheet("color: #607d8b; font-size: 10px;")
-
-        self.peak_move_limit_spin = QSpinBox()
-        self.peak_move_limit_spin.setRange(0, 10000)
-        self.peak_move_limit_spin.setSingleStep(1)
-        self.peak_move_limit_spin.setValue(10)
-        self.peak_move_limit_spin.setSuffix(" pt")
-        self.peak_move_limit_spin.setToolTip(
-            "Maximum allowed shift of the fitted center from its seed in data points.\n"
-            "0 = unconstrained. The equivalent size in the current analysis-axis units is shown to the right."
-        )
-        self.peak_move_value_label = QLabel(self._format_pts_conversion(int(self.peak_move_limit_spin.value())))
-        self.peak_move_value_label.setStyleSheet("color: #607d8b; font-size: 10px;")
-
-        self.maxfev_spin = QSpinBox()
-        self.maxfev_spin.setRange(100, 2000000)
-        self.maxfev_spin.setValue(20000)
-        self.maxfev_spin.setSingleStep(5000)
-        self.maxfev_spin.setToolTip(
-            "Maximum number of function evaluations for scipy.optimize.curve_fit.\n"
-            "Increase if fits are failing due to non-convergence."
-        )
-
-        params_form.addRow("Line Shape:", self.fit_model_combo)
-        self.lw_min_name_label = QLabel()
-        self.lw_max_name_label = QLabel()
-        params_form.addRow(self.lw_min_name_label, self._hrow([self.lw_min_spin, self.lw_min_value_label]))
-        params_form.addRow(self.lw_max_name_label, self._hrow([self.lw_max_spin, self.lw_max_value_label]))
-        self.fit_width_help_label = QLabel()
-        self.fit_width_help_label.setWordWrap(True)
-        self.fit_width_help_label.setStyleSheet("color: #607d8b; font-size: 10px;")
-        params_form.addRow(self.fit_width_help_label)
-        params_form.addRow("Max Peak Shift:", self._hrow([self.peak_move_limit_spin, self.peak_move_value_label]))
-        params_form.addRow("Max Iterations:", self.maxfev_spin)
-        self._update_fit_param_unit_labels()
-        lay.addWidget(params_box)
-
-        # ── Primary fit actions ────────────────────────────────────────────────
-        fit_action_row = QVBoxLayout()
-        fit_action_row.setSpacing(6)
-        self.fit_btn = QPushButton("Fit Current Gate")
-        self.batch_fit_btn = QPushButton("Batch Fit All Gates")
-        self.fit_btn.setToolTip(
-            "Fit the currently displayed gate trace using seeds from the active source.\n"
-            "Result overlaid immediately on the spectrum plot."
-        )
-        self.batch_fit_btn.setToolTip(
-            "Fit every gate using seeds from the active source.\n"
-            "Requires 'Find Peaks – All Gates' (or a seeds CSV) to have been run first."
-        )
-        self.fit_btn.setStyleSheet(_STYLE_PRIMARY)
-        self.batch_fit_btn.setStyleSheet(_STYLE_PRIMARY)
-        fit_action_row.addWidget(self.fit_btn, 1)
-        fit_action_row.addWidget(self.batch_fit_btn, 1)
-        lay.insertLayout(0, fit_action_row)
-
-        # One context-sensitive current-gate action: it detects first when no
-        # Find Peaks seeds exist, and fits directly once seeds are ready.
-        self.detect_then_fit_btn = self.fit_btn
-        self.fit_readiness_label = QLabel("Fit preparation: load data first.")
-        self.fit_readiness_label.setWordWrap(True)
-        self.fit_readiness_label.setStyleSheet("color: #607d8b; font-size: 10px;")
-        lay.insertWidget(1, self.fit_readiness_label)
-
-        # ── Secondary actions ──────────────────────────────────────────────────
-        secondary_row = QVBoxLayout()
-        secondary_row.setSpacing(6)
-        self.clear_fit_btn = QPushButton("Clear Fit")
-        self.export_current_fit_btn = QPushButton("Export Current Gate\nCSV")
-        self.export_all_fit_btn = QPushButton("Export All Results\nCSV")
-        self.clear_fit_btn.setToolTip("Remove the fit overlay from the spectrum plot.")
-        self.export_current_fit_btn.setToolTip("Save only the selected gate's fit result to CSV.")
-        self.export_all_fit_btn.setToolTip(
-            "Save all individually fitted and batch-fitted gates, including recorded failures, to CSV."
-        )
-        self.clear_fit_btn.setStyleSheet(_STYLE_MUTED)
-        self.export_current_fit_btn.setStyleSheet(_STYLE_MUTED)
-        self.export_all_fit_btn.setStyleSheet(_STYLE_MUTED)
-        secondary_row.addWidget(self.clear_fit_btn, 1)
-        secondary_row.addWidget(self.export_current_fit_btn, 1)
-        secondary_row.addWidget(self.export_all_fit_btn, 1)
-        lay.addLayout(secondary_row)
-
-        self.export_spec_btn = QPushButton("Export Spectrum CSV")
-        self.export_spec_btn.setToolTip(
-            "Save the current gate's raw spectrum, fit-range mask, and smoothed analysis trace to CSV."
-        )
-        self.export_spec_btn.setStyleSheet(_STYLE_MUTED)
-        lay.addWidget(self.export_spec_btn)
-
-        lay.addStretch(1)
-
-        # ── wire signals ──────────────────────────────────────────────────────
-        self._seeds_from_csv_radio.toggled.connect(self._on_seed_source_changed)
-        self._seeds_from_find_peak_radio.toggled.connect(self._on_seed_source_changed)
-        self.load_seeds_csv_btn.clicked.connect(self._on_load_seeds_csv)
-        self.fit_xmin_spin.valueChanged.connect(self._on_fit_range_changed)
-        self.fit_xmax_spin.valueChanged.connect(self._on_fit_range_changed)
-        self.fit_full_btn.clicked.connect(self._on_set_fit_full_range)
-        self.use_current_x_range_btn.clicked.connect(self._on_use_current_x_range)
-        self.batch_fit_btn.clicked.connect(self._on_batch_fit_all_gates)
-        self.fit_btn.clicked.connect(self._on_fit_or_detect_current_gate)
-        self.clear_fit_btn.clicked.connect(self._on_clear_fit)
-        self.export_current_fit_btn.clicked.connect(self._on_export_current_fit_csv)
-        self.export_all_fit_btn.clicked.connect(self._on_export_all_fit_csv)
-        self.export_spec_btn.clicked.connect(self._on_export_spectrum_csv)
-        return tab
-
-    # ── plot panel ────────────────────────────────────────────────────────────
-
-    def _build_plot_panel(self) -> QWidget:
-        panel = QWidget()
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        self.figure = Figure(figsize=(8.0, 6.0), layout="none")
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.canvas.mpl_connect("resize_event", self._layout_live_plots)
-        self.canvas.mpl_connect("draw_event", self._update_live_heatmap_tick_contrast)
-        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.toolbar = _AnalysisNavigationToolbar(self.canvas, self)
-
-        analysis_header = QWidget()
-        header_layout = QVBoxLayout(analysis_header)
-        header_layout.setContentsMargins(8, 6, 8, 6)
-        self.analysis_back_btn = QPushButton('← Back to Workspace')
-        self.analysis_back_btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-        self.analysis_back_btn.clicked.connect(self._back_to_workspace)
-        header_layout.addWidget(self.analysis_back_btn, 0, Qt.AlignLeft)
-        self.analysis_context_label = QLabel()
-        self.analysis_context_label.setAccessibleName('Analysis source and scope')
-        self.analysis_context_label.setTextFormat(Qt.PlainText)
-        self.analysis_context_label.setWordWrap(True)
-        self.analysis_context_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        header_layout.addWidget(self.analysis_context_label, 1)
-        lay.addWidget(analysis_header)
-
-        # ── Gate navigation bar ───────────────────────────────────────────────
-        gate_bar = QFrame()
-        gate_bar.setFrameShape(QFrame.StyledPanel)
-        gate_bar.setStyleSheet(
-            "QFrame { background: #f5f7fa; border: none; border-bottom: 1px solid #ddd; }"
-        )
-        gate_lay = QHBoxLayout(gate_bar)
-        gate_lay.setContentsMargins(8, 4, 8, 4)
-        gate_lay.setSpacing(6)
-
-        gate_lbl = QLabel("Gate:")
-        gate_lbl.setStyleSheet("font-weight: 600; color: #444; font-size: 11px;")
-
-        self.plot_gate_spin = GateValueSpinBox()
-        self.plot_gate_spin.setDecimals(6)
-        self.plot_gate_spin.setRange(-1e12, 1e12)
-        self.plot_gate_spin.setKeyboardTracking(False)
-        self.plot_gate_spin.setMinimumWidth(120)
-        self.plot_gate_spin.setMaximumWidth(160)
-        self.plot_gate_spin.setToolTip(
-            "Current gate value. Spin or type to navigate; plot updates immediately."
-        )
-
-        sep_lbl = QLabel("|")
-        sep_lbl.setStyleSheet("color: #ccc; font-size: 14px;")
-
-        idx_lbl = QLabel("Index:")
-        idx_lbl.setStyleSheet("color: #555; font-size: 11px;")
-
-        self.plot_gate_index_spin = QSpinBox()
-        self.plot_gate_index_spin.setRange(1, 1)
-        self.plot_gate_index_spin.setMinimumWidth(55)
-        self.plot_gate_index_spin.setMaximumWidth(70)
-        self.plot_gate_index_spin.setToolTip("Gate index (1-based). Spin to step through all gates.")
-
-        self.plot_prev_gate_btn = QPushButton("◀")
-        self.plot_next_gate_btn = QPushButton("▶")
-        for btn in (self.plot_prev_gate_btn, self.plot_next_gate_btn):
-            btn.setFixedWidth(30)
-            btn.setFixedHeight(26)
-            btn.setStyleSheet(
-                "QPushButton {"
-                "  background: #fff; border: 1px solid #ccc; border-radius: 3px;"
-                "  font-size: 10px; color: #333;"
-                "}"
-                "QPushButton:hover { background: #e8f0fe; border-color: #1976d2; }"
-                "QPushButton:pressed { background: #c5d8fb; }"
-                "QPushButton:disabled { color: #bbb; border-color: #e0e0e0; }"
-            )
-        self.plot_prev_gate_btn.setToolTip("Step to the previous gate (←)")
-        self.plot_next_gate_btn.setToolTip("Step to the next gate (→)")
-
-        gate_lay.addWidget(gate_lbl)
-        gate_lay.addWidget(self.plot_gate_spin)
-        gate_lay.addWidget(self.plot_prev_gate_btn)
-        gate_lay.addWidget(self.plot_next_gate_btn)
-        gate_lay.addWidget(sep_lbl)
-        gate_lay.addWidget(idx_lbl)
-        gate_lay.addWidget(self.plot_gate_index_spin)
-        gate_lay.addStretch(1)
-
-        # Keep reference for legacy attribute access
-        self.plot_gate_row = gate_bar
-
-        toolbar_row = QWidget()
-        toolbar_lay = QHBoxLayout(toolbar_row)
-        toolbar_lay.setContentsMargins(0, 0, 0, 0)
-        toolbar_lay.setSpacing(6)
-        toolbar_lay.addWidget(self.toolbar, 1)
-        toolbar_lay.addWidget(QLabel('Display:'))
-        self.analysis_zoom_combo = QComboBox()
-        self.analysis_zoom_combo.addItems(['Fit', '100%', '150%', '200%'])
-        toolbar_lay.addWidget(self.analysis_zoom_combo)
-        lay.addWidget(toolbar_row)
-        lay.addWidget(gate_bar)
-        self.analysis_scroll = QScrollArea()
-        self.analysis_scroll.setWidgetResizable(True)
-        self.analysis_scroll.setAlignment(Qt.AlignCenter)
-        self.analysis_scroll.setWidget(self.canvas)
-        lay.addWidget(self.analysis_scroll, 1)
-        self.plot_tabs = QTabWidget()
-        self.plot_tabs.addTab(panel, 'Analysis')
-        self.graph_documents = GraphDocuments(self._activate_document, self._finish_close_document)
+    def _build_plot_panel(self):
+        from .analysis_header_bridge import AnalysisHeaderBridge
+        from .dat_canvas_controller import DatCanvasController, CanvasServices
+        from PySide6.QtGui import QAction
+        self.figure = Figure(figsize=(8., 6.), layout='none')
+        self.canvas = AnalysisFigureCanvas(self.figure)
+        self.canvas.mpl_connect('resize_event', self._layout_live_plots)
+        self.canvas.mpl_connect('draw_event', self._update_live_heatmap_tick_contrast)
+        self.toolbar = AnalysisNavigationController(self.canvas, self)
+        self._analysis_display_zoom = 'Fit'
+        self.analysis_header = AnalysisHeaderBridge(self)
+        self.dat_canvas = DatCanvasController(self.canvas, CanvasServices(
+            validate_peak_menu=self._peak_menu_request_valid, continue_peak_menu=self._continue_peak_menu,
+            cancel_canvas_gesture=lambda: self._cancel_canvas_gesture() if hasattr(self, 'dat_canvas') else None,
+            schedule_view_layout=self._schedule_view_layout), self)
+        self.dat_canvas.window = self
+        self.graph_documents = QuickDocuments(self._activate_document, self._finish_close_document, self,
+            tooltip=self._document_tooltip,
+            input_eligible=lambda: self._outer_view == 'workspace' and not self._project_busy() and not self._project_installing and not self._closing)
         self.graph_documents.layoutChanged.connect(self._schedule_plot_page_render)
         self.graph_documents.layoutChanged.connect(self._refresh_graph_commands)
         self.graph_documents.workspaceChanged.connect(self._schedule_project_modified)
         self.graph_documents.workspaceChanged.connect(self._refresh_navigator_active)
-        self.graph_command_host = QWidget()
-        self.graph_command_host.setAccessibleName('Active graph command bar')
-        self._graph_command_layout = QVBoxLayout(self.graph_command_host)
-        self._graph_command_layout.setContentsMargins(4, 2, 4, 2)
-        # A single command row reserves the same footprint for every document.
-        self.graph_command_host.setFixedHeight(40)
-        self._graph_command_stack = QStackedWidget()
-        self._graph_command_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self._graph_command_layout.addWidget(self._graph_command_stack)
-        self.workspace_command_context = QLabel('Open a Workbook or graph from Project.')
-        self.workspace_command_context.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self._graph_command_stack.addWidget(self.workspace_command_context)
-        self.workbook_commands = WorkbookPlotCommands()
+        self.graph_documents.workspaceChanged.connect(self._refresh_graph_commands)
+        self.workbook_commands = WorkbookPlotCommandsController(self)
         self.workbook_commands.targetSelected.connect(self._select_comparison_target)
         self.workbook_commands.targetPinChanged.connect(self._pin_comparison_target)
         self.workbook_commands.targetShowRequested.connect(self._show_comparison_target)
-        self.workbook_commands.repeatRequested.connect(
-            lambda sheet, target: self._add_sheet_comparison(sheet, target, include_existing=True))
-        self._graph_command_stack.addWidget(self.workbook_commands)
+        self.workbook_commands.repeatRequested.connect(lambda sheet, target: self._add_sheet_comparison(sheet, target, include_existing=True))
         self._fallback_plot_page = self._create_plot_page()
-        self._size_workspace_commands()
-        self._fallback_plot_page.setParent(self.graph_documents)
-        self._fallback_plot_page.hide()
         self.plot_page = self._fallback_plot_page
-        self.analysis_scroll.viewport().installEventFilter(self)
-        self.analysis_zoom_combo.currentTextChanged.connect(lambda text: self.plot_page.set_zoom(text))
-        self.export_png_btn = self.plot_page.export_png_btn
-        self._settings_menu = QMenu('Plot settings', self)
-        self._settings_copy_action = self._settings_menu.addAction('Copy settings', self._on_copy_plot_settings)
-        self._settings_paste_action = self._settings_menu.addAction('Paste settings…', self._on_paste_plot_settings)
-        self._settings_copy_to_action = self._settings_menu.addAction('Copy settings to active graphs…', self._on_copy_settings_to_datasets)
-        settings_button = QToolButton()
-        settings_button.setText('Settings')
-        settings_button.setMenu(self._settings_menu)
-        settings_button.setPopupMode(QToolButton.InstantPopup)
-        self.toolbar.addWidget(settings_button)
-        self._comparison_action = self.toolbar.addAction('Open comparison window')
-        self._comparison_action.triggered.connect(self._on_open_plot_comparison)
+        for name, text, handler in (
+            ('_settings_copy_action', 'Copy settings', self._on_copy_plot_settings),
+            ('_settings_paste_action', 'Paste settings…', self._on_paste_plot_settings),
+            ('_settings_copy_to_action', 'Copy settings to active graphs…', self._on_copy_settings_to_datasets),
+            ('_comparison_action', 'Open comparison window', self._on_open_plot_comparison)):
+            action = QAction(text, self); action.triggered.connect(handler); setattr(self, name, action)
+        self.analysis_navigation = AnalysisNavigationBridge(self, self.toolbar, {
+            'settings_copy': self._settings_copy_action, 'settings_paste': self._settings_paste_action,
+            'settings_copy_to': self._settings_copy_to_action, 'comparison': self._comparison_action})
+        self.analysis_header.stateChanged.connect(self.analysis_navigation.refresh)
+        self.dat_canvas.bind_navigation(self.analysis_navigation)
         self._refresh_transfer_controls()
-        self.plot_tabs.addTab(self.graph_documents, 'Workspace')
-        self.plot_tabs.tabBar().hide()
-        self.plot_tabs.installEventFilter(self)
-        self.plot_tabs.currentChanged.connect(self._on_plot_tab_changed)
-        workspace = QWidget()
-        workspace_layout = QVBoxLayout(workspace)
-        workspace_layout.setContentsMargins(0, 0, 0, 0)
-        workspace_layout.setSpacing(0)
-        workspace_layout.addWidget(self.graph_command_host)
-        workspace_layout.addWidget(self.plot_tabs, 1)
-        return workspace
 
     # =========================================================================
     #  Helper utilities
     # =========================================================================
 
     def _build_data_navigator(self):
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(6, 6, 6, 6)
-        header = QHBoxLayout()
-        header.addWidget(QLabel('Project'), 1)
-        self.import_xy_btn = QToolButton()
-        self.import_xy_btn.setText('Import')
-        self.import_xy_btn.setAccessibleName('Import data files')
-        self.import_xy_btn.setToolTip('Automatically import full tables into Workbooks: first column X, all remaining columns Y. Use Actions → Import with options for a preview.')
-        self.import_xy_btn.setFocusPolicy(Qt.StrongFocus)
-        self.import_xy_btn.clicked.connect(self._on_import_data)
-        header.addWidget(self.import_xy_btn)
-        self.project_actions_btn = QToolButton()
-        self.project_actions_btn.setText('Actions')
-        self.project_actions_btn.setAccessibleName('Project actions')
-        self.project_actions_btn.setToolTip('Open, compare, organize or remove Project items.')
-        self.project_actions_btn.setFocusPolicy(Qt.StrongFocus)
-        self.project_actions_menu = QMenu(self.project_actions_btn)
-        self.project_actions_menu.setToolTipsVisible(True)
-        self.project_actions_menu.addAction(self._graph_command_actions['import_options'])
-        self.project_actions_btn.setMenu(self.project_actions_menu)
-        self.project_actions_btn.setPopupMode(QToolButton.InstantPopup)
-        header.addWidget(self.project_actions_btn)
-        layout.addLayout(header)
-        self.new_comparison_action = self.project_actions_menu.addAction('New comparison graph', self._new_xy_comparison)
-        self.project_search = QLineEdit()
-        self.project_search.setPlaceholderText('Search names or source paths')
-        self.project_search.setClearButtonEnabled(True)
-        self.project_search.setAccessibleName('Search Project names and source paths')
-        layout.addWidget(self.project_search)
-        self.data_navigator = ProjectTreeWidget()
-        self.project_search.textChanged.connect(self.data_navigator.filter_items)
-        self.data_navigator.setHeaderHidden(True)
-        self.data_navigator.setAccessibleName('Data and graphs navigator')
-        self.data_navigator.setToolTip('Ctrl/Shift selects Sheets or Workbooks. Double-click or press Enter to open.')
-        self.data_navigator.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.data_navigator.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.data_navigator.itemDoubleClicked.connect(lambda *_: self._open_navigator_item(toggle_group=False))
-        self.data_navigator.installEventFilter(self)
-        self.data_navigator.itemSelectionChanged.connect(self._navigator_selection_changed)
-        self.data_navigator.customContextMenuRequested.connect(self._navigator_menu)
-        layout.addWidget(self.data_navigator, 1)
-        # Keep established command hooks as real menu actions, rather than
-        # maintaining invisible duplicate button stacks.
-        self.compare_sheets_btn = self.project_actions_menu.addAction('Compare selected data…', self._compare_selected_sheets)
-        self.merge_workbooks_btn = self.project_actions_menu.addAction('Move sheets and merge…', self._on_merge_workbooks)
-        self.project_actions_menu.addSeparator()
-        self.project_analyze_action = self.project_actions_menu.addAction(
-            'Analyze', lambda: self._open_analysis(self._project_analysis_source()))
-        self._navigator_buttons = {}
-        for text, handler in (('Open', self._open_navigator_item), ('Rename', self._rename_navigator_item),
-                              ('Remove', self._remove_navigator_item)):
-            self._navigator_buttons[text] = self.project_actions_menu.addAction(
-                text if text == 'Open' else text + '…', handler)
-        self.reload_source_action = self.project_actions_menu.addAction('Reload as new copy…', self._on_reload_source_copy)
-        self._file_menu.addAction(self.reload_source_action)
-        self.project_actions_menu.addSeparator()
-        self.add_gate_comparison_btn = self.project_actions_menu.addAction('Add current DAT Gate to comparison', self._add_current_gate_comparison)
-        self.add_gate_again_action = self.project_actions_menu.addAction('Add current DAT Gate again',
+        self.project = self.app_bridge.project
+        # These remain the authoritative QActions for menus and keyboard routes.
+        from PySide6.QtGui import QAction
+        def action(text, handler):
+            result = QAction(text, self)
+            result.triggered.connect(handler)
+            return result
+        self.new_comparison_action = action('New comparison graph', self._new_xy_comparison)
+        self.compare_sheets_btn = action('Compare selected data…', self._compare_selected_sheets)
+        self.merge_workbooks_btn = action('Move sheets and merge…', self._on_merge_workbooks)
+        self.project_analyze_action = action('Analyze', lambda: self._open_analysis(self._project_analysis_source()))
+        self._navigator_buttons = {
+            text: action(text if text == 'Open' else text + '…', handler)
+            for text, handler in (('Open', self._open_navigator_item), ('Rename', self._rename_navigator_item),
+                                  ('Remove', self._remove_navigator_item))}
+        self.reload_source_action = action('Reload as new copy…', self._on_reload_source_copy)
+        self._menu_groups['File'].append(CommandAction('reload', self.reload_source_action, self))
+        self.add_gate_comparison_btn = action('Add current DAT Gate to comparison', self._add_current_gate_comparison)
+        self.add_gate_again_action = action('Add current DAT Gate again',
             lambda: self._add_current_gate_comparison(include_existing=True))
-        self.project_actions_menu.aboutToShow.connect(self._refresh_navigator_actions)
-        self._project_panel_layout.addWidget(panel)
+        actions = [('import_options', self._graph_command_actions['import_options']),
+            ('new_comparison', self.new_comparison_action), ('compare', self.compare_sheets_btn),
+            ('merge', self.merge_workbooks_btn), ('analyze', self.project_analyze_action),
+            ('open', self._navigator_buttons['Open']), ('rename', self._navigator_buttons['Rename']),
+            ('remove', self._navigator_buttons['Remove']), ('reload', self.reload_source_action),
+            ('add_gate', self.add_gate_comparison_btn), ('add_gate_again', self.add_gate_again_action)]
+        adapters = {key: CommandAction(key, value, self.project) for key, value in actions}
+        self.project.bind_actions(CommandAction('import', self._graph_command_actions['import'], self.project),
+            list(adapters.values()), [adapters[key] for key in
+                ('open', 'analyze', 'compare', 'merge', 'rename', 'reload', 'remove')])
         self._refresh_data_navigator()
-
-    def _navigator_items(self):
-        """Visit every row, including collapsed source and document groups."""
-        def descendants(parent):
-            for index in range(parent.childCount()):
-                item = parent.child(index)
-                yield item
-                yield from descendants(item)
-        yield from descendants(self.data_navigator.invisibleRootItem())
 
     def _navigator_source_labels(self):
         paths = {}
@@ -3947,134 +2358,102 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return labels
 
     def _refresh_data_navigator(self):
-        if not hasattr(self, 'data_navigator'):
+        if not hasattr(self, 'project'):
             return
-        tree = self.data_navigator
-        current = tree.currentItem()
-        current_key = current.data(0, Qt.UserRole) if current else None
-        selected_keys = {item.data(0, Qt.UserRole) for item in tree.selectedItems()}
-        expanded = {item.data(0, Qt.UserRole): item.isExpanded() for item in self._navigator_items()}
-        scroll = (tree.horizontalScrollBar().value(), tree.verticalScrollBar().value())
-        items, source_items, owners = {}, {}, {}
+        rows, items, source_items, owners = [], {}, {}, {}
         source_labels = self._navigator_source_labels()
-        folder_icon = tree.style().standardIcon(QStyle.SP_DirIcon)
-        sheet_icon = tree.style().standardIcon(QStyle.SP_FileIcon)
-        heatmap_icon, comparison_icon = plot_icon('heatmap'), plot_icon('line')
 
-        def add(parent, key, label, icon, tooltip, description):
-            item = QTreeWidgetItem(parent, [label])
-            item.setData(0, Qt.UserRole, key)
-            item.setIcon(0, icon)
-            item.setToolTip(0, tooltip)
-            item.setData(0, Qt.UserRole + 2, tooltip)
-            item.setData(0, Qt.AccessibleDescriptionRole, description)
-            items[key] = item
-            return item
+        def add(parent, key, label, tooltip, description):
+            row = ProjectRow(key, label, parent, tooltip, description)
+            rows.append(row)
+            items[key] = row
+            return key
 
         def source_key(sheet):
             return _source_key(sheet.source_path) if sheet.source_path is not None else None
 
-        with QSignalBlocker(tree):
-            tree.clear()
-            for book in self.workspace.workbooks.values():
-                sheets = [self.workspace.sheets[sid] for sid in book.sheet_ids]
-                sources = {}
-                for sheet in sheets:
-                    sources.setdefault(source_key(sheet), []).append(sheet)
-                paths = [key for key in sources if key is not None]
-                label = book.name
-                if len(sources) == 1 and paths:
-                    path = sources[paths[0]][0].source_path
-                    # A user alias never replaces the full source filename.
-                    label = source_labels[paths[0]] if book.name == path.name else (
-                        book.name + '\u2028' + source_labels[paths[0]])
-                elif paths:
-                    label += f' · {len(paths)} sources'
-                    if None in sources:
-                        label += ' + embedded values'
-                else:
-                    label += f' · {len(sheets)} embedded Sheets'
-                item = add(tree, ('workbook', book.workbook_id), label, folder_icon,
-                           self._workbook_tooltip(book), 'Workbook')
-                for path_key, source_sheets in sources.items():
-                    parent = item
-                    if len(sources) > 1:
-                        path = source_sheets[0].source_path
-                        parent = add(item, ('group', ('source', book.workbook_id, path_key)),
-                                     source_labels[path_key] if path_key is not None else 'Embedded values',
-                                     folder_icon, str(path or 'Embedded values'), 'Source group')
-                    source_items[(book.workbook_id, path_key)] = parent
-                    data = add(parent, ('group', ('worksheets', book.workbook_id, path_key)),
-                               f'Worksheets ({len(source_sheets)})', sheet_icon,
-                               'Data sheets for this source', 'Worksheets group')
-                    for sheet in source_sheets:
-                        add(data, ('sheet', sheet.sheet_id), sheet.name, sheet_icon,
-                            str(sheet.source_path or 'Embedded values'), 'Worksheet')
-                        if sheet.kind == 'dat' and sheet.role == 'original':
-                            owners.setdefault(sheet.dataset_id, (book.workbook_id, path_key))
-
-            # Reloaded copies may have the same name and the same provenance.
-            # Retain the established numeric collision qualifier without hiding
-            # any part of the source filename or changing the Workbook name.
-            duplicate_labels = {}
-            for book in self.workspace.workbooks.values():
-                item = items[('workbook', book.workbook_id)]
-                duplicate_labels.setdefault(item.text(0).casefold(), []).append(item)
-            for duplicates in duplicate_labels.values():
-                if len(duplicates) > 1:
-                    for index, item in enumerate(duplicates, 1):
-                        item.setText(0, item.text(0) + f' ({index})')
-
-            # Match dataset identity to its Original sheet, never a filename.
-            # A detached/legacy dataset still has a stable reachable source row.
-            heatmaps = {}
-            for session in self.workspace.datasets.values():
-                graphs = [graph for graph in session.graphs.values() if graph.published]
-                if not graphs:
-                    continue
-                owner = owners.get(session.dataset_id)
-                parent = source_items.get(owner)
-                if parent is None:
-                    path = session.source_path
-                    parent = add(tree, ('group', ('dataset', session.dataset_id)),
-                                 source_labels[_source_key(path)] if path is not None else 'Embedded DAT',
-                                 folder_icon, str(path or 'Embedded DAT'), 'DAT source group')
-                parent_key = parent.data(0, Qt.UserRole)
-                heatmaps.setdefault(parent_key, (parent, []))[1].extend((session, graph) for graph in graphs)
-            for parent_key, (parent, graphs) in heatmaps.items():
-                group = add(parent, ('group', ('heatmaps', parent_key)), f'Heatmaps ({len(graphs)})',
-                            heatmap_icon, 'Published heatmap graphs for this source', 'Heatmaps group')
-                for session, graph in graphs:
-                    add(group, ('heatmap', (session.dataset_id, graph.graph_id)), graph.name,
-                        heatmap_icon, f'Heatmap: {graph.name}\n{session.source_path or "Embedded DAT"}',
-                        'Heatmap graph')
-            if self.workspace.comparisons:
-                group = add(tree, ('group', ('comparisons',)),
-                            f'Comparisons ({len(self.workspace.comparisons)})', comparison_icon,
-                            'Independent XY graphs; curves may use multiple sources', 'Comparisons group')
-                for comparison in self.workspace.comparisons.values():
-                    sources = set()
-                    for curve in comparison.curves.values():
-                        sheet = self.workspace.sheets.get(curve.sheet_id)
-                        if sheet is not None:
-                            sources.add(('path', source_key(sheet)) if sheet.source_path is not None
-                                        else ('embedded', sheet.sheet_id))
-                    context = f' · {len(sources)} sources' if len(sources) > 1 else ''
-                    source_paths = '\n'.join(str(self.workspace.sheets[curve.sheet_id].source_path or '')
-                        for curve in comparison.curves.values() if curve.sheet_id in self.workspace.sheets)
-                    add(group, ('xy', comparison.comparison_id), comparison.name + context,
-                        comparison_icon, f'XY graph: {comparison.name}\n{len(sources)} sources\n{source_paths}', 'XY comparison graph')
-            if current_key in items:
-                tree.setCurrentItem(items[current_key], 0, QItemSelectionModel.NoUpdate)
-            for key, item in items.items():
-                item.setExpanded(expanded.get(key, True))
-                if key in selected_keys:
-                    item.setSelected(True)
-            self._refresh_navigator_active()
-            tree.filter_items(self.project_search.text())
-            tree.doItemsLayout()
-            tree.horizontalScrollBar().setValue(scroll[0])
-            tree.verticalScrollBar().setValue(scroll[1])
+        for book in self.workspace.workbooks.values():
+            sheets = [self.workspace.sheets[sid] for sid in book.sheet_ids]
+            sources = {}
+            for sheet in sheets:
+                sources.setdefault(source_key(sheet), []).append(sheet)
+            paths = [key for key in sources if key is not None]
+            label = book.name
+            if len(sources) == 1 and paths:
+                path = sources[paths[0]][0].source_path
+                label = source_labels[paths[0]] if book.name == path.name else (
+                    book.name + '\u2028' + source_labels[paths[0]])
+            elif paths:
+                label += f' · {len(paths)} sources'
+                if None in sources:
+                    label += ' + embedded values'
+            else:
+                label += f' · {len(sheets)} embedded Sheets'
+            item = add(None, ('workbook', book.workbook_id), label,
+                       self._workbook_tooltip(book), 'Workbook')
+            for path_key, source_sheets in sources.items():
+                parent = item
+                if len(sources) > 1:
+                    path = source_sheets[0].source_path
+                    parent = add(item, ('group', ('source', book.workbook_id, path_key)),
+                                 source_labels[path_key] if path_key is not None else 'Embedded values',
+                                 str(path or 'Embedded values'), 'Source group')
+                source_items[(book.workbook_id, path_key)] = parent
+                data = add(parent, ('group', ('worksheets', book.workbook_id, path_key)),
+                           f'Worksheets ({len(source_sheets)})',
+                           'Data sheets for this source', 'Worksheets group')
+                for sheet in source_sheets:
+                    add(data, ('sheet', sheet.sheet_id), sheet.name,
+                        str(sheet.source_path or 'Embedded values'), 'Worksheet')
+                    if sheet.kind == 'dat' and sheet.role == 'original':
+                        owners.setdefault(sheet.dataset_id, (book.workbook_id, path_key))
+        duplicate_labels = {}
+        for book in self.workspace.workbooks.values():
+            row = items[('workbook', book.workbook_id)]
+            duplicate_labels.setdefault(row.label.casefold(), []).append(row.key)
+        for duplicates in duplicate_labels.values():
+            if len(duplicates) > 1:
+                for index, key in enumerate(duplicates, 1):
+                    original = items[key]
+                    updated = replace(original, label=original.label + f' ({index})')
+                    rows[rows.index(original)] = updated
+                    items[key] = updated
+        heatmaps = {}
+        for session in self.workspace.datasets.values():
+            graphs = [graph for graph in session.graphs.values() if graph.published]
+            if not graphs:
+                continue
+            parent = source_items.get(owners.get(session.dataset_id))
+            if parent is None:
+                path = session.source_path
+                parent = add(None, ('group', ('dataset', session.dataset_id)),
+                             source_labels[_source_key(path)] if path is not None else 'Embedded DAT',
+                             str(path or 'Embedded DAT'), 'DAT source group')
+            heatmaps.setdefault(parent, []).extend((session, graph) for graph in graphs)
+        for parent, graphs in heatmaps.items():
+            group = add(parent, ('group', ('heatmaps', parent)), f'Heatmaps ({len(graphs)})',
+                        'Published heatmap graphs for this source', 'Heatmaps group')
+            for session, graph in graphs:
+                add(group, ('heatmap', (session.dataset_id, graph.graph_id)), graph.name,
+                    f'Heatmap: {graph.name}\n{session.source_path or "Embedded DAT"}', 'Heatmap graph')
+        if self.workspace.comparisons:
+            group = add(None, ('group', ('comparisons',)),
+                        f'Comparisons ({len(self.workspace.comparisons)})',
+                        'Independent XY graphs; curves may use multiple sources', 'Comparisons group')
+            for comparison in self.workspace.comparisons.values():
+                sources = set()
+                for curve in comparison.curves.values():
+                    sheet = self.workspace.sheets.get(curve.sheet_id)
+                    if sheet is not None:
+                        sources.add(('path', source_key(sheet)) if sheet.source_path is not None
+                                    else ('embedded', sheet.sheet_id))
+                context = f' · {len(sources)} sources' if len(sources) > 1 else ''
+                source_paths = '\n'.join(str(self.workspace.sheets[curve.sheet_id].source_path or '')
+                    for curve in comparison.curves.values() if curve.sheet_id in self.workspace.sheets)
+                add(group, ('xy', comparison.comparison_id), comparison.name + context,
+                    f'XY graph: {comparison.name}\n{len(sources)} sources\n{source_paths}', 'XY comparison graph')
+        self.project.set_rows(rows)
+        self._refresh_navigator_active()
         self._refresh_navigator_actions()
 
     def _workbook_tooltip(self, book):
@@ -4083,32 +2462,21 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 + ('\n'.join(str(path) for path in paths) if paths else 'Embedded values'))
 
     def _refresh_navigator_active(self):
-        if not hasattr(self, 'data_navigator'):
+        if not hasattr(self, 'project'):
             return
-        key = self.graph_documents._active_key if self.plot_tabs.currentWidget() is self.graph_documents else self._document_key()
+        key = self.graph_documents.registry.active_key if self._outer_view == 'workspace' else self._document_key()
         active = set()
         if key:
             active.add((key[0], key[1]) if len(key) == 3 else ('heatmap', key))
-            page = self.graph_documents.page_for(key)
-            if len(key) == 3 and key[0] == 'workbook' and isinstance(page, WorkbookPage):
-                sheet_page = page.tabs.currentWidget()
+            page = self.graph_documents.document_for(key)
+            if len(key) == 3 and key[0] == 'workbook' and isinstance(page, WorkbookController):
+                sheet_page = page.current_sheet
                 if sheet_page is not None:
                     active.add(('sheet', sheet_page.sheet_id))
-        for item in self._navigator_items():
-            item_key = item.data(0, Qt.UserRole)
-            current = item_key in active
-            font = item.font(0)
-            font.setBold(current or item_key[0] in ('workbook', 'group'))
-            font.setUnderline(current)
-            item.setFont(0, font)
-            item.setData(0, Qt.UserRole + 1, current)
-            description = (item.data(0, Qt.AccessibleDescriptionRole) or '').removesuffix(' · Active document')
-            item.setData(0, Qt.AccessibleDescriptionRole, description + (' · Active document' if current else ''))
-            tooltip = item.toolTip(0).removesuffix('\nActive document')
-            item.setToolTip(0, tooltip + ('\nActive document' if current else ''))
+        self.project.set_active(active)
 
     def _selected_sheet_ids(self):
-        selected = {item.data(0, Qt.UserRole) for item in self.data_navigator.selectedItems()}
+        selected = set(self.project.selected_keys())
         return [sid for book in self.workspace.workbooks.values() for sid in book.sheet_ids
                 if ('sheet', sid) in selected or (('workbook', book.workbook_id) in selected
                     and self.workspace.sheets[sid].role == 'original')]
@@ -4117,17 +2485,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if not hasattr(self, 'compare_sheets_btn'):
             return
         idle = not self._project_busy()
-        selected = self.data_navigator.selectedItems()
-        key = selected[0].data(0, Qt.UserRole) if len(selected) == 1 else None
+        selected = self.project.selected_keys()
+        key = selected[0] if len(selected) == 1 else None
         editable = bool(key and key[0] in ('sheet', 'workbook', 'xy'))
-        current = self.data_navigator.currentItem()
-        current_key = current.data(0, Qt.UserRole) if current else None
-        self.compare_sheets_btn.setEnabled(idle and any(item.data(0, Qt.UserRole)[0] in ('sheet', 'workbook') for item in selected))
+        current_key = self.project.current_key()
+        self.compare_sheets_btn.setEnabled(idle and any(key[0] in ('sheet', 'workbook') for key in selected))
         self.merge_workbooks_btn.setEnabled(idle and len(self._selected_workbook_ids()) >= 2)
         for name in ('Rename', 'Remove'):
             self._navigator_buttons[name].setEnabled(idle and editable)
         remove = self._navigator_buttons['Remove']
-        target = selected[0].text(0) if len(selected) == 1 else f'{len(selected)} selected items'
+        target = self.project.row_for_key(selected[0]).label if len(selected) == 1 else f'{len(selected)} selected items'
         remove.setText(f'Remove {target}…' if selected else 'Remove…')
         reason = self._navigator_remove_reason(key)
         remove.setEnabled(idle and editable and not reason)
@@ -4136,49 +2503,22 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self.reload_source_action.setToolTip('Read selected original sources from disk into new Workbooks. Existing data, graphs and results stay unchanged.')
         self._navigator_buttons['Open'].setEnabled(idle and bool(current_key and
             current_key[0] in ('sheet', 'workbook', 'xy', 'heatmap')))
-        self.import_xy_btn.setEnabled(idle)
         self.new_comparison_action.setEnabled(idle)
         self.add_gate_comparison_btn.setEnabled(idle and self.workspace.active is not None
-            and not self._auxiliary_active() and (self.plot_tabs.currentIndex() == 0 or
-            self.graph_documents.window_for(self._document_key()) is not None)
+            and not self._auxiliary_active() and (self._outer_view == 'analysis' or
+            self._document_key() in self.graph_documents.registry.open_keys())
             and (not self._comparison_target_pinned or self._last_comparison_id in self.workspace.comparisons))
         self.add_gate_again_action.setEnabled(self.add_gate_comparison_btn.isEnabled()
             and self._last_comparison_id in self.workspace.comparisons)
         self.project_analyze_action.setEnabled(idle and self._project_analysis_source() is not None)
+        self.project.sync()
 
     def _navigator_selection_changed(self):
         self._refresh_navigator_actions()
-        item = self.data_navigator.currentItem()
-        if item and item.data(0, Qt.UserRole)[0] == 'xy' and not self._comparison_target_pinned:
-            self._last_comparison_id = item.data(0, Qt.UserRole)[1]
+        key = self.project.current_key()
+        if key and key[0] == 'xy' and not self._comparison_target_pinned:
+            self._last_comparison_id = key[1]
             self._refresh_comparison_targets(self._last_comparison_id)
-
-    def _navigator_menu(self, position):
-        item = self.data_navigator.itemAt(position)
-        if item is None:
-            return
-        if item.isSelected():
-            self.data_navigator.setCurrentItem(item, 0, QItemSelectionModel.NoUpdate)
-        else:
-            self.data_navigator.setCurrentItem(item)
-        menu = QMenu(self)
-        menu.setToolTipsVisible(True)
-        self._refresh_navigator_actions()
-        if item.data(0, Qt.UserRole)[0] == 'group':
-            menu.addAction('Collapse' if item.isExpanded() else 'Expand',
-                           lambda: item.setExpanded(not item.isExpanded()))
-            menu.exec(self.data_navigator.viewport().mapToGlobal(position))
-            menu.deleteLater()
-            return
-        menu.addAction(self._navigator_buttons['Open'])
-        menu.addAction(self.project_analyze_action)
-        menu.addAction(self.compare_sheets_btn)
-        menu.addAction(self.merge_workbooks_btn)
-        menu.addAction(self._navigator_buttons['Rename'])
-        menu.addAction(self.reload_source_action)
-        menu.addAction(self._navigator_buttons['Remove'])
-        menu.exec(self.data_navigator.viewport().mapToGlobal(position))
-        menu.deleteLater()
 
     def _sheet_owner(self, sheet_id):
         return next(book for book in self.workspace.workbooks.values() if sheet_id in book.sheet_ids)
@@ -4203,9 +2543,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         elif kind == 'workbook':
             book = self.workspace.workbooks.get(identity)
             if book is not None:
-                page = self.graph_documents.page_for(('workbook', identity, ''))
-                if isinstance(page, WorkbookPage) and page.tabs.currentWidget() is not None:
-                    current = self._resolve_analysis_source(('sheet', page.tabs.currentWidget().sheet_id))
+                page = self.graph_documents.document_for(('workbook', identity, ''))
+                if isinstance(page, WorkbookController) and page.current_sheet is not None:
+                    current = self._resolve_analysis_source(('sheet', page.current_sheet.sheet_id))
                     if current is not None:
                         return current
                 sources = [self._resolve_analysis_source(('sheet', sid)) for sid in book.sheet_ids]
@@ -4215,22 +2555,22 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return None
 
     def _project_analysis_source(self):
-        selected = self.data_navigator.selectedItems()
-        return self._resolve_analysis_source(selected[0].data(0, Qt.UserRole)) if len(selected) == 1 else None
+        selected = self.project.selected_keys()
+        return self._resolve_analysis_source(selected[0]) if len(selected) == 1 else None
 
     def _active_analysis_source(self):
-        if self.plot_tabs.currentIndex() == 0:
+        if self._outer_view == 'analysis':
             return self._resolve_analysis_source(('heatmap', self._document_key()))
-        key = self.graph_documents._active_key
-        if key is None or self.graph_documents.window_for(key) is None:
+        key = self.graph_documents.registry.active_key
+        if key is None or key not in self.graph_documents.registry.open_keys():
             return None
         if len(key) == 2:
             return self._resolve_analysis_source(('heatmap', key))
         if key[0] == 'xy':
             return self._resolve_analysis_source(('xy', key[1]))
         if key[0] == 'workbook':
-            page = self.graph_documents.page_for(key)
-            sheet_page = page.tabs.currentWidget() if isinstance(page, WorkbookPage) else None
+            page = self.graph_documents.document_for(key)
+            sheet_page = page.current_sheet if isinstance(page, WorkbookController) else None
             if sheet_page is not None:
                 return self._resolve_analysis_source(('sheet', sheet_page.sheet_id))
         return None
@@ -4238,7 +2578,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _open_analysis(self, source):
         source = self._resolve_analysis_source(source)
         if source is None:
-            self.statusBar().showMessage('Choose an XY graph, DAT heatmap, Original sheet or Processed sheet to analyze.')
+            self.publish_status('Choose an XY graph, DAT heatmap, Original sheet or Processed sheet to analyze.')
             return
         try:
             if source[0] != 'xy':
@@ -4250,14 +2590,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 page = self.open_xy_comparison(identity)
                 page.finish_editor()
                 self._set_dat_details_requested(True)
-                page.analysis_panel.analyze_selected()
-                page.inspector.ensureWidgetVisible(page.analysis_panel)
+                page.analysis_controller.analyze_selected()
                 return
             if kind == 'heatmap':
                 dataset_id, graph_id = identity
-                if self.plot_tabs.currentIndex() == 0 and identity == self._document_key():
+                if self._outer_view == 'analysis' and identity == self._document_key():
                     self._set_dat_details_requested(True)
-                    self._sidebar_tabs.setCurrentWidget(self._analysis_sidebar_scroll)
+                    self.request_task(1)
                     self._refresh_analysis_context()
                     return
                 self.open_graph_document(dataset_id, graph_id)
@@ -4265,18 +2604,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 sheet = self.workspace.sheets[identity]
                 dataset_id = sheet.dataset_id
                 self.open_workbook(self._sheet_owner(identity).workbook_id, identity)
-            return_key = self.graph_documents._active_key
-            self.plot_tabs.setCurrentIndex(0)
-            if self.plot_tabs.currentIndex() != 0:
+            return_key = self.graph_documents.registry.active_key
+            self.request_outer_view('analysis')
+            if self._outer_view != 'analysis':
                 return
             if dataset_id != self.workspace.active_dataset_id:
                 self.activate_dataset(dataset_id)
             self._analysis_return_key = return_key
             self._set_dat_details_requested(True)
-            self._sidebar_tabs.setCurrentWidget(self._analysis_sidebar_scroll)
+            self.request_task(1)
             self._refresh_graph_commands()
         except ValueError as exc:
-            self.statusBar().showMessage(str(exc))
+            self.publish_status(str(exc))
 
     def _back_to_workspace(self):
         try:
@@ -4284,8 +2623,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._finish_current_document()
             key = self._analysis_return_key
             if key is None:
-                key = self.graph_documents._active_key
-            if key and document_exists(self.workspace, key) and self.graph_documents.window_for(key) is not None:
+                key = self.graph_documents.registry.active_key
+            if key and document_exists(self.workspace, key) and key in self.graph_documents.registry.open_keys():
                 if len(key) == 2:
                     self.open_graph_document(*key)
                 else:
@@ -4293,63 +2632,41 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             else:
                 # A closed/removed source stays closed. Do not reopen the
                 # scientific selection just because the container changes.
-                with QSignalBlocker(self.plot_tabs):
-                    self.plot_tabs.setCurrentWidget(self.graph_documents)
-                active = self.graph_documents._active_key
+                self.request_outer_view('workspace')
+                active = self.graph_documents.registry.active_key
                 if active and document_exists(self.workspace, active):
                     self._activate_document(active)
-                self._on_plot_tab_changed(1, restore_graph=False)
+                self._outer_view_changed(restore_graph=False)
         except ValueError as exc:
-            self.statusBar().showMessage(str(exc))
+            self.publish_status(str(exc))
 
     def _refresh_analysis_context(self):
-        if not hasattr(self, 'analysis_context_label'):
+        if not hasattr(self, 'analysis_header'):
             return
+        context = self._workbench_update_input_context()
         session = self.workspace.active
-        document = self._workbench_document()
-        if document is not None:
-            cube = document.science.current_cube
+        if context is None and session is not None and session.current_cube is not None:
+            cube, graph = session.current_cube, session.active_graph
+            applied = 'Energy 2nd derivative' if session.applied.mode == 'energy_second_derivative' else 'Original'
             index = self._current_gate_index()
-            graph = session.active_graph
-            source = session.graphs.get(document.source_graph_id)
-            count = cube.gate.size if graph.gate_indices is None else len(graph.gate_indices)
-            details = (
-                f'Analysis — {session.source_path.name if session.source_path else "Embedded data"} · {graph.name}\n'
-                f'Analysis input: {document.input_label} · version {document.input_version[:8]} · '
-                f'Gate: {cube.gate[index]:g} ({index+1}/{cube.gate.size})\n'
-                f'Graph display: {count} of {cube.gate.size} Gates · All Gates analyzes all {cube.gate.size} bound Gates · '
-                f'Format source: {source.name if source else "Retained format (source removed)"}')
             title = session.source_path.name if session.source_path else 'Embedded data'
-            display_title = '\u200b'.join(title[start:start + 24] for start in range(0, len(title), 24))
-            scope = f'All {cube.gate.size} Gates' if self.workbench_scope.currentIndex() else f'Current Gate {index+1}/{cube.gate.size}'
-            input_name = 'Original' if document.source_mode == 'raw' else 'Processed'
-            self.analysis_context_label.setText(f'{display_title}\n{input_name} input · {scope}')
-            self.analysis_context_label.setToolTip(details + '\n' + str(session.source_path or 'Embedded data'))
-            self._workbench_update_input_context()
-            return
-        if session is None or session.current_cube is None:
-            self.analysis_context_label.setText('Analysis — no DAT selected. Return to Workspace to open data.')
-            return
-        cube, graph = session.current_cube, session.active_graph
-        applied = 'Energy 2nd derivative' if session.applied.mode == 'energy_second_derivative' else 'Original'
-        index = int(np.argmin(np.abs(cube.gate - self.current_gate)))
-        title = session.source_path.name if session.source_path else 'Embedded data'
-        # Plain-text labels wrap at these invisible opportunities, including
-        # filenames with no spaces. The tooltip retains the exact full path.
-        display_title = '\u200b'.join(title[start:start + 24] for start in range(0, len(title), 24))
-        text = (f'Analysis — {display_title}\nAnalysis input: {applied} · Gate: {cube.gate[index]:g} '
-                f'({index + 1}/{cube.gate.size}) · Batch: all {cube.gate.size} Gates')
-        displayed = 'Original' if graph.source_mode == 'raw' else applied
-        count = cube.gate.size if graph.gate_indices is None else len(graph.gate_indices)
-        text += f'\nGraph display: {displayed} · {count} of {cube.gate.size} Gates · {graph.name}'
-        if displayed != applied or count != cube.gate.size:
-            text += ('\nThe live heatmap/spectrum use the graph display; analysis uses the input above, '
-                     'and batch analysis includes every Gate.')
-        self.analysis_context_label.setText(text)
-        self.analysis_context_label.setToolTip(str(session.source_path or title))
+            displayed = 'Original' if graph.source_mode == 'raw' else applied
+            count = cube.gate.size if graph.gate_indices is None else len(graph.gate_indices)
+            details = (f'Analysis — {title} · {graph.name}\n{session.source_path or title}\n'
+                f'Analysis input: {applied} · Gate: {cube.gate[index]:g} ({index+1}/{cube.gate.size})\n'
+                f'Batch: all {cube.gate.size} Gates\n'
+                f'Graph display: {displayed} · {count} of {cube.gate.size} Gates\n'
+                f'Processing recipe: {session.applied.recipe()}')
+            if displayed != applied or count != cube.gate.size:
+                details += ('\nThe live heatmap/spectrum use the graph display; analysis uses the input above, '
+                            'and batch analysis includes every Gate.')
+            context = dict(title=title, summary=f'{applied} · {count}/{cube.gate.size} Gates · analyzed all',
+                           warning='', details=details)
+        self.analysis_header.refresh(context)
+        self.ordinary_analysis.refresh()
 
     def _selected_workbook_ids(self):
-        selected = {item.data(0, Qt.UserRole) for item in self.data_navigator.selectedItems()}
+        selected = set(self.project.selected_keys())
         return [key for key in self.workspace.workbooks if ('workbook', key) in selected]
 
     def merge_workbooks(self, workbook_ids, destination_id):
@@ -4362,7 +2679,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         # alone cannot detect an invalid editor that has not reached the model.
         for key in self.graph_documents.keys():
             if len(key) == 3 and key[0] == 'xy':
-                page = self.graph_documents.page_for(key)
+                page = self.graph_documents.document_for(key)
                 page.validate_editor()
         self._finish_current_document()
         destination = merge_workbooks(self.workspace, workbook_ids, destination_id)
@@ -4376,7 +2693,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return
         display = workbook_display_labels(self.workspace)
         labels = [f'{index + 1}. {display[key]}' for index, key in enumerate(identities)]
-        selected, accepted = QInputDialog.getItem(self, 'Move sheets and merge', 'Destination Workbook:', labels, 0, False)
+        selected, accepted = prompt_item(self.root_window, 'Move sheets and merge', 'Destination Workbook:', labels, 0)
         if accepted:
             try:
                 self._require_project_idle()
@@ -4389,8 +2706,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                     + f'\n\nMove all Sheets into the destination and remove {len(identities)-1} empty Workbook containers. '
                     'Sheet values, identities, comparison curves and source files are preserved. '
                     'This does not concatenate numeric rows and cannot be undone.')
-                if QMessageBox.warning(self, 'Move sheets and merge', summary,
-                        QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
+                if prompt_message(self.root_window, 'Move sheets and merge', summary,
+                        (PromptAction.YES, PromptAction.CANCEL), PromptAction.CANCEL, kind='warning') != PromptAction.YES:
                     return
                 self.merge_workbooks(identities, destination)
             except ValueError as exc:
@@ -4401,7 +2718,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._require_project_idle()
             if sheet_shape(self.workspace, sheet_id)[0] == 0:
                 raise ValueError('There are no current results to snapshot.')
-            name, accepted = QInputDialog.getText(self, 'Save snapshot', 'Snapshot name:')
+            name, accepted = prompt_text(self.root_window, 'Save snapshot', 'Snapshot name:')
             if not accepted:
                 return
             self._require_project_idle()
@@ -4414,13 +2731,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error(str(exc))
 
     def _open_navigator_item(self, *, toggle_group=True):
-        item = self.data_navigator.currentItem()
-        if item is None:
+        key = self.project.current_key()
+        if key is None or not self.project.enabled:
             return
-        kind, identity = item.data(0, Qt.UserRole)
+        kind, identity = key
         if kind == 'group':
             if toggle_group:
-                item.setExpanded(not item.isExpanded())
+                self.project.set_expanded(key, not self.project.is_expanded(key))
             return
         try:
             if kind == 'sheet':
@@ -4435,11 +2752,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error(str(exc))
 
     def _rename_navigator_item(self):
-        selected = self.data_navigator.selectedItems()
+        selected = self.project.selected_keys()
         if len(selected) != 1:
             return
-        item = selected[0]
-        kind, identity = item.data(0, Qt.UserRole)
+        kind, identity = selected[0]
         if kind not in ('sheet', 'workbook', 'xy'):
             return
         try:
@@ -4447,14 +2763,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._finish_current_document()
             record = {'sheet': self.workspace.sheets, 'workbook': self.workspace.workbooks,
                       'xy': self.workspace.comparisons}[kind][identity]
-            name, ok = QInputDialog.getText(self, 'Rename', 'Name:', text=record.name)
+            name, ok = prompt_text(self.root_window, 'Rename', 'Name:', text=record.name)
             if ok and name.strip() and '\x00' not in name:
                 record.name = name.strip()
                 if kind == 'xy':
-                    page = self.graph_documents.page_for(('xy', identity, ''))
+                    page = self.graph_documents.document_for(('xy', identity, ''))
                     if page is not None:
-                        with QSignalBlocker(page.name_edit):
-                            page.name_edit.setText(record.name)
+                        page.sync_graph_name()
                 else:
                     self._refresh_auxiliary_documents()
                 self._auxiliary_changed()
@@ -4462,12 +2777,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error(str(exc))
 
     def _remove_navigator_item(self):
-        selected = self.data_navigator.selectedItems()
+        selected = self.project.selected_keys()
         if len(selected) != 1:
             return
-        item = selected[0]
-        kind, identity = item.data(0, Qt.UserRole)
-        target_name = item.text(0)
+        kind, identity = selected[0]
+        target_name = self.project.row_for_key(selected[0]).label
         if kind not in ('sheet', 'workbook', 'xy'):
             return
         try:
@@ -4480,16 +2794,21 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if kind == 'workbook':
                 sheet = next((self.workspace.sheets[key] for key in self.workspace.workbooks[identity].sheet_ids
                               if self.workspace.sheets[key].kind == 'dat'), None)
-            if sheet is not None and sheet.kind == 'dat':
+            if sheet is not None and sheet.kind == 'dat' and sheet.result_id is None:
                 self.remove_dataset(sheet.dataset_id)
                 return
-            if QMessageBox.warning(self, 'Remove from project',
-                    f'Remove {target_name}? Removing a Sheet or workbook also removes its curves from comparisons. Source files remain unchanged.',
-                    QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
+            message = (f'Remove Processed result “{target_name}” and its linked Heatmaps? Its curves are also removed from comparisons. Other results and source files remain unchanged.'
+                       if sheet is not None and sheet.result_id is not None else
+                       f'Remove {target_name}? Removing a Sheet or workbook also removes its curves from comparisons. Source files remain unchanged.')
+            if prompt_message(self.root_window, 'Remove from project', message,
+                    (PromptAction.YES, PromptAction.CANCEL), PromptAction.CANCEL, kind='warning') != PromptAction.YES:
                 return
             self._require_project_idle()
+            result_owner = self.workspace.datasets.get(sheet.dataset_id) if sheet is not None and sheet.result_id is not None else None
             {'sheet': remove_sheet, 'workbook': remove_workbook, 'xy': remove_comparison}[kind](self.workspace, identity)
             self._refresh_auxiliary_documents()
+            if result_owner is self.workspace.active and result_owner is not None:
+                self.activate_dataset(result_owner.dataset_id, capture_outgoing=False)
             self._auxiliary_changed()
         except ValueError as exc:
             self._show_error(str(exc))
@@ -4502,7 +2821,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             sheet = self.workspace.sheets.get(identity)
             if sheet is None:
                 return 'This Sheet is no longer in the project.'
-            if sheet.kind == 'dat' and sheet.role != 'original':
+            if sheet.kind == 'dat' and sheet.role != 'original' and sheet.result_id is None:
                 return 'This is a live DAT projection. Select its Original Sheet to remove the source and dependent results.'
         elif kind == 'workbook':
             if identity not in self.workspace.workbooks:
@@ -4515,12 +2834,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return ''
 
     def _selected_reload_sheets(self):
-        if not hasattr(self, 'data_navigator'):
+        if not hasattr(self, 'project'):
             return []
-        selected = self.data_navigator.selectedItems()
+        selected = self.project.selected_keys()
         if len(selected) != 1:
             return []
-        kind, identity = selected[0].data(0, Qt.UserRole)
+        kind, identity = selected[0]
         if kind == 'workbook':
             if identity not in self.workspace.workbooks:
                 return []
@@ -4626,7 +2945,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._pending_data_review = None
         self._job_cancel_requested = False
         self._set_dat_import_pending(True)
-        self._job_cancel_button.show()
+        self.set_cancel_visible(True)
         self._background_job_owner = None
         self._processing_request = self._analysis_request = None
 
@@ -4660,57 +2979,58 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if not self._dat_import_is_current(token) or workspace is not self.workspace:
             return
         self._set_dat_import_pending(False)
-        self._job_cancel_button.hide()
+        self.set_cancel_visible(False)
         failures = '\n'.join(f'{error.path}: {error.reason}' for error in errors)
         if new_copy and failures:
             message = 'Cannot reload as new copy. No sources were added:\n' + failures
-            self.dat_import_status_label.setText(message)
-            self.statusBar().showMessage(message)
+            self.source_navigation.set_import_status(message)
+            self.publish_status(message)
             self._show_error(message)
             return
         if not entries:
-            self.dat_import_status_label.setText('No data imported.\n' + failures)
-            self.statusBar().showMessage('No data imported. See the file errors for details.')
+            self.source_navigation.set_import_status('No data imported.\n' + failures)
+            self.publish_status('No data imported. See the file errors for details.')
             self._show_error('No data imported:\n' + failures)
             return
         dialog = None
         try:
             if review or comparison_id is not None:
-                dialog = XYImportDialog([entry.table for entry in entries], self.workspace.workbooks, self,
+                dialog = XYImportDialog([entry.table for entry in entries], self.workspace.workbooks, self.root_window,
                     entries=entries, mappings=[(entry.mapping[0], list(entry.mapping[1])) for entry in entries],
                     reused=[entry.sheet_id is not None for entry in entries],
                     comparisons=self.workspace.comparisons, comparison_id=comparison_id)
                 if failures:
-                    dialog.feedback.setText('These files could not be read; the valid files are ready to review:\n' + failures)
-                if dialog.exec() != QDialog.Accepted:
+                    dialog.set_feedback('These files could not be read; the valid files are ready to review:\n' + failures)
+                if dialog.exec() != 1:
                     message = 'Data import cancelled. No sources were added.'
-                    self.dat_import_status_label.setText(message)
-                    self.statusBar().showMessage(message)
+                    self.source_navigation.set_import_status(message)
+                    self.publish_status(message)
                     return
                 if token != self._dat_import_token or workspace is not self.workspace or self._close_pending:
                     return
-                destination = dialog.destination_combo.currentData()
+                entries = dialog.entries
+                destination = dialog.destination
                 self.import_data_files(entries, None if destination == 'per_file' else destination,
-                    mappings=dialog.mappings, compare=dialog.compare, workbook_name=dialog.name_edit.text(),
+                    mappings=dialog.mappings, compare=dialog.compare, workbook_name=dialog.workbook_name,
                     grouping='per_file' if destination == 'per_file' else 'single',
                     comparison_id=(comparison_id if comparison_id is not None else
-                                   dialog.comparison_combo.currentData()) if dialog.compare else None,
-                    include_existing=dialog.include_existing_chk.isChecked(), new_copy=new_copy)
+                                   dialog.comparison_id) if dialog.compare else None,
+                    include_existing=dialog.include_existing, new_copy=new_copy)
             else:
                 self.import_data_files(entries, new_copy=new_copy)
             notices = [entry.session.initialization_notice for entry in entries
                        if entry.kind == 'dat' and entry.session is not None and entry.session.initialization_notice]
             if failures:
-                self.statusBar().showMessage(self.statusBar().currentMessage()
+                self.publish_status(self._status_text
                     + f' {len(errors)} file(s) failed; see the file errors for details.')
-            self.dat_import_status_label.setText(self.statusBar().currentMessage()
+            self.source_navigation.set_import_status(self._status_text
                 + ('\n' + failures if failures else '') + ('\n' + '\n'.join(notices) if notices else ''))
             if failures and dialog is None:
                 self._show_error('Valid data imported into Workspace. These files could not be imported:\n' + failures)
         except (ValueError, OSError, KeyError) as exc:
             message = f'Cannot import data: {exc}'
-            self.dat_import_status_label.setText(message)
-            self.statusBar().showMessage(message)
+            self.source_navigation.set_import_status(message)
+            self.publish_status(message)
             self._show_error(message)
         finally:
             if dialog is not None:
@@ -4797,7 +3117,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             comparison = self.workspace.comparisons[comparison_id]
             self.open_xy_comparison(comparison_id)
             self._report_curve_additions(comparison, 0, skipped)
-            self.statusBar().showMessage(self.statusBar().currentMessage() + ' '
+            self.publish_status(self._status_text + ' '
                 + self._import_source_summary(new_sources, reused_sources, new_copy=new_copy))
             return self._sheet_owner(sheets[0].sheet_id)
         # Build curves before publishing so an invalid source cannot leave a partial import.
@@ -4809,6 +3129,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             staged.comparisons[comparison.comparison_id] = comparison
             for sheet_id, x, y, mode in additions:
                 add_curve(staged, comparison.comparison_id, sheet_id, x, y, mode=mode)
+            if comparison_id is None:
+                initialize_comparison_labels(staged, comparison)
         self._finish_comparison_append(target_page)
         self.workspace.datasets.update(staged.datasets)
         self.workspace.path_index.update(staged.path_index)
@@ -4842,12 +3164,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 target_page.refresh()
             self.open_xy_comparison(comparison.comparison_id)
             self._report_curve_additions(comparison, len(additions), skipped)
-            self.statusBar().showMessage(self.statusBar().currentMessage() + ' '
+            self.publish_status(self._status_text + ' '
                 + self._import_source_summary(new_sources, reused_sources, new_copy=new_copy))
         else:
             # Other imported owners remain available in Project without opening more windows.
             self.open_workbook(book.workbook_id, sheets[0].sheet_id)
-            self.statusBar().showMessage(self._import_source_summary(new_sources, reused_sources, new_copy=new_copy))
+            self.publish_status(self._import_source_summary(new_sources, reused_sources, new_copy=new_copy))
         self._auxiliary_changed()
         return book
 
@@ -4928,7 +3250,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if compare and not additions:
             comparison = self.workspace.comparisons[comparison_id]
             self._report_curve_additions(comparison, 0, skipped)
-            self.statusBar().showMessage(self.statusBar().currentMessage() + ' '
+            self.publish_status(self._status_text + ' '
                 + self._import_source_summary(len(keys)-reused, reused))
             return self._sheet_owner(sheets[0].sheet_id)
         self._finish_comparison_append(target_page)
@@ -4948,16 +3270,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                           if comparison_id is None else self.workspace.comparisons[comparison_id])
             for sheet_id, x, y, mode in additions:
                 add_curve(self.workspace, comparison.comparison_id, sheet_id, x, y, mode=mode)
+            if comparison_id is None:
+                initialize_comparison_labels(self.workspace, comparison)
             if target_page is not None:
                 target_page.refresh()
             self._auxiliary_changed()
             self.open_xy_comparison(comparison.comparison_id)
             self._report_curve_additions(comparison, len(additions), skipped)
-            self.statusBar().showMessage(self.statusBar().currentMessage() + ' '
+            self.publish_status(self._status_text + ' '
                 + self._import_source_summary(len(keys)-reused, reused))
         else:
             self.open_workbook(book.workbook_id, sheets[0].sheet_id)
-            self.statusBar().showMessage(self._import_source_summary(len(keys)-reused, reused))
+            self.publish_status(self._import_source_summary(len(keys)-reused, reused))
         return book
 
     def _on_import_xy(self, comparison_id=None):
@@ -4969,28 +3293,29 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             comparison_id = None
         if self._project_busy() or self._close_pending:
             return
-        paths, _ = QFileDialog.getOpenFileNames(self, 'Import with options' if review else 'Import data', self.current_folder, DATA_FILTER)
+        paths, _ = FilePicker.getOpenFileNames(self.root_window, 'Import with options' if review else 'Import data', self.current_folder, DATA_FILTER)
         if paths:
             self._import_data_files(paths, comparison_id, review=review)
 
     def _auxiliary_active(self):
-        key = self.graph_documents._active_key
-        return bool(self.plot_tabs.currentWidget() is self.graph_documents and key and len(key) == 3)
+        key = self.graph_documents.registry.active_key
+        return bool(self._outer_view == 'workspace' and key and len(key) == 3)
 
     def _finish_auxiliary_editor(self, key):
-        page = self.graph_documents.page_for(key)
-        if isinstance(page, XYPlotPage):
+        page = self.graph_documents.document_for(key)
+        if isinstance(page, (XYPlotController, WorkbookController)):
             page.finish_editor()
 
     def _finish_current_document(self):
         if self._auxiliary_active():
-            self._finish_auxiliary_editor(self.graph_documents._active_key)
+            self._finish_auxiliary_editor(self.graph_documents.registry.active_key)
         elif self.workspace.active is not None:
             self._finish_graph_editors()
 
     def _create_auxiliary_page(self, key):
         if key[0] == 'workbook':
-            page = WorkbookPage(self.workspace, key[1])
+            page = WorkbookController(self.workspace, key[1], self)
+            page.draftChanged.connect(self._schedule_project_modified)
             page.snapshotRequested.connect(self._on_save_sheet_snapshot)
             page.comparisonRequested.connect(self._add_sheet_comparison)
             page.quickPlotRequested.connect(self._quick_sheet_plot)
@@ -5001,21 +3326,20 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             page.gateRequested.connect(self._sheet_gate_requested)
             page.refresh_targets(self._last_comparison_id)
         else:
-            page = XYPlotPage(self.workspace, key[1])
-            page.canvas.addAction(self._graph_command_actions['rescale'])
-            for name in ('undo', 'redo'):
-                page.canvas.addAction(self._graph_command_actions[name])
-                page.curve_list.addAction(self._graph_command_actions[name])
+            page = XYPlotController(self.workspace, key[1], self)
+            page.bind_canvas_actions({name: self._graph_command_actions[name] for name in ('rescale', 'undo', 'redo')})
             page.historyChanged.connect(self._refresh_graph_commands)
-            page.analysis_panel.host = self
+            page.analysis_controller.services = XYAnalysisServices(
+                project_busy=self._project_busy, require_project_idle=self._require_project_idle,
+                current_workspace=lambda: self.workspace,
+                background_owner=lambda: self._background_job_owner,
+                start_background_job=self._start_background_job,
+                publish_results=self._save_xy_analysis_results)
+            page.analysis_controller.sync()
             page.analysisRequested.connect(lambda owner=key[1]: self._open_analysis(('xy', owner)))
-            page.command_bar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            self._graph_command_stack.addWidget(page.command_bar)
-            page._inspector_hosted = True
-            page.inspector.setMaximumWidth(16777215)
-            self._properties_stack.addWidget(page.inspector)
             page.inspectorVisibilityRequested.connect(self._set_dat_details_requested)
-            self._watch_dat_editor_focus(page.inspector)
+            page.inspectorSectionRequested.connect(lambda section, field, target=page: self.reveal_xy_inspector(target, section, field))
+            page.canvasFocusRequested.connect(lambda owner=key: self.graph_documents.focus_document(owner))
             page.sourceRequested.connect(lambda identity: self.open_workbook(self._sheet_owner(identity).workbook_id, identity))
             page.addDataRequested.connect(lambda owner=key[1]: self._show_sheet_comparison_dialog(comparison_id=owner))
             page.importDataRequested.connect(lambda owner=key[1]: self._on_import_xy(comparison_id=owner))
@@ -5026,18 +3350,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._require_project_idle()
         if not document_exists(self.workspace, key):
             raise ValueError('The document no longer exists.')
-        if key != self.graph_documents._active_key or self.plot_tabs.currentWidget() is not self.graph_documents:
+        if key != self.graph_documents.registry.active_key or self._outer_view != 'workspace':
             self._finish_current_document()
-        page = self.graph_documents.page_for(key)
+        page = self.graph_documents.document_for(key)
         if page is None:
             page = self._create_auxiliary_page(key)
-            self.graph_documents.cache_page(key, page)
+            self.graph_documents.cache_document(key, page)
         self.graph_documents.show_document(key, self._document_title(key))
         if key[0] == 'xy' and not self._comparison_target_pinned:
             self._last_comparison_id = key[1]
             self._refresh_comparison_targets(self._last_comparison_id)
-        self.plot_tabs.setCurrentWidget(self.graph_documents)
-        self._on_plot_tab_changed(self.plot_tabs.currentIndex())
+        self.request_outer_view('workspace')
+        self._outer_view_changed()
         self._refresh_graph_commands()
         return page
 
@@ -5086,9 +3410,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _finish_xy_analysis_jobs(self, *, cancelled=False):
         for key in self.graph_documents.keys():
-            page = self.graph_documents.page_for(key)
-            if isinstance(page, XYPlotPage):
-                page.analysis_panel.background_finished(cancelled=cancelled)
+            page = self.graph_documents.document_for(key)
+            if isinstance(page, XYPlotController):
+                page.analysis_controller.background_finished(cancelled=cancelled)
 
     def open_workbook(self, workbook_id, sheet_id=None):
         page = self._open_auxiliary_document(('workbook', workbook_id, ''))
@@ -5104,11 +3428,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._last_comparison_id = preferred
         if self._last_comparison_id not in self.workspace.comparisons:
             self._last_comparison_id = None
-        with QSignalBlocker(self.workbook_commands.pin_action):
-            self.workbook_commands.pin_action.setChecked(self._comparison_target_pinned)
+        self.workbook_commands.set_target_pinned(self._comparison_target_pinned)
         for key in self.graph_documents.keys():
-            page = self.graph_documents.page_for(key)
-            if isinstance(page, WorkbookPage):
+            page = self.graph_documents.document_for(key)
+            if isinstance(page, WorkbookController):
                 page.refresh_targets(self._last_comparison_id)
         self._refresh_graph_command_host()
 
@@ -5152,7 +3475,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             previous_graph_id = session.active_graph_id
             # A repeated command opens its exact source scope; existing graph visuals are retained.
             graph = next((graph for graph in session.graphs.values()
-                          if graph.source_mode == sheet.mode and graph.gate_indices == gates), None)
+                          if graph.analysis is None and graph.source_mode == sheet.mode
+                          and graph.result_id == sheet.result_id and graph.gate_indices == gates), None)
             created = graph is None
             published = graph.published if graph is not None else False
             try:
@@ -5163,6 +3487,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                         name, count = f'{base_name} {count}', count + 1
                     graph = session.create_graph(name)
                     graph.source_mode, graph.gate_indices = sheet.mode, gates
+                    graph.result_id = sheet.result_id
                     cube = graph_cube(session)
                     view = graph.view
                     view.x_limits = (float(np.min(cube.energy)), float(np.max(cube.energy)))
@@ -5194,16 +3519,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if graph.analysis is not None:
                 self._project_selected_graph(session)
                 if notice:
-                    self.statusBar().showMessage(self.statusBar().currentMessage() + ' — ' + notice)
+                    self.publish_status(self._status_text + ' — ' + notice)
             else:
                 self._refresh_document_titles()
                 incoming_notice = self._save_current_plot_state()
                 self._refresh_project_modified()
-                self.statusBar().showMessage(f'Active: {session.source_path.name} — {graph.name}'
-                    + (f' — {notice}' if notice else '') + (f' — {incoming_notice}' if incoming_notice else ''))
+                self.publish_status(' — '.join(part for part in (notice, incoming_notice) if part))
             self._select_graph_page(session, show=True)
-            self.plot_tabs.setCurrentWidget(self.graph_documents)
-            self._on_plot_tab_changed(self.plot_tabs.currentIndex())
+            self.request_outer_view('workspace')
+            self._outer_view_changed()
             self._refresh_graph_commands()
             return graph
         except ValueError as exc:
@@ -5216,7 +3540,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             mappings = {sheet_id: (sheet.x_column, list(sheet.y_columns), sheet.mode)}
             validate_sheet_comparison(self.workspace, mappings)
             comparison = self.compare_sheets(mappings, comparison_id, include_existing=include_existing, style=style)
-            return self.graph_documents.page_for(('xy', comparison.comparison_id, ''))
+            return self.graph_documents.document_for(('xy', comparison.comparison_id, ''))
         except ValueError as exc:
             self._show_error(str(exc))
 
@@ -5225,20 +3549,20 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if selected:
             self._show_sheet_comparison_dialog(selected_sheet_ids=selected)
         else:
-            self.statusBar().showMessage('The selected Workbooks contain no Original Sheets. Select individual result Sheets to compare.')
+            self.publish_status('The selected Workbooks contain no Original Sheets. Select individual result Sheets to compare.')
 
     def _show_sheet_comparison_dialog(self, *, selected_sheet_ids=(), comparison_id=None):
         try:
             self._require_project_idle()
             if comparison_id is not None and comparison_id not in self.workspace.comparisons:
                 raise ValueError('The destination comparison no longer exists.')
-            dialog = SheetComparisonDialog(self.workspace, self, selected_sheet_ids=selected_sheet_ids,
+            dialog = SheetComparisonDialog(self.workspace, self.root_window, selected_sheet_ids=selected_sheet_ids,
                                            comparison_id=comparison_id)
             try:
-                if dialog.exec() == QDialog.Accepted:
-                    target = comparison_id if comparison_id is not None else dialog.destination_combo.currentData()
+                if dialog.exec() == 1:
+                    target = comparison_id if comparison_id is not None else dialog.comparison_id
                     self.compare_sheets(dialog.selected_mappings(), target,
-                                        include_existing=dialog.include_existing_chk.isChecked())
+                                        include_existing=dialog.include_existing)
                     if target is not None:
                         self._select_comparison_target(target)
             finally:
@@ -5251,23 +3575,23 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._require_project_idle()
         if comparison_id is not None and comparison_id not in self.workspace.comparisons:
             raise ValueError('The destination comparison no longer exists.')
-        target_page = self.graph_documents.page_for(('xy', comparison_id, '')) if comparison_id else None
-        current_page = self.graph_documents.page_for(self.graph_documents._active_key) if self._auxiliary_active() else None
+        target_page = self.graph_documents.document_for(('xy', comparison_id, '')) if comparison_id else None
+        current_page = self.graph_documents.document_for(self.graph_documents.registry.active_key) if self._auxiliary_active() else None
         # Check both drafts first: an invalid target must not commit a valid
         # current graph's draft, or any source defaults, before it fails.
         for page in (current_page, target_page):
-            if isinstance(page, XYPlotPage):
+            if isinstance(page, XYPlotController):
                 page.validate_editor()
         return target_page
 
     def _finish_comparison_append(self, target_page):
-        current_page = self.graph_documents.page_for(self.graph_documents._active_key) if self._auxiliary_active() else None
+        current_page = self.graph_documents.document_for(self.graph_documents.registry.active_key) if self._auxiliary_active() else None
         self._finish_current_document()
         if target_page is not None and target_page is not current_page:
             target_page.finish_editor()
 
     def _report_curve_additions(self, comparison, added, skipped):
-        self.statusBar().showMessage(f'Added {added} curve(s) to {comparison.name}; skipped {skipped} existing curve(s).')
+        self.publish_status(f'Added {added} curve(s) to {comparison.name}; skipped {skipped} existing curve(s).')
 
     def compare_sheets(self, mappings, comparison_id=None, *, include_existing=False, style='line'):
         """Commit one existing-Sheet batch after every source/target passes preflight."""
@@ -5301,6 +3625,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                     set_sheet_mapping(self.workspace, sheet_id, x, ys, mode)
         for sheet_id, x, y, mode in additions:
             add_curve(self.workspace, comparison.comparison_id, sheet_id, x, y, mode=mode, style=style)
+        if comparison_id is None:
+            initialize_comparison_labels(self.workspace, comparison)
         if not self._comparison_target_pinned:
             self._last_comparison_id = comparison.comparison_id
         if target_page is not None:
@@ -5316,29 +3642,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _refresh_batch_sheet_pages(self, sheet_ids):
         for key in self.graph_documents.keys():
-            workbook = self.graph_documents.page_for(key)
-            if not isinstance(workbook, WorkbookPage):
+            workbook = self.graph_documents.document_for(key)
+            if not isinstance(workbook, WorkbookController):
                 continue
             for sheet_id in sheet_ids.intersection(workbook.sheet_pages):
                 page = workbook.sheet_pages[sheet_id]
-                selection_model = page.table.selectionModel()
-                ranges = [(r.top(), r.left(), r.bottom(), r.right()) for r in selection_model.selection()]
-                index = selection_model.currentIndex()
-                current = (index.row(), index.column())
-                scroll = (page.table.horizontalScrollBar().value(), page.table.verticalScrollBar().value())
-                # Restoring a DAT current column must not request dataset/Gate
-                # activation through SheetPage.currentColumnChanged.
-                with QSignalBlocker(selection_model):
-                    page.refresh()
-                    selection = QItemSelection()
-                    for top, left, bottom, right in ranges:
-                        if top < page.model.rowCount() and left < page.model.columnCount():
-                            selection.select(page.model.index(top, left), page.model.index(
-                                min(bottom, page.model.rowCount() - 1), min(right, page.model.columnCount() - 1)))
-                    selection_model.select(selection, QItemSelectionModel.ClearAndSelect)
-                    selection_model.setCurrentIndex(page.model.index(*current), QItemSelectionModel.NoUpdate)
-                    page.table.horizontalScrollBar().setValue(scroll[0])
-                    page.table.verticalScrollBar().setValue(scroll[1])
+                state = page.capture_view_state()
+                page.refresh()
+                page.restore_view_state(state)
 
     def _new_xy_comparison(self):
         try:
@@ -5377,9 +3688,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if comparison_id is None:
                 comparison_id = create_comparison(self.workspace, 'Comparison ' + str(len(self.workspace.comparisons) + 1)).comparison_id
             add_curve(self.workspace, comparison_id, sheet.sheet_id, 0, y, mode=sheet.mode)
+            if creating:
+                initialize_comparison_labels(self.workspace, self.workspace.comparisons[comparison_id])
             if not self._comparison_target_pinned:
                 self._last_comparison_id = comparison_id
-            page = self.graph_documents.page_for(('xy', comparison_id, ''))
+            page = self.graph_documents.document_for(('xy', comparison_id, ''))
             if page:
                 page.refresh()
             self._auxiliary_changed()
@@ -5400,12 +3713,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self.open_workbook(owner.workbook_id, sheet_id)
             self._indicate_sheet_gate()
         except ValueError as exc:
-            self.statusBar().showMessage(str(exc))
+            self.publish_status(str(exc))
 
     def _indicate_sheet_gate(self):
         for key in self.graph_documents.keys():
-            page = self.graph_documents.page_for(key)
-            if isinstance(page, WorkbookPage):
+            page = self.graph_documents.document_for(key)
+            if isinstance(page, WorkbookController):
                 for sheet_page in page.sheet_pages.values():
                     sheet = self.workspace.sheets.get(sheet_page.sheet_id)
                     if sheet is None:
@@ -5415,17 +3728,26 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _refresh_auxiliary_documents(self):
         for key in self.graph_documents.keys():
+            if len(key) == 2 and not document_exists(self.workspace, key):
+                if self.plot_page is self.graph_documents.document_for(key):
+                    self._bind_plot_page(self._fallback_plot_page)
+                self.graph_documents.discard(key)
+                self._graph_revisions.pop(key, None)
+                session = self.workspace.datasets.get(key[0])
+                if session is not None:
+                    self._history_for(session).remove_graph(key[1])
+                continue
             if len(key) == 3:
                 if not document_exists(self.workspace, key):
                     self.graph_documents.discard(key)
                 else:
-                    page = self.graph_documents.page_for(key)
-                    if isinstance(page, XYPlotPage) and page.has_pending_project_edits():
+                    page = self.graph_documents.document_for(key)
+                    if isinstance(page, XYPlotController) and page.has_pending_project_edits():
                         page.refresh_sources()
                         page.render()
                     else:
                         page.refresh()
-                    self.graph_documents.refresh_page_inputs(key)
+                    self.graph_documents.refresh_document_input(key)
         self._refresh_comparison_targets()
         self._indicate_sheet_gate()
 
@@ -5444,17 +3766,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._schedule_project_modified()
 
     def _create_plot_page(self, key=None):
-        page = PlotPage()
+        page = FormalPlotController(self, prompt_window=lambda: self.root_window)
         page.analysisRequested.connect(lambda owner=key:
             self._open_analysis(('heatmap', owner)) if owner is not None else None)
-        self._watch_dat_editor_focus(page.control_scroll)
-        page.take_control_scroll().setParent(self._sidebar_tabs)
-        page.control_scroll.hide()
-        page.take_command_bar().setParent(page)
-        page.command_bar.hide()
+        page.set_mutation_guard(lambda owner=key, target=page: self._formal_page_can_mutate(target, owner))
+        page.formal.set_properties_input_guard(lambda source, owner=key, target=page:
+            self._formal_properties_input_allowed(target, owner, source))
         for signal, callback in (
-                (page.presentationChanged, self.set_plot_presentation),
-                (page.presentationError, self._on_plot_presentation_error),
+
                 (page.exportRequested, self._on_export_plot_page),
                 (page.graphCopyRequested, self._on_copy_graph_svg),
                 (page.propertyEditRequested, self._show_plot_property),
@@ -5473,20 +3792,105 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                            self._dispatch_document(owner, handler, *args))
         page.displayZoomChanged.connect(lambda text: self._sync_display_zoom(text)
                                         if self.plot_page is page else None)
-        page.displayScaleChanged.connect(lambda *args: self._on_display_scale_changed(*args)
-                                         if self.plot_page is page else None)
-        for control in page.control_scroll.findChildren(QAbstractSpinBox):
-            control.lineEdit().textChanged.connect(self._schedule_project_modified)
-            control.valueChanged.connect(self._schedule_project_modified)
-        for control in page.control_scroll.findChildren(QLineEdit):
-            if not isinstance(control.parent(), QAbstractSpinBox):
-                control.textChanged.connect(self._schedule_project_modified)
-        page.annotation_visible.toggled.connect(self._schedule_project_modified)
-        page.annotation_font_role.currentTextChanged.connect(self._schedule_project_modified)
-        for name, action in getattr(self, '_graph_command_actions', {}).items():
-            if name in ('undo', 'redo', 'rescale', 'cancel'):
-                page.preview.addAction(action)
+        # Formal preview Fit/scale follows its own paper viewport. Analysis
+        # derives scale from owner zoom and its DAT viewport/DPR instead.
+        page.presentationChanged.connect(lambda presentation, owner=key, target=page:
+            self._owned_plot_presentation(target, owner, presentation))
+        page.presentationError.connect(lambda message, owner=key, target=page:
+            self._owned_plot_error(target, owner, message))
+        page.formal.draftChanged.connect(self._schedule_project_modified)
+        page.formal.focusRequested.connect(lambda section, field, target=page:
+            self._reveal_formal_editor(target, section, field))
         return page
+
+    def _reveal_formal_editor(self, page, section, field):
+        if page is not self.plot_page or page is not self._properties_controller:
+            return
+        self._set_dat_details_requested(True)
+        if self.taskIndex == 2:
+            return
+        owner = page.expected_owner
+        self.request_task(2)
+
+        def focus_owner():
+            if (page is self.plot_page and page is self._properties_controller
+                    and page.expected_owner == owner and self.taskIndex == 2):
+                page.formal.focusRequested.emit(section, field)
+
+        QTimer.singleShot(0, self, focus_owner)
+
+    def _formal_properties_input_allowed(self, page, key, source):
+        from PySide6.QtQuick import QQuickItem
+        from shiboken6 import isValid
+        host = getattr(self, '_quick_host', None)
+        if (host is None or self._closing or self._context_kind != 'dat'
+                or not self.propertiesVisible or self.taskIndex != 2
+                or page is not self.plot_page or page is not self._properties_controller
+                or self._workbench_document() is not None
+                or not self._formal_page_can_mutate(page, key)):
+            return False
+        if key is not None and (key != self._document_key()
+                or self.graph_documents.document_for(key) is not page):
+            return False
+        if self._outer_view == 'workspace' and key != self.graph_documents.registry.active_key:
+            return False
+        properties = host.window.findChild(QQuickItem, 'applicationProperties')
+        receiver = host._floating_properties if self.propertiesFloating else host.window
+        return bool(isinstance(source, QQuickItem) and isValid(source)
+            and properties is not None and isValid(properties)
+            and properties.findChild(QQuickItem, 'formalProperties') is source
+            and source.property('bridge') is page.formal
+            and properties.isVisible() and properties.isEnabled()
+            and source.isVisible() and source.isEnabled()
+            and properties.isAncestorOf(source)
+            and receiver is not None and isValid(receiver) and receiver.isVisible()
+            and receiver.contentItem().isAncestorOf(properties))
+
+    def _formal_page_can_mutate(self, page, key):
+        if page is getattr(self, 'plot_page', None) and self._workbench_document() is not None:
+            return False
+        if (self._project_busy() or self._close_pending or self._project_io_close_pending
+                or self._restoring_dataset or self._project_installing):
+            return False
+        if key is None:
+            return page is self._fallback_plot_page if hasattr(self, '_fallback_plot_page') else True
+        if not document_exists(self.workspace, key):
+            return False
+        return page.expected_owner is None or page.expected_owner == self._plot_owner_token(key)
+
+    def _owned_plot_presentation(self, page, key, presentation):
+        if not self._formal_page_can_mutate(page, key):
+            return
+        if not self._binding_graph_document:
+            self._dispatch_document(key, self.set_plot_presentation, presentation)
+            return
+        session = (self.workspace.datasets.get(key[0]) if key is not None else
+                   self.workspace.active or self._unregistered_session)
+        graph_id = key[1] if key is not None else session.active_graph_id
+        if session is None or graph_id not in session.graphs:
+            return
+        graph = session.graphs[graph_id]
+        if graph.presentation == presentation:
+            return
+        owner = replace(session, active_graph_id=graph_id)
+        before = capture_fields(owner, ('presentation',)) if self._history_enabled() else None
+        if before is not None:
+            self._finish_history_edit()
+        previous = graph.presentation
+        graph.presentation = presentation
+        page.set_presentation(presentation)
+        self._invalidate_graph_document((session.dataset_id, graph_id), kind='presentation')
+        if before is not None:
+            label = 'Edit annotation' if previous.annotations != presentation.annotations else 'Plot presentation'
+            self._record_history(session, label, before, capture_fields(owner, ('presentation',)), graph_id=graph_id)
+        self._schedule_project_modified()
+
+    def _owned_plot_error(self, page, key, message):
+        if key is not None and document_exists(self.workspace, key):
+            self._invalidate_graph_document(key, kind='presentation')
+        elif page is self.plot_page:
+            self._invalidate_plot_page(kind='presentation', schedule=False)
+        page.set_status_message(f'Cannot prepare page: {message}')
 
     def _dispatch_document(self, key, callback, *args):
         if key is None or self._activate_document(key):
@@ -5509,10 +3913,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _refresh_document_titles(self):
         for key in self.graph_documents.keys():
             if document_exists(self.workspace, key):
-                self.graph_documents.update_title(key, self._document_title(key), self._document_tooltip(key))
+                self.graph_documents.update_title(key, self._document_title(key))
         self._refresh_data_navigator()
 
     def _document_tooltip(self, key):
+        if not document_exists(self.workspace, key):
+            return ''
         if len(key) == 2:
             return str(self.workspace.datasets[key[0]].source_path or 'Embedded data')
         if key[0] == 'workbook':
@@ -5524,78 +3930,40 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return f'{comparison.name} · {len(comparison.curves)} curves\n' + ('\n'.join(paths) or 'Embedded values')
 
     def _bind_plot_page(self, page):
-        previous = self.plot_page
-        if previous is page:
+        if self.plot_page is page:
             return
-        sidebar = self._sidebar_tabs
-        in_sidebar = sidebar.indexOf(previous.control_scroll) >= 0
-        if in_sidebar:
-            current = sidebar.currentWidget()
-            sidebar.removeTab(sidebar.indexOf(previous.control_scroll))
-            previous.control_scroll.hide()
-            for index, box in enumerate((self._shared_color_scale_box, self._shared_view_range_box,
-                                         self._shared_annotations_box)):
-                previous.control_layout.removeWidget(box)
-                page.control_layout.insertWidget(index + 1, box)
-                box.show()
-            sidebar.addTab(page.control_scroll, 'View')
-            sidebar.setCurrentWidget(page.control_scroll if current is previous.control_scroll else current)
         self.plot_page = page
-        if self._graph_command_stack.indexOf(page.command_bar) < 0:
-            self._graph_command_stack.addWidget(page.command_bar)
         self._refresh_graph_command_host()
-        self.export_png_btn = page.export_png_btn
-        self._sync_display_zoom(page.zoom_combo.currentText())
+        self._sync_display_zoom(page.zoom_text)
         if hasattr(self, '_plot_format_store'):
             self._refresh_plot_formats()
         if hasattr(self, '_settings_paste_action'):
             self._refresh_transfer_controls()
 
     def _refresh_graph_command_host(self):
-        self.workbook_commands.sheet_page = None
+        self.workbook_commands.bind(None)
         if hasattr(self, 'analyze_action'):
             self.analyze_action.setEnabled(not self._project_busy() and self._active_analysis_source() is not None)
-        if self.plot_tabs.currentIndex() == 0:
-            self.graph_command_host.hide()
-            return
-        heatmap = (self.plot_tabs.currentWidget() is self.graph_documents
-                   and not self._auxiliary_active()
-                   and self.graph_documents.window_for(self._document_key()) is not None)
-        if heatmap:
-            if self._graph_command_stack.indexOf(self.plot_page.command_bar) < 0:
-                self._graph_command_stack.addWidget(self.plot_page.command_bar)
-            self._graph_command_stack.setCurrentWidget(self.plot_page.command_bar)
-        else:
-            key = self.graph_documents._active_key
-            page = self.graph_documents.page_for(key) if key else None
-            if self.plot_tabs.currentWidget() is self.graph_documents and isinstance(page, WorkbookPage):
-                sheet_page = page.tabs.currentWidget()
-                if sheet_page is not None and sheet_page.sheet_id in self.workspace.sheets:
-                    self.workbook_commands.bind(sheet_page)
-                    self._graph_command_stack.setCurrentWidget(self.workbook_commands)
-                    self.graph_command_host.show()
-                    return
-            if self.plot_tabs.currentWidget() is self.graph_documents and isinstance(page, XYPlotPage):
-                self._graph_command_stack.setCurrentWidget(page.command_bar)
-                self.graph_command_host.show()
-                return
-            self.workspace_command_context.setText(
-                self._document_title(key) if key and document_exists(self.workspace, key)
-                else 'Open a Workbook or graph from Project.')
-            self._graph_command_stack.setCurrentWidget(self.workspace_command_context)
-        self.graph_command_host.show()
+        key = self.graph_documents.registry.active_key
+        page = self.graph_documents.document_for(key)
+        self._command_controller = page if self._outer_view == 'workspace' else None
+        if isinstance(page, WorkbookController) and self._outer_view == 'workspace':
+            sheet = page.current_sheet
+            if sheet is not None and sheet.sheet_id in self.workspace.sheets:
+                self.workbook_commands.bind(sheet)
+        self.shellChanged.emit()
 
     def _select_graph_page(self, session, *, show=None):
         key = (session.dataset_id, session.active_graph_id)
-        page = self.graph_documents.page_for(key)
+        page = self.graph_documents.document_for(key)
         if page is None:
             page = self._create_plot_page(key)
             page.set_presentation(graph_presentation(session))
             page.invalidate(self._plot_owner_token(key))
-            self.graph_documents.cache_page(key, page)
+            self.graph_documents.cache_document(key, page)
         self._bind_plot_page(page)
         if show is None:
-            show = self.plot_tabs.currentWidget() is self.graph_documents and not self._auxiliary_active()
+            show = self._outer_view == 'workspace' and not self._auxiliary_active()
         if show and session.active_graph.published and session.active_graph.analysis is None:
             self.graph_documents.show_document(key, self._document_title(key))
             self._schedule_plot_page_render()
@@ -5617,7 +3985,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if self._project_busy():
             raise ValueError('Wait for the current operation before changing graphs.')
         if self._auxiliary_active():
-            self._finish_auxiliary_editor(self.graph_documents._active_key)
+            self._finish_auxiliary_editor(self.graph_documents.registry.active_key)
         if key != self._document_key() or not session.graphs[graph_id].published:
             self._finish_graph_editors()
             if dataset_id != self.workspace.active_dataset_id:
@@ -5630,7 +3998,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                     session.activate_graph(previous_graph_id)
                     raise
                 if notice:
-                    self.statusBar().showMessage(self.statusBar().currentMessage() + ' — ' + notice)
+                    self.publish_status(self._status_text + ' — ' + notice)
             else:
                 self.activate_graph(graph_id)
         if not session.graphs[graph_id].published:
@@ -5639,23 +4007,31 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._refresh_document_titles()
             notice = self._save_current_plot_state()
             if notice:
-                self.statusBar().showMessage(notice)
+                self.publish_status(notice)
             self._schedule_project_modified()
         page = self._select_graph_page(session, show=True)
-        self.plot_tabs.setCurrentWidget(self.graph_documents)
-        self._on_plot_tab_changed(self.plot_tabs.currentIndex())
+        self.request_outer_view('workspace')
+        self._outer_view_changed()
         self._refresh_graph_commands()
         return page
 
     def _activate_document(self, key):
         if len(key) == 3:
-            if key == self.graph_documents._active_key and self._auxiliary_active():
+            if key == self.graph_documents.registry.active_key and self._auxiliary_active():
                 return not self._project_busy()
             try:
-                self._open_auxiliary_document(key)
+                self._require_project_idle()
+                if not document_exists(self.workspace, key):
+                    raise ValueError('The document no longer exists.')
+                self._finish_current_document()
+                # Registry activation invokes this before committing its active
+                # key. Project the domain owner only; opening a frame here
+                # would recursively invoke the same activation callback.
+                self._outer_view = 'workspace'
+                self._task_index = self._heatmap_task_index
                 return True
             except ValueError as exc:
-                self.statusBar().showMessage(str(exc))
+                self.publish_status(str(exc))
                 return False
         if self._binding_graph_document:
             return key == self._document_key()
@@ -5666,7 +4042,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self.open_graph_document(*key)
             return True
         except ValueError as exc:
-            self.statusBar().showMessage(str(exc))
+            self.publish_status(str(exc))
             return False
         finally:
             self._binding_graph_document = False
@@ -5681,18 +4057,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 self._finish_graph_editors()
             return True
         except ValueError as exc:
-            self.statusBar().showMessage(str(exc))
+            self.publish_status(str(exc))
             return False
 
     def _close_visible_document(self):
-        if self.plot_tabs.currentWidget() is not self.graph_documents:
+        if self._outer_view != 'workspace':
             return False
         return self.graph_documents.close_document()
 
     def _discard_dataset_documents(self, dataset_id):
         self._formal_peak_label_signatures.pop(dataset_id, None)
         keys = [key for key in self.graph_documents.keys() if len(key) == 2 and key[0] == dataset_id]
-        if any(self.graph_documents.page_for(key) is self.plot_page for key in keys):
+        if any(self.graph_documents.document_for(key) is self.plot_page for key in keys):
             self._bind_plot_page(self._fallback_plot_page)
         for key in keys:
             self.graph_documents.discard(key)
@@ -5705,133 +4081,117 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error(str(exc))
 
     def _build_graph_commands(self):
-        """Shared everyday command hooks; Edit can also host dataset history."""
-        self._file_menu = self.menuBar().addMenu('&File')
-        self._edit_menu = self.menuBar().addMenu('&Edit')
-        self._view_menu = self.menuBar().addMenu('&View')
-        self._analysis_menu = self.menuBar().addMenu('&Analysis')
-        self._help_menu = self.menuBar().addMenu('&Help')
-        self.check_updates_action = self._help_menu.addAction('Check for Updates…', self._show_updates)
-        self.analyze_action = self._analysis_menu.addAction(
-            'Analyze', lambda: self._open_analysis(self._active_analysis_source()))
-        self.back_to_workspace_action = self._analysis_menu.addAction('Back to Workspace', self._back_to_workspace)
-        self._analysis_menu.aboutToShow.connect(self._refresh_graph_commands)
-        self.project_panel_action = self._view_menu.addAction('Project tree')
-        self.project_panel_action.setCheckable(True)
-        self.project_panel_action.setChecked(True)
-        self.project_panel_action.setShortcut(QKeySequence('Ctrl+Shift+P'))
+        from PySide6.QtGui import QAction
+        self._menu_groups = {name: [] for name in ('File', 'Edit', 'View', 'Analysis', 'Help')}
+        def action(key, text, callback=None, group='View', shortcut='', checkable=False, checked=False):
+            result = QAction(text, self)
+            if callback is not None:
+                result.triggered.connect(callback)
+            result.setShortcut(QKeySequence(shortcut))
+            result.setCheckable(checkable)
+            result.setChecked(checked)
+            self._menu_groups[group].append(CommandAction(key, result, self))
+            return result
+        self.check_updates_action = action('updates', 'Check for Updates…', self._show_updates, 'Help')
+        self.analyze_action = action('analyze', 'Analyze', lambda: self._open_analysis(self._active_analysis_source()), 'Analysis')
+        self.back_to_workspace_action = action('back', 'Back to Workspace', self._back_to_workspace, 'Analysis')
+        self.project_panel_action = action('project', 'Project tree', group='View', shortcut='Ctrl+Shift+P', checkable=True, checked=True)
         self.project_panel_action.toggled.connect(self._set_project_panel_visible)
-        self.dat_details_action = self._view_menu.addAction('Properties')
-        self.dat_details_action.setToolTip('Show properties for the active Workbook or graph.')
-        self.dat_details_action.setCheckable(True)
-        self.dat_details_action.setChecked(self._dat_details_requested)
+        self.dat_details_action = action('properties', 'Properties', checkable=True, checked=True)
         self.dat_details_action.toggled.connect(self._set_dat_details_requested)
-        self._view_menu.addSeparator()
-        self.open_graph_action = self._view_menu.addAction('Open Graph', self._on_open_graph_document)
-        self.free_graphs_action = self._view_menu.addAction('Free Windows', self.graph_documents.free_view)
-        self.tabbed_graphs_action = self._view_menu.addAction('Tabbed View', self.graph_documents.tabbed_view)
-        self.free_graphs_action.setCheckable(True)
-        self.tabbed_graphs_action.setCheckable(True)
-        self.cascade_graphs_action = self._view_menu.addAction('Cascade Graphs', self.graph_documents.cascade_graphs)
-        self.tile_graphs_action = self._view_menu.addAction('Tile Graphs', self.graph_documents.tile_graphs)
-        self.close_graph_view_action = self._view_menu.addAction(
-            'Close Document View', self._close_visible_document)
+        self.open_graph_action = action('open_graph', 'Open Graph', self._on_open_graph_document)
+        self.free_graphs_action = action('free', 'Free Windows', lambda: self.graph_documents.setMode('free'), checkable=True)
+        self.tabbed_graphs_action = action('tabbed', 'Tabbed View', lambda: self.graph_documents.setMode('tabbed'), checkable=True)
+        self.cascade_graphs_action = action('cascade', 'Cascade Graphs', self.graph_documents.cascade)
+        self.tile_graphs_action = action('tile', 'Tile Graphs', self.graph_documents.tile)
+        self.close_graph_view_action = action('close_document', 'Close Document View', self._close_visible_document)
         self._graph_command_actions = {}
-        for key, menu, text, shortcut, callback in (
-                ('new_project', self._file_menu, 'New Project', 'Ctrl+N', self._on_new_project),
-                ('open_project', self._file_menu, 'Open Project…', 'Ctrl+Shift+O', self._on_open_project),
-                ('save_project', self._file_menu, 'Save Project', 'Ctrl+S', self._on_save_project),
-                ('save_project_as', self._file_menu, 'Save Project As…', 'Ctrl+Shift+S',
-                 lambda: self._on_save_project(save_as=True)),
-                ('import', self._file_menu, 'Import data…', 'Ctrl+O', self._on_import_data),
-                ('import_options', self._file_menu, 'Import with options…', '',
-                 lambda: self._on_import_data(review=True)),
-                ('undo', self._edit_menu, 'Undo', 'Ctrl+Z', self.undo_edit),
-                ('redo', self._edit_menu, 'Redo', 'Ctrl+Y', self.redo_edit),
-                ('copy_graph', self._edit_menu, 'Copy Graph as SVG', 'Ctrl+Alt+J', self._on_copy_graph_svg),
-                ('rescale', self._view_menu, 'Rescale Graph', 'Ctrl+R', self._on_rescale_graph),
-                ('cancel', self._edit_menu, 'Cancel Graph Selection / Drag', 'Esc', self._cancel_graph_interaction)):
-            action = menu.addAction(text, callback)
-            action.setShortcut(QKeySequence(shortcut))
-            if key in ('undo', 'redo', 'rescale', 'cancel'):
-                # Associate graph-only shortcuts with the canvases. Explicit
-                # menu activation still works while a text editor has focus.
-                action.setShortcutContext(Qt.WidgetShortcut)
-                self.canvas.addAction(action)
-                self.plot_page.preview.addAction(action)
-            else:
-                action.setShortcutContext(Qt.WindowShortcut)
-            self._graph_command_actions[key] = action
+        for key, group, text, shortcut, callback in (
+            ('new_project', 'File', 'New Project', 'Ctrl+N', self._on_new_project),
+            ('open_project', 'File', 'Open Project…', 'Ctrl+Shift+O', self._on_open_project),
+            ('save_project', 'File', 'Save Project', 'Ctrl+S', self._on_save_project),
+            ('save_project_as', 'File', 'Save Project As…', 'Ctrl+Shift+S', lambda: self._on_save_project(save_as=True)),
+            ('import', 'File', 'Import data…', 'Ctrl+O', self._on_import_data),
+            ('import_options', 'File', 'Import with options…', '', lambda: self._on_import_data(review=True)),
+            ('undo', 'Edit', 'Undo', 'Ctrl+Z', self.undo_edit),
+            ('redo', 'Edit', 'Redo', 'Ctrl+Y', self.redo_edit),
+            ('copy_graph', 'Edit', 'Copy Graph as SVG', 'Ctrl+Alt+J', self._on_copy_graph_svg),
+            ('rescale', 'View', 'Rescale Graph', 'Ctrl+R', self._on_rescale_graph),
+            ('cancel', 'Edit', 'Cancel Graph Selection / Drag', 'Esc', self._cancel_graph_interaction)):
+            self._graph_command_actions[key] = action(key, text, callback, group, shortcut)
         self._graph_command_actions['import'].setToolTip('Automatically import full tables: first column X, all remaining columns Y.')
         self._graph_command_actions['import_options'].setToolTip('Preview detected types, choose X/Y columns, group Workbooks or compare.')
         self._graph_command_actions['redo'].setShortcuts([QKeySequence('Ctrl+Y'), QKeySequence('Ctrl+Shift+Z')])
-        self._recent_projects_menu = QMenu('Recent Projects', self)
-        self._recent_projects_menu.setToolTipsVisible(True)
-        self._file_menu.insertMenu(self._graph_command_actions['save_project'], self._recent_projects_menu)
-        self._refresh_recent_projects()
-        self.graph_documents.set_start_actions(self._graph_command_actions['import'],
-            self._graph_command_actions['open_project'], self._recent_projects_menu)
-        self._edit_menu.aboutToShow.connect(self._refresh_graph_commands)
-        self._file_menu.aboutToShow.connect(self._refresh_graph_commands)
-        self.import_dats_btn.installEventFilter(self)
+        self.source_navigation.availabilityChanged.connect(self._refresh_source_import_commands)
         self._refresh_graph_commands()
 
+    def _build_quick_commands(self):
+        actions = [(key, self._graph_command_actions[key]) for key in ('import', 'open_project', 'save_project', 'undo', 'redo')]
+        actions.extend((('analyze', self.analyze_action), ('back', self.back_to_workspace_action), ('project', self.project_panel_action), ('properties', self.dat_details_action)))
+        self.app_bridge.commands.bind(actions)
+
+    def _refresh_source_import_commands(self):
+        if hasattr(self, '_graph_command_actions'):
+            for key in ('import', 'import_options'):
+                self._graph_command_actions[key].setEnabled(self.source_navigation.importEnabled)
+
     def _refresh_graph_commands(self):
+        self.processing.syncFromOwner()
         self._refresh_analysis_context()
         self._refresh_navigator_actions()
         self._refresh_workspace_shell()
         for key in self.graph_documents.keys():
-            page = self.graph_documents.page_for(key)
-            if isinstance(page, XYPlotPage):
-                page.add_data_btn.setEnabled(not self._project_busy() and bool(self.workspace.sheets))
+            page = self.graph_documents.document_for(key)
+            if isinstance(page, XYPlotController):
+                page.set_add_data_enabled(not self._project_busy() and bool(self.workspace.sheets))
+                page.add_files_action.setEnabled(not self._project_busy())
+                page.refresh_input_state()
                 page.analyze_action.setEnabled(not self._project_busy())
-                page.analysis_panel.sync()
+                page.analysis_controller.bridge.refresh()
         self._refresh_graph_lifecycle_controls()
         self._refresh_graph_command_host()
         self._refresh_navigator_active()
         for key in self.graph_documents.keys():
             if document_exists(self.workspace, key):
-                self.graph_documents.update_title(key, self._document_title(key), self._document_tooltip(key))
+                self.graph_documents.update_title(key, self._document_title(key))
         if not hasattr(self, '_graph_command_actions'):
             return
         ready = self.current_cube is not None
         idle = not self._project_busy()
         self.analyze_action.setEnabled(idle and self._active_analysis_source() is not None)
-        self.back_to_workspace_action.setEnabled(idle and self.plot_tabs.currentIndex() == 0)
-        self.analysis_back_btn.setEnabled(idle)
+        self.back_to_workspace_action.setEnabled(idle and self._outer_view == 'analysis')
+        self.analysis_header.refresh()
+        self.ordinary_analysis.refresh()
         for key in self.graph_documents.keys():
-            page = self.graph_documents.page_for(key)
-            if isinstance(page, PlotPage):
-                page.analyze_btn.setEnabled(idle and self._resolve_analysis_source(('heatmap', key)) is not None)
+            page = self.graph_documents.document_for(key)
+            if isinstance(page, FormalPlotController):
+                page.set_command_availability('analyze', idle and self._resolve_analysis_source(('heatmap', key)) is not None)
         self.open_graph_action.setEnabled(ready and self.workspace.active is not None and idle)
         self.close_graph_view_action.setEnabled(
-            idle and self.plot_tabs.currentWidget() is self.graph_documents
-            and self.graph_documents.window_for(self.graph_documents._active_key) is not None)
-        visible = bool(self.graph_documents.subWindowList())
+            idle and self._outer_view == 'workspace'
+            and self.graph_documents.registry.active_key in self.graph_documents.registry.open_keys())
+        visible = bool(self.graph_documents.registry.open_keys())
         self.tabbed_graphs_action.setEnabled(visible)
         self.tile_graphs_action.setEnabled(visible)
         self.free_graphs_action.setEnabled(visible)
         self.cascade_graphs_action.setEnabled(visible)
-        tabbed = self.graph_documents.viewMode() == GraphDocuments.ViewMode.TabbedView
+        tabbed = self.graph_documents.mode == 'tabbed'
         self.tabbed_graphs_action.setChecked(tabbed)
         self.free_graphs_action.setChecked(not tabbed)
         for key in ('new_project', 'open_project', 'save_project', 'save_project_as'):
             self._graph_command_actions[key].setEnabled(not self._project_busy())
-        if hasattr(self, '_recent_projects_menu'):
-            self._recent_projects_menu.setEnabled(not self._project_busy())
-        self._graph_command_actions['import'].setEnabled(self.import_dats_btn.isEnabled())
-        self._graph_command_actions['import_options'].setEnabled(self.import_dats_btn.isEnabled())
+        self._refresh_source_import_commands()
         auxiliary = self._auxiliary_active()
-        xy = auxiliary and self.graph_documents._active_key[0] == 'xy'
-        heatmap_visible = (self.plot_tabs.currentWidget() is not self.graph_documents or
-                           self.graph_documents._active_key == self._document_key() and
-                           self.graph_documents.window_for(self._document_key()) is not None)
+        xy = auxiliary and self.graph_documents.registry.active_key[0] == 'xy'
+        heatmap_visible = (self._outer_view != 'workspace' or
+                           self.graph_documents.registry.active_key == self._document_key() and
+                           self._document_key() in self.graph_documents.registry.open_keys())
         self._graph_command_actions['copy_graph'].setEnabled(idle and (xy or (heatmap_visible and not auxiliary and ready and self.plot_page.presentation_error is None)))
         self._graph_command_actions['rescale'].setEnabled(idle and (xy or (not auxiliary and ready)))
         self._graph_command_actions['cancel'].setEnabled(not auxiliary)
         session = self.workspace.active
         if xy:
-            page = self.graph_documents.page_for(self.graph_documents._active_key)
+            page = self.graph_documents.document_for(self.graph_documents.registry.active_key)
             for key in ('undo', 'redo'):
                 action = self._graph_command_actions[key]
                 action.setText(key.title())
@@ -5854,8 +4214,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_rescale_graph(self):
         if self._auxiliary_active():
-            page = self.graph_documents.page_for(self.graph_documents._active_key)
-            if isinstance(page, XYPlotPage):
+            page = self.graph_documents.document_for(self.graph_documents.registry.active_key)
+            if isinstance(page, XYPlotController):
                 page.render()
             return
         if self.current_cube is not None:
@@ -5865,15 +4225,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if self._auxiliary_active():
             return
         self.plot_page.cancel_interaction()
-        if self.plot_tabs.currentWidget() is not self.graph_documents:
+        if self._outer_view != 'workspace':
             if self._motion_cid is not None:
                 self.canvas.mpl_disconnect(self._motion_cid)
                 self._motion_cid = None
             self._drag_peak_arr_idx = None
             self._drag_current_x = None
             self._drag_scatter = None
-            self.lasso_mode_btn.setChecked(False)
-            self.circle_delete_btn.setChecked(False)
+            self._on_lasso_mode_toggled(False)
+            self._on_toggle_circle_delete_mode(False)
             self._batch_delete_circle_start = None
             self._lasso_selected_peak_ids = []
             self._clear_lasso_selection_visual()
@@ -5882,31 +4242,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _show_plot_property(self, kind, identifier=''):
         page = self.plot_page.rendered_page
-        if (self.plot_tabs.currentWidget() is not self.graph_documents or page is None
-                or page.owner_token != self._plot_owner_token()):
+        if self._outer_view != 'workspace' or page is None or page.owner_token != self._plot_owner_token():
             return
-        editor = None
-        if kind == 'title':
-            editor = self.plot_title_edit
-        elif kind == 'signal-label':
-            editor = self.signal_title_combo
-        elif kind in ('horizontal-label', 'vertical-label', 'horizontal-range', 'vertical-range'):
-            horizontal = kind.startswith('horizontal')
-            source_y = horizontal == self.plot_page.presentation.axis.exchange_xy
-            if kind.endswith('-range'):
-                editor = self.ymin_spin if source_y else self.xmin_spin
-            else:
-                editor = self.y_axis_name_edit if source_y else self.x_axis_override_combo
+        field = {'title': 'plot_title', 'signal-label': 'signal_title'}.get(kind)
+        if kind in ('horizontal-label', 'vertical-label', 'horizontal-range', 'vertical-range'):
+            source_y = kind.startswith('horizontal') == self.plot_page.presentation.axis.exchange_xy
+            field = ('ymin' if source_y else 'xmin') if kind.endswith('-range') else ('y_axis_name' if source_y else 'axis_override')
+        self._set_dat_details_requested(True)
+        self.request_task(2)
+        if field is None:
+            self.plot_page.reveal_property(kind, identifier)
         else:
-            editor = self.plot_page.property_editor(kind, identifier)
-        if editor is not None:
-            self._set_dat_details_requested(True)
-            self._sidebar_tabs.setCurrentWidget(self.plot_page.control_scroll)
-            reveal_editor(editor)
-            self.plot_page.control_scroll.ensureWidgetVisible(editor)
-            editor.setFocus(Qt.MouseFocusReason)
-            if isinstance(editor, QLineEdit):
-                editor.selectAll()
+            self.dat_properties.reveal(field)
 
     def _plot_owner_token(self, key=None):
         dataset_id, graph_id = key or self._document_key()
@@ -5914,14 +4261,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         view, presentation = self._graph_revisions.setdefault((dataset_id, graph_id), [0, 0])
         return (dataset_id, self._plot_lifetime, science, view, presentation, graph_id)
 
-    def _invalidate_graph_document(self, key, *, kind='view'):
+    def _invalidate_graph_document(self, key, *, kind='view', preserve_input=False):
         revisions = self._graph_revisions.setdefault(key, [0, 0])
         revisions[1 if kind == 'presentation' else 0] += 1
-        page = self.graph_documents.page_for(key)
+        page = self.graph_documents.document_for(key)
         if page is None and key == self._document_key():
             page = self.plot_page
         if page is not None:
-            page.invalidate(self._plot_owner_token(key))
+            page.invalidate(self._plot_owner_token(key), preserve_input=preserve_input)
 
     def _invalidate_dataset_documents(self, dataset_id):
         self._plot_revisions.setdefault(dataset_id, [0, 0, 0])[0] += 1
@@ -5962,81 +4309,42 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 self._schedule_plot_page_render()
 
     def _schedule_plot_page_render(self, *, delay=None):
-        if self._workbench_document() is not None and self.plot_tabs.currentIndex() == 0:
+        if self._workbench_document() is not None and self._outer_view == 'analysis':
             self._plot_render_timer.start(180 if delay is None else delay)
             return
-        if (self.plot_tabs.currentWidget() is not self.graph_documents
+        if (self._outer_view != 'workspace'
                 or self.current_cube is None or self._annotation_edit_pending
                 or (getattr(self, '_plot_batch', None) and not self._plot_batch.done)):
             return
         self._plot_render_timer.start(180 if delay is None else delay)
 
-    def _on_plot_tab_changed(self, _index, *, restore_graph=True):
-        previous = getattr(self, '_previous_plot_tab_index', 0)
-        current = self.plot_tabs.currentIndex()
-        active = self.graph_documents._active_key
-        if (previous == 1 and current == 0 and active
-                and not self._project_installing):
-            try:
-                if len(active) == 3:
-                    self._finish_auxiliary_editor(active)
-                else:
-                    self._finish_graph_editors()
-            except ValueError as exc:
-                with QSignalBlocker(self.plot_tabs):
-                    self.plot_tabs.setCurrentIndex(previous)
-                self.statusBar().showMessage(str(exc))
-                return
-        self._previous_plot_tab_index = current
-        if current == 0 and previous != 0:
-            self._analysis_return_key = active
-        plot_mode = self.plot_tabs.currentWidget() is self.graph_documents and not self._auxiliary_active()
-        if plot_mode and self.workspace.active is not None and restore_graph:
-            self._select_graph_page(self.workspace.active, show=(self.graph_documents.initial_view
-                                    or bool(self.graph_documents.subWindowList())))
+    def _outer_view_changed(self, *, restore_graph=True, defer_live_layout=False):
         self._refresh_graph_command_host()
-        sidebar = self._sidebar_tabs
-        if plot_mode and sidebar.indexOf(self.plot_page.control_scroll) < 0:
-            self._analysis_sidebar_index = sidebar.currentIndex()
-            self._analysis_sidebar_widget = sidebar.currentWidget()
-            sidebar.removeTab(sidebar.indexOf(self._view_sidebar_scroll))
-            sidebar.addTab(self.plot_page.control_scroll, 'View')
-            preferred = getattr(self, '_heatmap_sidebar_widget', None)
-            sidebar.setCurrentWidget(preferred if preferred in (self._data_sidebar_scroll, self._analysis_sidebar_scroll)
-                                     else self.plot_page.control_scroll)
-            for index, box in enumerate((self._shared_color_scale_box, self._shared_view_range_box,
-                                         self._shared_annotations_box)):
-                self._view_settings_layout.removeWidget(box)
-                self.plot_page.control_layout.insertWidget(index + 1, box)
-                box.show()
-        elif not plot_mode and sidebar.indexOf(self.plot_page.control_scroll) >= 0:
-            self._heatmap_sidebar_widget = sidebar.currentWidget()
-            sidebar.removeTab(sidebar.indexOf(self.plot_page.control_scroll))
-            sidebar.insertTab(2, self._view_sidebar_scroll, 'View')
-            sidebar.setCurrentWidget(self._analysis_sidebar_widget)
-            for box in (self._shared_color_scale_box, self._shared_view_range_box,
-                        self._shared_annotations_box):
-                self.plot_page.control_layout.removeWidget(box)
-                self._view_settings_layout.addWidget(box)
-                box.show()
-        self._plot_render_timer.stop()
-        if (self.plot_tabs.currentWidget() is not self.graph_documents
-                and getattr(self, '_annotation_layout_pending', False)):
-            self._annotation_layout_pending = False
-            self._layout_live_plots()
-            self.canvas.draw_idle()
-        if self.plot_page.rendered_page is None:
+        self._refresh_workspace_shell()
+        if hasattr(self, '_plot_render_timer'):
+            self._plot_render_timer.stop()
+        if self._outer_view == 'analysis' and getattr(self, '_annotation_layout_pending', False):
+            if defer_live_layout and self._workbench_document() is None:
+                # Quick's command/header geometry settles after view entry.
+                # Measure only its final viewport with the existing burst timer.
+                self._schedule_view_layout()
+            else:
+                self._layout_live_plots()
+                self.canvas.draw_idle()
+        if hasattr(self, '_plot_render_timer') and self.plot_page.rendered_page is None:
             self._schedule_plot_page_render()
-        self._workbench_set_visible()
+        if hasattr(self, 'analysis_workbench'):
+            self._workbench_set_visible()
+        self.graph_documents.refresh_eligibility()
         self._refresh_graph_commands()
 
     def _render_visible_plot_page(self):
-        if self._workbench_document() is not None and self.plot_tabs.currentIndex() == 0:
+        if self._workbench_document() is not None and self._outer_view == 'analysis':
             self._workbench_render()
             return
-        if self.plot_tabs.currentWidget() is self.graph_documents:
+        if self._outer_view == 'workspace':
             for key in self.graph_documents.visible_keys():
-                page = self.graph_documents.page_for(key)
+                page = self.graph_documents.document_for(key)
                 if len(key) == 3:
                     continue
                 if key == self._document_key() and self._annotation_edit_pending:
@@ -6062,15 +4370,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self.plot_page.set_presentation(presentation)
         # Retire old export bytes before projecting fallible coordinate styles.
         self._invalidate_plot_page(kind='presentation')
-        if self.plot_tabs.currentWidget() is self.graph_documents:
+        if self._outer_view == 'workspace':
             self._apply_live_heatmap_style()
             self._annotation_layout_pending = True
         else:
-            self._annotation_layout_pending = False
             self._layout_live_plots()
             self.canvas.draw_idle()
         if getattr(self, '_live_heatmap_style_error', None):
-            self.plot_page.status_label.setText(f'Cannot prepare page: {self._live_heatmap_style_error}')
+            self.plot_page.set_status_message(f'Cannot prepare page: {self._live_heatmap_style_error}')
         if before is not None:
             label = 'Plot presentation'
             if previous.annotations != presentation.annotations:
@@ -6083,7 +4390,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_plot_presentation_error(self, message):
         self._invalidate_plot_page(kind='presentation', schedule=False)
-        self.plot_page.status_label.setText(f'Cannot prepare page: {message}')
+        self.plot_page.set_status_message(f'Cannot prepare page: {message}')
 
     def snapshot_plot_dataset(self, session=None):
         """Batch-safe snapshot hook. Inactive sessions never project into widgets."""
@@ -6109,7 +4416,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         active = key == self._document_key()
         if active and self._annotation_edit_pending:
             self._finish_annotation_edit(render=False)
-        target = self.plot_page if active else self.graph_documents.page_for(key)
+        target = self.plot_page if active else self.graph_documents.document_for(key)
         session = self.workspace.datasets.get(key[0])
         if session is None and active:
             session = self._unregistered_session
@@ -6120,9 +4427,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             target.invalidate(owner, f'Cannot prepare page: {target.presentation_error}')
             return
         if target.has_pending_project_edits():
-            target.invalidate(owner, 'Finish or correct the current page editor before preparing the page.')
+            target.invalidate(owner, 'Finish or correct the current page editor before preparing the page.',
+                              preserve_input=owner == target.expected_owner)
             return
         if active and self._heat_ax is not None:
+            # Applying style resets measured live label coordinates even when
+            # the formal frame size stays unchanged. Repair them on exposure.
+            self._annotation_layout_pending = True
             self._apply_live_heatmap_style()
             if self._live_heatmap_style_error:
                 target.invalidate(owner, f'Cannot prepare page: {self._live_heatmap_style_error}')
@@ -6152,10 +4463,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if target.commit_rendered_page(page) and active:
                 layout_pending = (getattr(self, '_annotation_layout_pending', False)
                                   or not np.allclose(frame_before, page.plot_size_in, rtol=1e-9, atol=1e-9))
-                if self.plot_tabs.currentWidget() is self.graph_documents:
+                if self._outer_view == 'workspace':
                     self._annotation_layout_pending = layout_pending
                 else:
-                    self._annotation_layout_pending = False
                     if layout_pending:
                         self._layout_live_plots()
                     self.canvas.draw_idle()
@@ -6165,13 +4475,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _adopt_prepared_page_size(self, session, key, presentation):
         """Commit measured paper size to the graph that supplied the snapshot."""
-        session.graphs[key[1]].presentation = presentation
-        target = self.graph_documents.page_for(key)
+        previous = session.graphs[key[1]].presentation
+        target = self.graph_documents.document_for(key)
         if target is None and key == self._document_key():
             target = self.plot_page
+        # Measured paper growth preserves every other presentation choice.
+        preserve_input = (target is not None and target.presentation == previous
+                          and replace(presentation, width_in=previous.width_in,
+                                      height_in=previous.height_in) == previous)
+        session.graphs[key[1]].presentation = presentation
         if target is not None:
             target.set_presentation(presentation)
-        self._invalidate_graph_document(key, kind='presentation')
+        self._invalidate_graph_document(key, kind='presentation', preserve_input=preserve_input)
         self._schedule_project_modified()
 
     def export_plot_page(self, extension):
@@ -6180,15 +4495,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._workbench_finish_editors()
             self._workbench_render()
         if self._auxiliary_active():
-            page = self.graph_documents.page_for(self.graph_documents._active_key)
-            if isinstance(page, XYPlotPage):
+            page = self.graph_documents.document_for(self.graph_documents.registry.active_key)
+            if isinstance(page, XYPlotController):
                 page._export_dialog(extension)
                 return
             raise ValueError('Choose a comparison graph to export; a workbook has no graph image.')
-        if self.plot_tabs.currentWidget() is self.graph_documents and self.graph_documents._active_key is None:
+        if self._outer_view == 'workspace' and self.graph_documents.registry.active_key is None:
             raise ValueError('Open a graph document to export.')
-        if (self._annotation_edit_pending or (self.plot_page.rendered_page is None
-                and getattr(self, '_annotation_layout_pending', False))):
+        # FocusOut can finish a title draft before its queued page preparation.
+        # Page readiness is independent of whether live geometry needs layout.
+        if self._annotation_edit_pending or self.plot_page.rendered_page is None:
             self._finish_annotation_edit(render=False)
             self._render_plot_page()
         page = self.plot_page.rendered_page
@@ -6204,7 +4520,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             saved = write_svg_png(page, path, metadata={
                 'SpectraAnalyzer': json.dumps(self._heatmap_export_metadata(), ensure_ascii=False, sort_keys=True)})
         notice = self._save_current_plot_state()
-        self.statusBar().showMessage(f'Exported {extension.upper()}: {saved}' + (f' — {notice}' if notice else ''))
+        self.publish_status(notice or '')
         return saved
 
     def _on_export_plot_page(self, extension):
@@ -6216,20 +4532,20 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def copy_graph_svg(self):
         """Publish only the final hybrid SVG after fresh validation succeeds."""
         if self._auxiliary_active():
-            page = self.graph_documents.page_for(self.graph_documents._active_key)
-            if not isinstance(page, XYPlotPage):
+            page = self.graph_documents.document_for(self.graph_documents.registry.active_key)
+            if not isinstance(page, XYPlotController):
                 raise ValueError('Select table cells and use Ctrl+C, or choose a comparison graph.')
             mime = QMimeData()
             mime.setData('image/svg+xml', page.svg_bytes())
-            QApplication.clipboard().setMimeData(mime)
+            QGuiApplication.clipboard().setMimeData(mime)
             return page
-        if self.plot_tabs.currentWidget() is self.graph_documents and self.graph_documents._active_key is None:
+        if self._outer_view == 'workspace' and self.graph_documents.registry.active_key is None:
             raise ValueError('Open a graph document to copy.')
         _session, _snapshot, page = self._capture_formal_source()
         mime = QMimeData()
         mime.setData('image/svg+xml', page.svg_bytes)
-        QApplication.clipboard().setMimeData(mime)
-        self.statusBar().showMessage(f'Copied hybrid SVG with embedded heatmap at {page.heatmap_dpi} DPI.')
+        QGuiApplication.clipboard().setMimeData(mime)
+        self.publish_status('')
         return page
 
     def _on_copy_graph_svg(self):
@@ -6243,7 +4559,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self.plot_page.set_format_names(self._plot_format_store.list_names(), selected)
         except (ValueError, OSError, TypeError) as exc:
             self.plot_page.set_format_names(())
-            self.plot_page.status_label.setText(f'Cannot read named formats: {exc}')
+            self.plot_page.set_status_message(f'Cannot read named formats: {exc}')
 
     def save_plot_format(self, name):
         session, snapshot, page = self._capture_formal_source()
@@ -6258,15 +4574,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self.plot_page.set_transfer_availability(available, self._plot_settings_source_label)
         self._refresh_graph_commands()
         if available:
-            self.plot_page.comparison_btn.setToolTip(self.plot_page.comparison_btn.toolTip() +
-                f'\nSource: {session.source_path} [ID: {session.dataset_id}]')
+            self.plot_page.set_command_availability('comparison', True,
+                self.plot_page.command_tooltip('comparison') + f'\nSource: {session.source_path} [ID: {session.dataset_id}]')
         if hasattr(self, '_settings_copy_action'):
             self._settings_copy_action.setEnabled(available)
             self._settings_copy_to_action.setEnabled(available)
             self._settings_paste_action.setEnabled(available and self._plot_settings_clipboard is not None)
-            self._settings_paste_action.setToolTip(self.plot_page.paste_settings_btn.toolTip())
+            self._settings_paste_action.setToolTip(self.plot_page.command_tooltip('settings_paste'))
             self._comparison_action.setEnabled(available)
-            self._comparison_action.setToolTip(self.plot_page.comparison_btn.toolTip())
+            self._comparison_action.setToolTip(self.plot_page.command_tooltip('comparison'))
 
     def _capture_formal_source(self):
         """Finalize editors and validate fresh formal bytes before freezing a source."""
@@ -6276,7 +4592,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._workbench_render()
             page = self.plot_page.rendered_page
             if page is None or page.owner_token != self._plot_owner_token():
-                raise ValueError(self.plot_page.status_label.text())
+                raise ValueError(self.plot_page.status_text)
             return self.workspace.active, self.plot_page.preview.snapshot, page
         session = self.workspace.active
         if session is None or session.current_cube is None:
@@ -6285,19 +4601,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             raise ValueError('Wait for the current operation before capturing this page.')
         if self.plot_page.presentation_error is not None:
             raise ValueError(f'Correct the current page editor first: {self.plot_page.presentation_error}')
-        for name in ('xmin', 'xmax', 'ymin', 'ymax', 'vmin', 'vmax'):
-            control = getattr(self, name + '_spin')
-            if not control.hasAcceptableInput():
-                raise ValueError(f'Correct the current range editor first: {name}.')
-            control.interpretText()
-        self.plot_page.finish_editor()
+        self._finish_graph_editors(capture_science=False)
         self._finish_annotation_edit()
         self._finish_history_edit()
         self._sync_formal_plot_view()
         self._render_plot_page()
         page = self.plot_page.rendered_page
         if page is None or page.owner_token != self._plot_owner_token():
-            raise ValueError(self.plot_page.status_label.text())
+            raise ValueError(self.plot_page.status_text)
         return session, self.plot_page.preview.snapshot, page
 
     def copy_plot_settings(self):
@@ -6307,7 +4618,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._plot_settings_clipboard = template
         self._plot_settings_source_label = f'{session.source_path} — {session.active_graph.name} [ID: {session.dataset_id}]'
         self._refresh_transfer_controls()
-        self.statusBar().showMessage('Copied settings from ' + self._plot_settings_source_label)
+        self.publish_status('')
         return template
 
     def create_paste_settings_dialog(self, *, current_only=False):
@@ -6318,7 +4629,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             raise ValueError('Choose an imported target dataset first.')
         self.capture_active_dataset()
         return ApplyFormatDialog(sessions, self.workspace.active_dataset_id, self._plot_settings_clipboard,
-                                 self, source_label=self._plot_settings_source_label)
+                                 self.root_window, source_label=self._plot_settings_source_label)
 
     def paste_plot_settings(self, dataset_ids=None, *, options=None, annotation_pairs=None):
         if self._plot_settings_clipboard is None:
@@ -6332,7 +4643,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         label = f'{session.source_path} — {session.active_graph.name} [ID: {session.dataset_id}]'
         window = PlotComparisonWindow(page, source_label=label,
             metadata=self._plot_dataset_metadata(session, snapshot), png_dpi=session.presentation.heatmap_dpi,
-            output_folder=self._output_folder(session), parent=self)
+            output_folder=self._output_folder(session), parent=self.root_window)
         self._plot_comparison_windows.append(window)
         window.destroyed.connect(lambda: self._forget_plot_comparison(window))
         window.show()
@@ -6369,7 +4680,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         dialog = None
         try:
             dialog = self.create_paste_settings_dialog(current_only=current_only)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
+            if dialog.exec() == 1:
                 self._report_format_outcomes(self.paste_plot_settings(dialog.selected_ids(),
                     options=dialog.options(), annotation_pairs=dialog.annotation_pairs()))
         except Exception as exc:
@@ -6389,7 +4700,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if current_only and self.workspace.active is None:
             raise ValueError('Choose an imported target dataset first.')
         return ApplyFormatDialog(sessions, self.workspace.active_dataset_id,
-                                 self._plot_format_store.load(name), self)
+                                 self._plot_format_store.load(name), self.root_window)
 
     def _save_plot_dataset(self, session):
         if not session.sidecar_writes_enabled:
@@ -6452,7 +4763,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                                  capture_fields(session, STYLE_FIELDS + ('presentation',)))
             key = (dataset_id, session.active_graph_id)
             self._invalidate_graph_document(key, kind='presentation')
-            page = self.graph_documents.page_for(key)
+            page = self.graph_documents.document_for(key)
             if page is not None:
                 page.set_presentation(session.presentation)
             active_changed |= dataset_id == self.workspace.active_dataset_id
@@ -6468,15 +4779,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._project_plot_dataset(self.workspace.active)
         self._schedule_plot_page_render()
         failures = sum(not item['success'] for item in outcomes)
-        self.statusBar().showMessage(f'Format applied: {len(outcomes)-failures}/{len(outcomes)} datasets; {failures} failed')
+        self.publish_status(
+            f'Format applied: {len(outcomes)-failures}/{len(outcomes)} datasets; {failures} failed' if failures else '')
         skipped = [item['source'] for item in outcomes if item.get('notice')]
         if skipped:
-            self.plot_page.status_label.setText('Annotation positions skipped (no explicit usable pairs): ' + '; '.join(skipped))
+            self.plot_page.set_status_message('Annotation positions skipped (no explicit usable pairs): ' + '; '.join(skipped))
         return outcomes
 
     def _on_save_plot_format(self):
-        name, accepted = QInputDialog.getText(self, 'Save named plot format', 'Format name:',
-                                             text=self.plot_page.format_combo.currentText())
+        name, accepted = prompt_text(self.root_window, 'Save named plot format', 'Format name:',
+                                             text=self.plot_page.selected_format)
         if accepted:
             try:
                 self.save_plot_format(name)
@@ -6509,7 +4821,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _show_named_format_dialog(self, name, *, current_only):
         dialog = self.create_format_dialog(name, current_only=current_only)
         try:
-            if dialog.exec() == QDialog.DialogCode.Accepted:
+            if dialog.exec() == 1:
                 self._report_format_outcomes(self.apply_plot_format(name, dialog.selected_ids(),
                     options=dialog.options(), annotation_pairs=dialog.annotation_pairs()))
         finally:
@@ -6583,7 +4895,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                     raise ValueError('The selected graph is unpublished. Open it before exporting.')
                 if editor_error and active is session and graph_id == active.active_graph_id:
                     raise ValueError(editor_error)
-                target_page = self.graph_documents.page_for((dataset_id, graph_id))
+                target_page = self.graph_documents.document_for((dataset_id, graph_id))
                 if target_page is not None and target_page.has_pending_project_edits():
                     raise ValueError('Finish or correct the selected graph page editor before exporting.')
                 candidate = detached_graph_session(replace(session, active_graph_id=graph_id))
@@ -6607,11 +4919,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._plot_batch_basenames = tuple(job.basename for job in jobs)
         self._plot_batch_labels = tuple(job.target_label for job in jobs)
         self._plot_batch = SerialPlotBatch(jobs,formats=formats, prepare_page=self._prepare_batch_page)
-        self.plot_page.batch_export_btn.setEnabled(False)
+        self.plot_page.set_batch_state(export_enabled=False)
         self._refresh_graph_commands()
-        self.plot_page.batch_progress.setVisible(True)
-        self.plot_page.batch_progress.setRange(0,len(entries))
-        self.plot_page.batch_cancel_btn.setVisible(True)
+        self.plot_page.set_batch_state(visible=True, maximum=len(entries), cancel_visible=True)
         self._update_plot_batch_report()
         if self._plot_batch.done:
             self._finish_plot_batch()
@@ -6630,7 +4940,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         key = (job.snapshot.dataset_id, job.snapshot.graph_id)
         session = self.workspace.datasets.get(key[0])
         graph = session.graphs.get(key[1]) if session is not None else None
-        target = self.graph_documents.page_for(key)
+        target = self.graph_documents.document_for(key)
         snapshot = job.snapshot
         if (graph is not None and graph.presentation == job.presentation
                 and snapshot.owner_token == self._plot_owner_token(key)
@@ -6672,13 +4982,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         lines.extend(self._plot_batch_save_notices.values())
         self.plot_batch_report = '\n'.join(lines)
         summary = self.plot_batch_summary
-        self.plot_page.batch_progress.setValue(summary.completed+summary.canceled)
+        self.plot_page.set_batch_state(value=summary.completed+summary.canceled)
         warning_count = len(self._plot_batch_save_notices)
         warning_status = f' · {warning_count} settings warning' + ('s' if warning_count != 1 else '') if warning_count else ''
-        self.plot_page.batch_status.setText(f'{summary.completed}/{summary.total} attempted · '
-                                           f'{summary.failed} failed · {summary.canceled} canceled{warning_status}')
-        self.plot_page.batch_status.setToolTip(self.plot_batch_report)
-        self.plot_page.batch_results_btn.setEnabled(bool(self.plot_batch_report))
+        self.plot_page.set_batch_state(status=f'{summary.completed}/{summary.total} attempted · '
+            f'{summary.failed} failed · {summary.canceled} canceled{warning_status}',
+            tooltip=self.plot_batch_report, results_enabled=bool(self.plot_batch_report))
 
     def _step_plot_batch(self):
         self._plot_batch_timer.stop()
@@ -6699,20 +5008,22 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._finish_plot_batch()
 
     def _finish_plot_batch(self):
-        self.plot_page.batch_export_btn.setEnabled(True)
+        self.plot_page.set_batch_state(export_enabled=True)
         self._refresh_graph_commands()
-        self.plot_page.batch_cancel_btn.setVisible(False)
-        self.statusBar().showMessage(self.plot_page.batch_status.text())
+        self.plot_page.set_batch_state(cancel_visible=False)
+        summary = self.plot_batch_summary
+        self.publish_status(self.plot_page.formal.state['batch']['status']
+            if summary.failed or summary.canceled or self._plot_batch_save_notices else '')
         if self.plot_page.rendered_page is None and self.current_cube is not None:
             self._schedule_plot_page_render()
 
     def _on_batch_export_plot(self):
-        dialog = BatchExportDialog(self.workspace.datasets.values(),self.workspace.active_dataset_id,self)
+        dialog = BatchExportDialog(self.workspace.datasets.values(), self.workspace.active_dataset_id, self.root_window)
         try:
             if self._project_path is not None:
-                dialog.common_folder.setText('Use one output folder (default: project folder for saved datasets)')
-                dialog.folder_edit.setText(str(self._output_folder()))
-            if dialog.exec() == QDialog.DialogCode.Accepted:
+                dialog.set_destination_label('Use one output folder (default: project folder for saved datasets)')
+                dialog.set_destination_folder(str(self._output_folder()))
+            if dialog.exec() == 1:
                 self.start_plot_batch(graph_targets=dialog.selected_graph_targets(),
                     formats=dialog.formats(),common_folder=dialog.destination())
         except (ValueError, OSError, TypeError) as exc:
@@ -6721,32 +5032,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             dialog.deleteLater()
 
     def create_plot_batch_results_dialog(self):
-        dialog=QDialog(self)
-        dialog.setWindowTitle('Batch export results')
-        dialog.resize(760,480)
-        layout=QVBoxLayout(dialog)
-        report=QPlainTextEdit()
-        report.setReadOnly(True)
-        report.setPlainText(self.plot_batch_report)
-        report.setAccessibleName('Per-DAT, per-graph and per-format batch export outcomes')
-        dialog.report_text=report
-        layout.addWidget(report)
-        buttons=QDialogButtonBox(QDialogButtonBox.Close)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        return dialog
+        return self._quick_host.show_batch_report(self.plot_batch_report)
 
     def _on_plot_batch_results(self):
-        dialog=self.create_plot_batch_results_dialog()
-        dialog.exec()
-        dialog.deleteLater()
+        self.create_plot_batch_results_dialog()
 
     def _on_color_mapping_changed(self, *_args):
         with self._edit_transaction('Color mapping', ('view.norm',) + COLOR_FIELDS):
             session = self.workspace.active or self._unregistered_session
-            session.view.norm = NormSpec(str(self.mapping_combo.currentData()), self.linthresh_spin.value())
+            session.view.norm = NormSpec(str(self._dat_view().norm.kind), self._dat_view().norm.linthresh)
             session.view.last_valid_region_color_limits = []
-            self.linthresh_spin.setEnabled(session.view.norm.kind == 'symlog')
             self._invalidate_plot_page()
             if self.current_cube is None:
                 return
@@ -6755,7 +5050,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 self._plot_cube()
             except ValueError as exc:
                 self._on_plot_presentation_error(str(exc))
-                self.statusBar().showMessage(str(exc))
+                self.publish_status(str(exc))
 
     def _current_norm_spec(self):
         return (self.workspace.active or self._unregistered_session).view.norm
@@ -6763,10 +5058,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _update_mapping_status(self):
         session = self.workspace.active or self._unregistered_session
         cube, view = graph_cube(session), session.view
-        if not hasattr(self, 'mapping_status_label'):
-            return
-        self.mapping_status_label.setVisible(view.norm.kind == 'log' and cube is not None)
         if view.norm.kind != 'log' or cube is None:
+            self._dat_status('mapping_status', '')
             return
         xlo, xhi = sorted(view.x_limits)
         ylo, yhi = sorted(view.y_limits)
@@ -6774,15 +5067,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         columns = (cube.energy >= xlo) & (cube.energy <= xhi)
         values = cube.z[np.ix_(rows, columns)]
         count = int(np.count_nonzero(np.isfinite(values) & (values <= 0)))
-        self.mapping_status_label.setText(f'Log: {count} visible nonpositive cells shown gray.')
+        self._dat_status('mapping_status', f'Log: {count} visible nonpositive cells shown gray.')
 
     def _display_mapping_error(self, message):
         self._invalidate_plot_page(schedule=False)
-        self.plot_page.status_label.setText(f'Cannot prepare page: {message}')
-        self.statusBar().showMessage(message)
+        self.plot_page.set_status_message(f'Cannot prepare page: {message}')
+        self.publish_status(message)
 
     def _show_error(self, msg: str) -> None:
-        QMessageBox.critical(self, "Error", msg)
+        prompt_message(self.root_window, "Error", msg, (PromptAction.OK,), PromptAction.OK, kind="error")
 
     def _disconnect_lasso_selector(self) -> None:
         if self._lasso_selector is None:
@@ -6811,22 +5104,44 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 },
             )
         except Exception as exc:
-            self.statusBar().showMessage(f"Lasso init failed: {exc}")
+            self.publish_status(f"Lasso init failed: {exc}")
             self._lasso_mode = False
-            self.lasso_helper_label.setVisible(False)
-            self.lasso_mode_btn.blockSignals(True)
-            self.lasso_mode_btn.setChecked(False)
-            self.lasso_mode_btn.blockSignals(False)
+            self._analysis_status()
             self._lasso_selector = None
 
     def _set_canvas_cursor_for_event(self, event: Any | None = None) -> None:
+        if self.toolbar.mode:
+            return
         if not self._lasso_mode:
-            self.canvas.unsetCursor()
+            self.dat_canvas.set_cursor(Qt.ArrowCursor)
             return
         if event is not None and event.inaxes is self._heat_ax:
-            self.canvas.setCursor(Qt.CrossCursor)
+            self.dat_canvas.set_cursor(Qt.CrossCursor)
             return
-        self.canvas.unsetCursor()
+        self.dat_canvas.set_cursor(Qt.ArrowCursor)
+
+    def _cancel_canvas_gesture(self) -> None:
+        """Retire view-local drags without applying edits to a replacement owner."""
+        if getattr(self, '_motion_cid', None) is not None:
+            self.canvas.mpl_disconnect(self._motion_cid)
+            self._motion_cid = None
+        marker = getattr(self, '_drag_scatter', None)
+        self._drag_peak_arr_idx = self._drag_current_x = self._drag_scatter = None
+        if marker is not None and marker.axes is not None:
+            axes = marker.axes
+            marker.remove()
+            handles, labels = axes.get_legend_handles_labels()
+            if handles:
+                axes.legend(loc='upper right', fontsize=PLOT_FONT_SIZE)
+            elif axes.get_legend() is not None:
+                axes.get_legend().remove()
+            self.canvas.draw_idle()
+        self._batch_delete_circle_start = None
+        selector = getattr(self, '_lasso_selector', None)
+        if selector is not None:
+            selector.clear()
+            selector.verts = None
+            selector._eventpress = selector._eventrelease = None
 
     def _clear_lasso_selection_visual(self) -> None:
         if self._lasso_selection_patch is not None:
@@ -6838,28 +5153,28 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _update_lasso_actions(self) -> None:
         has_sel = bool(self._lasso_selected_peak_ids)
-        self.delete_lasso_btn.setEnabled(has_sel)
-        self.clear_lasso_btn.setEnabled(has_sel)
+        self._analysis_status(deleteLassoEnabled=has_sel)
+        self._analysis_status(clearLassoEnabled=has_sel)
 
     def _selected_x_axis_override(self) -> str | None:
-        return self.x_axis_override_combo.currentData()
+        return self.dat_properties._axis_override
 
     def _refresh_axis_status(self) -> None:
         if self.current_cube is None:
-            self.axis_status_label.setText("X-axis: no file loaded.")
-            self.fit_axis_label.setText("Analysis axis: no file loaded.")
+            self._dat_status('axis_status', "X-axis: no file loaded.")
+            self._analysis_status(axisText="Analysis axis: no file loaded.")
             return
 
         cube = self.current_cube
         override = self._selected_x_axis_override()
-        override_txt = "Auto Detect" if override is None else self.x_axis_override_combo.currentText()
+        override_txt = "Auto Detect" if override is None else dict(AXIS_OVERRIDE_ITEMS).get(override, str(override))
         ambiguity = "Ambiguous auto-detect. Manual override is recommended." if cube.x_is_ambiguous else "Auto-detect is confident."
-        self.axis_status_label.setText(
+        self._dat_status('axis_status', 
             f"Detected: {cube.x_original_label} via {cube.x_detection_source}. {cube.x_detection_note}\n"
             f"Conversion: {cube.photon_energy_note}\n"
             f"Override: {override_txt}. {ambiguity}"
         )
-        self.fit_axis_label.setText(
+        self._analysis_status(axisText=
             f"Analysis axis: {cube.energy_label}. Original axis preserved as {cube.x_original_label}."
         )
 
@@ -6953,13 +5268,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return lo - pad, hi + pad
 
     def _fit_range_bounds(self) -> tuple[float, float]:
-        a = float(self.fit_xmin_spin.value())
-        b = float(self.fit_xmax_spin.value())
+        a = float(self._analysis_controls().fit_xmin)
+        b = float(self._analysis_controls().fit_xmax)
         return (a, b) if a <= b else (b, a)
 
     def _peak_search_bounds(self) -> tuple[float, float]:
-        a = float(self.xmin_spin.value())
-        b = float(self.xmax_spin.value())
+        a = float(self._dat_number('xmin'))
+        b = float(self._dat_number('xmax'))
         return (a, b) if a <= b else (b, a)
 
     def _fit_mask(self, x: np.ndarray) -> np.ndarray:
@@ -6984,7 +5299,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if xr.size < 5:
             raise ValueError("Fit range is too narrow. Need at least 5 points.")
         if smooth:
-            requested = int(self.fit_smooth_win_spin.value()) if smooth_window is None else int(smooth_window)
+            requested = int(self._analysis_controls().fit_smooth_window) if smooth_window is None else int(smooth_window)
             win = _clamp_sg_window(xr.size, requested)
             if win >= 3 and xr.size > win:
                 yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
@@ -7129,32 +5444,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return f"{int(points)} pt ({axis_value:.6g} {unit})"
 
     def _update_fit_param_unit_labels(self) -> None:
-        if not hasattr(self, "lw_min_value_label"):
-            return
-        self.lw_min_value_label.setText(self._format_pts_conversion(int(self.lw_min_spin.value())))
-        maximum = int(self.lw_max_spin.value())
-        self.lw_max_value_label.setText(self._format_pts_conversion(maximum) if maximum else "Auto")
-        self.peak_move_value_label.setText(self._format_pts_conversion(int(self.peak_move_limit_spin.value())))
-        gaussian = self.fit_model_combo.currentText() == "Gaussian"
-        parameter = "sigma" if gaussian else "HWHM gamma"
-        model = "Gaussian" if gaussian else "Lorentzian"
-        fwhm = "FWHM ≈ 2.35482 × sigma" if gaussian else "FWHM = 2 × gamma"
-        row_name = "sigma" if gaussian else "HWHM"
-        self.lw_min_name_label.setText(f"Min {row_name}:")
-        self.lw_max_name_label.setText(f"Max {row_name}:")
-        self.fit_width_help_label.setText(
-            f"{model} width is {parameter}; {fwhm}. "
-            "Bounds use points, converted to X-axis units."
-        )
-        unit_note = "The equivalent size in the current analysis-axis units is shown beside the control."
-        self.lw_min_spin.setToolTip(
-            f"Minimum allowed {model} linewidth parameter ({parameter}) in data points.\n{unit_note}"
-        )
-        self.lw_max_spin.setToolTip(
-            f"Maximum allowed {model} linewidth parameter ({parameter}) in data points.\n"
-            "0 = automatic upper bound (about 2 × the fitted X span).\n"
-            f"{unit_note}"
-        )
+        controls = self._analysis_controls()
+        gaussian = controls.fit_model == 'Gaussian'
+        parameter = 'sigma' if gaussian else 'HWHM gamma'
+        model = 'Gaussian' if gaussian else 'Lorentzian'
+        fwhm = 'FWHM ≈ 2.35482 × sigma' if gaussian else 'FWHM = 2 × gamma'
+        row_name = 'sigma' if gaussian else 'HWHM'
+        self._analysis_status(
+            minWidthText=self._format_pts_conversion(controls.linewidth_min),
+            maxWidthText=self._format_pts_conversion(controls.linewidth_max) if controls.linewidth_max else 'Auto',
+            moveText=self._format_pts_conversion(controls.peak_move_limit),
+            minWidthLabel=f'Min {row_name}:', maxWidthLabel=f'Max {row_name}:',
+            widthHelp=f'{model} width is {parameter}; {fwhm}. Bounds use points, converted to X-axis units.')
 
     def _current_peak_overlay_rows(self) -> list[tuple[float, float, float]]:
         if self.current_cube is None:
@@ -7233,15 +5534,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _current_second_derivative_trace(
         self, x: np.ndarray, y: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray] | None:
-        if not self._d2_radio.isChecked():
+        if not self._analysis_controls().derivative_detection:
             return None
         mask = self._peak_search_mask(x)
         xr = np.asarray(x[mask], dtype=float)
         yr = np.asarray(y[mask], dtype=float)
         if xr.size < 5:
             return None
-        win = _clamp_sg_window(xr.size, int(self.d2_sg_win_spin.value()))
-        polyorder = min(max(1, int(self.d2_sg_poly_spin.value())), win - 1)
+        win = _clamp_sg_window(xr.size, int(self._analysis_controls().d2_window))
+        polyorder = min(max(1, int(self._analysis_controls().d2_polyorder)), win - 1)
         if win < 3 or polyorder < 1:
             return None
         key = self._second_derivative_key(mask, win, polyorder)
@@ -7259,26 +5560,26 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 window, polyorder)
 
     def _peak_mode(self) -> str:
-        if self._d2_radio.isChecked():
-            return str(self.d2_mode_combo.currentText())
-        return str(self.peak_mode_combo.currentText())
+        if self._analysis_controls().derivative_detection:
+            return str(self._analysis_controls().d2_mode)
+        return str(self._analysis_controls().peak_mode)
 
     def _refresh_peak_delete_controls(self) -> None:
+        # This narrow epoch also survives a consumed menu while its label prompt
+        # runs. Replacing peaks and returning to the old values cannot revive it.
+        signature = (id(self.peak_indices), tuple(int(i) for i in self.peak_indices),
+                     self._peak_gate_idx)
+        previous = getattr(self, '_peak_menu_targets', signature)
+        if signature != previous:
+            self._retire_peak_menu()
+        self._peak_menu_targets = signature
         n = int(self._current_trace_peak_indices().size)
-        self.peak_delete_spin.blockSignals(True)
-        self.peak_delete_spin.setRange(1, max(1, n))
-        if n > 0:
-            self.peak_delete_spin.setValue(min(int(self.peak_delete_spin.value()), n))
-        else:
-            self.peak_delete_spin.setValue(1)
-        self.peak_delete_spin.blockSignals(False)
-        self.delete_peak_btn.setEnabled(n > 0)
-        self.clear_peaks_btn.setEnabled(n > 0)
+        self._analysis_status(deletePeakEnabled=n > 0, clearPeaksEnabled=n > 0)
 
     def _selected_peak_array_index(self) -> int | None:
         if self._current_trace_peak_indices().size == 0:
             return None
-        n = int(self.peak_delete_spin.value())
+        n = int(self.ordinary_analysis.state['peakNumber'])
         if n < 1 or n > int(self._current_trace_peak_indices().size):
             return None
         return int(n - 1)
@@ -7287,39 +5588,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._refresh_analysis_context()
         if hasattr(self, 'graph_documents'):
             self._indicate_sheet_gate()
-        if self.current_cube is None or self.current_cube.gate.size == 0:
-            self.plot_gate_spin.setEnabled(False)
-            self.plot_gate_index_spin.setEnabled(False)
-            self.plot_prev_gate_btn.setEnabled(False)
-            self.plot_next_gate_btn.setEnabled(False)
-            self.plot_gate_spin.blockSignals(True)
-            self.plot_gate_spin.set_allowed_values(np.asarray([], dtype=float))
-            self.plot_gate_spin.blockSignals(False)
-            self.plot_gate_index_spin.blockSignals(True)
-            self.plot_gate_index_spin.setRange(1, 1)
-            self.plot_gate_index_spin.setValue(1)
-            self.plot_gate_index_spin.blockSignals(False)
-            return
-        self.plot_gate_spin.setEnabled(True)
-        self.plot_gate_index_spin.setEnabled(True)
-        gates = np.asarray(self.current_cube.gate, dtype=float)
-        gate_idx = self._current_gate_index()
-        gate_value = float(gates[gate_idx])
-        self.plot_gate_spin.blockSignals(True)
-        self.plot_gate_spin.set_allowed_values(gates)
-        self.plot_gate_spin.setValue(gate_value)
-        self.plot_gate_spin.blockSignals(False)
-        self.plot_gate_index_spin.blockSignals(True)
-        self.plot_gate_index_spin.setRange(1, int(gates.size))
-        self.plot_gate_index_spin.setValue(gate_idx + 1)
-        self.plot_gate_index_spin.blockSignals(False)
-        self.plot_prev_gate_btn.setEnabled(gate_idx > 0)
-        self.plot_next_gate_btn.setEnabled(gate_idx < int(gates.size) - 1)
 
     def _set_current_gate_from_index(self, gate_idx: int, *, update_plot: bool = True) -> None:
         if self.current_cube is None or self.current_cube.gate.size == 0:
             return
         gate_idx = int(np.clip(gate_idx, 0, self.current_cube.gate.size - 1))
+        if self._workbench_document() is not None and not self._restoring_dataset:
+            try:
+                self._workbench_finish_editors()
+            except ValueError as exc:
+                self.publish_status(str(exc))
+                self._sync_gate_controls()
+                return
         same_peaks = (not self.batch_peak_map or (
             self._peak_gate_idx == gate_idx and
             np.array_equal(self.peak_indices, self.batch_peak_map.get(gate_idx, [])) and
@@ -7330,6 +5610,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._sync_gate_controls()
             self._refresh_fit_readiness()
             return
+        self._retire_peak_menu()
         self.current_gate = float(self.current_cube.gate[gate_idx])
         self._schedule_project_modified()
         if self.batch_peak_map:
@@ -7354,20 +5635,19 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _update_peak_text(self, gate_used: float, x: np.ndarray, y: np.ndarray, *, title_prefix: str = "Selected") -> None:
         trace_peaks = self._current_trace_peak_indices()
         if trace_peaks.size == 0:
-            self.analysis_text.setPlainText(f"{title_prefix}: no peaks.")
+            self._set_analysis_summary(f"{title_prefix}: no peaks.")
             return
         x_name = self.current_cube.energy_label if self.current_cube is not None else "X"
         lines = [f"{title_prefix} peaks @ gate {gate_used:.6g}:"]
         for i, p in enumerate(trace_peaks, start=1):
             lines.append(f"  {i}. {x_name}={x[p]:.6g}, I={y[p]:.6g}")
-        self.analysis_text.setPlainText("\n".join(lines))
+        self._set_analysis_summary("\n".join(lines))
 
     # ── CSV seeds helpers ─────────────────────────────────────────────────────
 
-    def _on_seed_source_changed(self, checked: bool) -> None:
-        if hasattr(self, "_csv_seeds_row"):
-            self._csv_seeds_row.setVisible(self._seeds_from_csv_radio.isChecked())
+    def _on_seed_source_changed(self, *_args) -> None:
         self._refresh_fit_readiness()
+        self.ordinary_analysis.refresh()
 
     def _fit_seed_status(self) -> tuple[np.ndarray, np.ndarray, str, bool]:
         """Return active seeds, in-range seeds, explanation, and detect availability."""
@@ -7376,7 +5656,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         seeds = np.asarray(self._get_seeds_for_current_gate(), dtype=float)
         xlo, xhi = self._fit_range_bounds()
         in_range = seeds[(seeds >= xlo) & (seeds <= xhi)] if seeds.size else np.asarray([], dtype=float)
-        if self._seeds_from_csv_radio.isChecked():
+        if self._analysis_controls().csv_source:
             if self._csv_seeds_map is None:
                 return seeds, in_range, "CSV source selected, but no seeds CSV is loaded.", False
             if seeds.size == 0:
@@ -7400,7 +5680,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return seeds, in_range, f"Find Peaks seeds ready: {in_range.size} in fit range.", False
 
     def _refresh_fit_readiness(self) -> None:
-        if not hasattr(self, "fit_readiness_label"):
+        if not hasattr(self, 'ordinary_analysis'):
             return
         _seeds, in_range, message, can_detect = self._fit_seed_status()
         error = self._fit_validation_error()
@@ -7412,19 +5692,20 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             message = error
         elif busy:
             message = 'Fitting current gate… Use Cancel operation to stop.'
-        if not error and self.current_cube is not None and self.fit_smooth_chk.isChecked():
+        if not error and self.current_cube is not None and self._analysis_controls().fit_smooth:
             points = int(np.count_nonzero(self._fit_mask(self.current_cube.energy)))
-            note = self._sg_window_note(self.fit_smooth_win_spin.value(), points)
+            note = self._sg_window_note(self._analysis_controls().fit_smooth_window, points)
             if note:
                 message += '\n' + note
-        self.fit_readiness_label.setText(f"Fit preparation: {message}")
-        self.fit_btn.setText('Fitting Current Gate…' if busy else
+        self._analysis_status(readinessText=f"Fit preparation: {message}")
+        self._analysis_status(fitText='Fitting Current Gate…' if busy else
                              "Detect Then Fit\nCurrent Gate" if can_detect else "Fit Current Gate")
-        self.fit_btn.setEnabled(not self._dat_import_pending and not error and not busy
+        self._analysis_status(fitEnabled=not self._dat_import_pending and not error and not busy
                                 and bool(can_detect or in_range.size))
-        self.batch_fit_btn.setText('Batch Fitting…' if batch_busy else 'Batch Fit All Gates')
-        self.batch_fit_btn.setEnabled(not self._dat_import_pending and self.current_cube is not None
-                                      and not self._fit_validation_error() and not batch_busy)
+        self._analysis_status(batchFitText='Batch Fitting…' if batch_busy else 'Batch Fit All Gates')
+        self._analysis_status(batchFitEnabled=not self._dat_import_pending and self.current_cube is not None
+                                      and not self._fit_validation_error() and not batch_busy
+                                      and bool(self._csv_seeds_map if self._analysis_controls().csv_source else self.batch_peak_map))
         self._refresh_export_actions()
 
     @staticmethod
@@ -7447,46 +5728,52 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return note
 
     def _detection_validation_error(self) -> str:
-        if self._d2_radio.isChecked():
-            return self._sg_window_error('Detection SG', self.d2_sg_win_spin.value(),
-                                         polyorder=self.d2_sg_poly_spin.value())
-        if self.peak_smooth_chk.isChecked():
-            return self._sg_window_error('Detection pre-smooth', self.peak_smooth_win_spin.value())
+        if self._analysis_controls().derivative_detection:
+            return self._sg_window_error('Detection SG', self._analysis_controls().d2_window,
+                                         polyorder=self._analysis_controls().d2_polyorder)
+        if self._analysis_controls().peak_smooth:
+            return self._sg_window_error('Detection pre-smooth', self._analysis_controls().peak_smooth_window)
         return ''
 
     def _fit_validation_error(self) -> str:
-        minimum, maximum = self.lw_min_spin.value(), self.lw_max_spin.value()
+        minimum, maximum = self._analysis_controls().linewidth_min, self._analysis_controls().linewidth_max
         if maximum != 0 and maximum <= minimum:
             return ('Max linewidth must exceed Min linewidth; use 0 for an automatic upper bound '
                     '(about 2 × the fitted X span).')
-        if self.fit_smooth_chk.isChecked():
-            return self._sg_window_error('Fit pre-smooth', self.fit_smooth_win_spin.value())
+        if self._analysis_controls().fit_smooth:
+            return self._sg_window_error('Fit pre-smooth', self._analysis_controls().fit_smooth_window)
         return ''
 
     def _refresh_analysis_controls(self, *_args) -> None:
         if self._workbench_document() is not None:
             self._workbench_refresh()
             return
-        self.peak_smooth_win_spin.setEnabled(self.peak_smooth_chk.isChecked())
-        self.fit_smooth_win_spin.setEnabled(self.fit_smooth_chk.isChecked())
         error = self._detection_validation_error()
         note = ''
         if self.current_cube is not None:
             points = int(np.count_nonzero(self._peak_search_mask(self.current_cube.energy)))
-            if self._d2_radio.isChecked():
-                note = self._sg_window_note(self.d2_sg_win_spin.value(), points,
-                                            polyorder=self.d2_sg_poly_spin.value())
-            elif self.peak_smooth_chk.isChecked():
-                note = self._sg_window_note(self.peak_smooth_win_spin.value(), points)
-        self.peak_validation_label.setText(error or note)
+            if self._analysis_controls().derivative_detection:
+                note = self._sg_window_note(self._analysis_controls().d2_window, points,
+                                            polyorder=self._analysis_controls().d2_polyorder)
+            elif self._analysis_controls().peak_smooth:
+                note = self._sg_window_note(self._analysis_controls().peak_smooth_window, points)
+        self._analysis_status(detectionText=error or note)
         batch_busy = self._analysis_request_matches('batch-find', None)
-        self.find_btn.setEnabled(not self._dat_import_pending and self.current_cube is not None and not error)
-        self.batch_find_btn.setEnabled(not self._dat_import_pending and self.current_cube is not None
+        self._analysis_status(findEnabled=not self._dat_import_pending and self.current_cube is not None and not error)
+        self._analysis_status(batchFindEnabled=not self._dat_import_pending and self.current_cube is not None
                                        and not error and not batch_busy)
-        self.batch_find_btn.setText('Batch Detecting…' if batch_busy else 'Find Peaks — All Gates')
+        self._analysis_status(fullRangeEnabled=self.current_cube is not None, currentRangeEnabled=self.current_cube is not None,
+                              findText='Find Peaks (This Gate)')
+        self._analysis_status(batchFindText='Batch Detecting…' if batch_busy else 'Find Peaks — All Gates')
         self._refresh_fit_readiness()
 
     def _guard_analysis_controls(self, *, fitting=False, detecting=False) -> bool:
+        if self._workbench_document() is None:
+            try:
+                self.ordinary_analysis.finish_editor()
+            except ValueError as exc:
+                self.publish_status(str(exc))
+                return False
         error = self._fit_validation_error() if fitting else ''
         if detecting and not error:
             error = self._detection_validation_error()
@@ -7498,7 +5785,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_fit_or_detect_current_gate(self) -> None:
         if self._workbench_document() is not None:
-            self.workbench_scope.setCurrentIndex(0)
+            self.analysis_workbench.setChoice('scope', 'current', self.analysis_workbench.ownerToken)
             return self._workbench_fit()
         if self._dat_import_pending:
             return
@@ -7514,7 +5801,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
             return
-        if self._seeds_from_csv_radio.isChecked():
+        if self._analysis_controls().csv_source:
             self._show_error("Detect Then Fit is available only for the Find Peaks source.")
             return
         if not self._guard_analysis_controls(fitting=True, detecting=True):
@@ -7532,7 +5819,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _get_seeds_for_current_gate(self) -> np.ndarray:
         """Return energy values (eV) to use as fit seeds for the current gate."""
-        if self._seeds_from_csv_radio.isChecked():
+        if self._analysis_controls().csv_source:
             if self._csv_seeds_map is None:
                 return np.asarray([], dtype=float)
             gi = self._current_gate_index()
@@ -7544,7 +5831,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _get_seeds_for_gate_idx(self, gi: int) -> np.ndarray:
         """Return energy values (eV) to use as fit seeds for gate index gi."""
-        if self._seeds_from_csv_radio.isChecked():
+        if self._analysis_controls().csv_source:
             if self._csv_seeds_map is None:
                 return np.asarray([], dtype=float)
             return np.asarray(self._csv_seeds_map.get(gi, []), dtype=float)
@@ -7571,162 +5858,71 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _reset_csv_seed_source(self) -> None:
         self._csv_seeds_map = None
-        self._csv_seeds_path = ""
-        if hasattr(self, "_csv_path_label"):
-            self._csv_path_label.setText("(none loaded)")
-        if hasattr(self, "_seeds_from_find_peak_radio"):
-            self._seeds_from_find_peak_radio.setChecked(True)
+        self._csv_seeds_path = ''
+        self._analysis_controls().csv_source = False
+        self._analysis_status()
 
     def _on_browse_root(self) -> None:
         if self._dat_import_pending:
             return
-        folder = QFileDialog.getExistingDirectory(self, "Choose Root Folder", self.current_root or ".")
+        folder = FilePicker.getExistingDirectory(self.root_window, "Choose Root Folder", self.current_root or ".")
         if not folder:
             return
         self.current_root = folder
-        self.root_edit.setText(folder)
-        self.file_list.clear()
-        self.folder_combo.clear()
-        self.current_folder = ""
+        self.current_folder = ''
+        ticket = self.source_navigation.begin_root(folder)
         root = Path(folder)
         self._start_background_job(
             lambda context: discover_folders(root, context),
-            lambda folders: self._apply_dat_folders(folder, folders), "Finding DAT folders…")
+            lambda folders: self._apply_dat_folders(ticket, folders), "Finding DAT folders…")
 
-    def _apply_dat_folders(self, folder: str, folders: list[Path]) -> None:
-        self.folder_combo.blockSignals(True)
-        self.folder_combo.clear()
-        for p in folders:
-            rel = "." if p == Path(folder) else str(p.relative_to(folder))
-            self.folder_combo.addItem(rel, str(p))
-        self.folder_combo.blockSignals(False)
-        if not folders:
-            self.current_folder = ""
-            self.file_list.clear()
-            self.statusBar().showMessage("No .dat files found under selected root.")
+    def _apply_dat_folders(self, ticket, folders: list[Path]) -> None:
+        if not self.source_navigation.apply_folders(ticket, folders):
             return
-        self.folder_combo.setCurrentIndex(0)
-        self._on_folder_changed()
+        if not folders:
+            self.current_folder = ''
+            self.publish_status("No .dat files found under selected root.")
 
-    def _on_folder_changed(self) -> None:
+    def _on_folder_changed(self, folder=None) -> None:
         if self._dat_import_pending:
             return
-        folder = self.folder_combo.currentData()
+        folder = folder or self.source_navigation.selectedFolder
         if not folder:
             return
         self.current_folder = str(folder)
-        self.file_list.clear()
+        ticket = self.source_navigation.begin_folder(folder)
         path = Path(folder)
         self._start_background_job(
-            lambda context: discover_files(path, context), self._apply_dat_files, "Reading folder…")
+            lambda context: discover_files(path, context),
+            lambda files: self._apply_dat_files(ticket, files), "Reading folder…")
 
-    def _apply_dat_files(self, files: list[str]) -> None:
-        self.file_list.clear()
-        for name in files:
-            path = (Path(self.current_folder) / name).resolve()
-            item = QListWidgetItem(name)
-            item.setData(Qt.UserRole, str(path))
-            item.setToolTip(str(path))
-            self.file_list.addItem(item)
+    def _apply_dat_files(self, ticket, files: list[str]) -> None:
+        if not self.source_navigation.apply_files(ticket, files):
+            return
         if files:
-            self.file_list.setCurrentRow(0)
-            self.statusBar().showMessage(f"Folder ready: {len(files)} dat files.")
+            self.publish_status('')
         else:
-            self.statusBar().showMessage("No dat files in selected process folder.")
+            self.publish_status("No dat files in selected process folder.")
 
     def _on_load_selected_file(self) -> None:
         if self._dat_import_pending:
             return
-        item = self.file_list.currentItem()
-        if item is None:
+        if not self.source_navigation.selectedFile:
             self._show_error("Select one DAT file first.")
             return
-        inventory_path = item.data(Qt.UserRole)
-        path = Path(inventory_path) if inventory_path else Path(self.current_folder) / item.text().strip()
-        self._import_data_files([path])
+        self.source_navigation.loadSelected()
 
     def _refresh_imported_datasets(self) -> None:
-        if not hasattr(self, 'imported_dataset_list'):
+        if not hasattr(self, 'source_navigation'):
             return
-        with QSignalBlocker(self.imported_dataset_list):
-            self.imported_dataset_list.clear()
-            sessions = list(self.workspace.datasets.values())
-            labels = dataset_display_labels(sessions)
-            for session in sessions:
-                path = session.source_path
-                label = labels[session.dataset_id]
-                item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, session.dataset_id)
-                item.setToolTip(str(path.resolve()))
-                self.imported_dataset_list.addItem(item)
-                if session.dataset_id == self.workspace.active_dataset_id:
-                    self.imported_dataset_list.setCurrentItem(item)
-            self._filter_imported_datasets()
-        self._resize_imported_dataset_list(persist=False)
+        self.source_navigation.sync(reset_status=True)
         self._schedule_project_modified()
-        if not self._dat_import_pending:
-            self.dat_import_status_label.setText(
-                f'{len(sessions)} imported dataset(s).' if sessions
-                else 'No imported datasets. Import or drop DAT files to begin.')
-
-    def _resize_imported_dataset_list(self, *_args, persist=True) -> None:
-        rows = self.imported_dataset_rows_spin.value()
-        row_height = self.imported_dataset_list.sizeHintForRow(0)
-        row_height = max(row_height, self.imported_dataset_list.fontMetrics().height() + 6)
-        margins = self.imported_dataset_list.contentsMargins()
-        height = rows * row_height + margins.top() + margins.bottom() + 2 * self.imported_dataset_list.frameWidth()
-        self.imported_dataset_list.setFixedHeight(height)
-        if persist:
-            self._annotation_settings.setValue('datasets/list_rows', rows)
-
-    def _filter_imported_datasets(self) -> None:
-        query = self.imported_dataset_search.text().strip().casefold()
-        visible = 0
-        with QSignalBlocker(self.imported_dataset_list):
-            for row in range(self.imported_dataset_list.count()):
-                item = self.imported_dataset_list.item(row)
-                path = self.workspace.datasets[item.data(Qt.UserRole)].source_path
-                matches = not query or query in path.name.casefold() or query in str(path.parent).casefold()
-                item.setHidden(not matches)
-                visible += matches
-        total = self.imported_dataset_list.count()
-        count = f'{visible} / {total} shown' if query else str(total)
-        self.imported_dataset_label.setText(f'Imported datasets ({count})')
-        self.imported_dataset_filter_status_label.setVisible(bool(total and not visible))
-
-    def _on_imported_dataset_changed(self, item, _previous) -> None:
-        if self._dat_import_pending or item is None:
-            return
-        dataset_id = item.data(Qt.UserRole)
-        if dataset_id != self.workspace.active_dataset_id:
-            try:
-                self.activate_dataset(dataset_id)
-            except ValueError as exc:
-                self._refresh_imported_datasets()
-                self._show_error(str(exc))
-
-    def _show_dataset_context_menu(self, position) -> None:
-        item = self.imported_dataset_list.itemAt(position)
-        if item is None:
-            return
-        dataset_id = item.data(Qt.UserRole)
-        if dataset_id not in self.workspace.datasets:
-            return
-        menu = QMenu(self)
-        menu.addAction('Copy Source Path', lambda: self._copy_dataset_source_path(dataset_id))
-        menu.addAction('Open Source Folder', lambda: self._open_dataset_folder(dataset_id))
-        menu.addAction('Open Export Folder', lambda: self._open_dataset_folder(dataset_id, export=True))
-        menu.addSeparator()
-        remove = menu.addAction('Remove from Project', lambda: self._on_remove_dataset(dataset_id))
-        remove.setEnabled(not self._project_busy())
-        menu.exec(self.imported_dataset_list.viewport().mapToGlobal(position))
-        menu.deleteLater()
 
     def _copy_dataset_source_path(self, dataset_id: str) -> None:
         session = self.workspace.datasets.get(dataset_id)
         if session is not None and session.source_path is not None:
-            QApplication.clipboard().setText(str(session.source_path))
-            self.statusBar().showMessage(f'Copied source path: {session.source_path}')
+            QGuiApplication.clipboard().setText(str(session.source_path))
+            self.publish_status('')
 
     def _open_dataset_folder(self, dataset_id: str, *, export: bool = False) -> bool:
         session = self.workspace.datasets.get(dataset_id)
@@ -7745,23 +5941,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _on_import_dats(self) -> None:
         self._on_import_data()
 
-    def _set_dat_import_pending(self, pending: bool) -> None:
-        """The request owns this lock, independently of retained cancelled threads."""
-        controls = (self.import_dats_btn, self.imported_dataset_search, self.imported_dataset_list, self.browse_btn,
-                    self.folder_combo, self.file_list, self.load_btn,
-                    self.x_axis_override_combo, self._processing_content, self._analysis_tabs)
-        self._dat_import_pending = pending
-        if pending:
-            self._dat_import_enabled_states = {control: control.isEnabled() for control in controls}
-            for control in controls:
-                control.setEnabled(False)
-            self.dat_import_status_label.setText('Preparing data… Dataset switching and analysis are paused.')
-            self.import_dats_btn.setAccessibleDescription('Import in progress; use Cancel operation to stop.')
-        else:
-            for control, enabled in self._dat_import_enabled_states.items():
-                control.setEnabled(enabled)
-            self._dat_import_enabled_states.clear()
-            self.import_dats_btn.setAccessibleDescription('')
+    def _set_dat_import_pending(self, pending):
+        self._dat_import_pending = bool(pending)
+        self.source_navigation.set_import_pending(pending)
+        if not pending:
             self._refresh_fit_readiness()
             self._refresh_export_actions()
             self._refresh_imported_datasets()
@@ -7790,8 +5973,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         token = self._dat_import_token
         self._job_cancel_requested = False
         self._set_dat_import_pending(True)
-        self._job_cancel_button.show()
-        self.statusBar().showMessage(f'Importing {len(ordered)} DAT file(s)…')
+        self.set_cancel_visible(True)
+        self.publish_status(f'Importing {len(ordered)} DAT file(s)…')
 
         def work(context):
             batch = prepare_dat_batch(requests, context)
@@ -7821,16 +6004,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _dat_import_progress(self, token: int, message: str) -> None:
         if self._dat_import_is_current(token):
-            self.statusBar().showMessage(message)
+            self.publish_status(message)
 
     def _dat_import_failed(self, token: int, error: Exception) -> None:
         if not self._dat_import_is_current(token):
             return
         self._set_dat_import_pending(False)
-        self._job_cancel_button.hide()
+        self.set_cancel_visible(False)
         message = f'Data import failed: {error}'
-        self.dat_import_status_label.setText(message)
-        self.statusBar().showMessage(message)
+        self.source_navigation.set_import_status(message)
+        self.publish_status(message)
         self._show_error(message)
 
     def _accept_dat_import(self, token: int, ordered, candidates, errors) -> None:
@@ -7856,24 +6039,24 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             save_notice = self._save_current_plot_state()
             self.current_folder = str(first.source_path.parent)
             self.activate_dataset(first.dataset_id, capture_outgoing=False)
-            active_notice = self.statusBar().currentMessage()
+            active_notice = self._status_text
             if save_notice:
                 active_notice += ' — ' + save_notice
         else:
             active_notice = 'No DAT files imported; current dataset preserved.'
-        self._job_cancel_button.hide()
+        self.set_cancel_visible(False)
         message = f'Imported {len(candidates)} new dataset(s). {active_notice}'
         if errors:
             failed = '\n'.join(f'{failure.path}: {failure.reason}' for failure in errors)
             message += f' {len(errors)} file(s) failed.'
-            self.dat_import_status_label.setText(message + '\n' + failed + ('\n' + '\n'.join(notices) if notices else ''))
-            self.statusBar().showMessage(message)
+            self.source_navigation.set_import_status(message + '\n' + failed + ('\n' + '\n'.join(notices) if notices else ''))
+            self.publish_status(message)
             self._show_error('DAT import completed with file errors:\n' + failed)
         else:
             if notices:
                 message += ' ' + ' '.join(notices)
-            self.dat_import_status_label.setText(message)
-            self.statusBar().showMessage(message)
+            self.source_navigation.set_import_status(message)
+            self.publish_status(message)
 
     def _start_background_job(self, work, apply, description: str, *, on_error=None,
                               owner=None) -> None:
@@ -7886,11 +6069,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if owner != 'analysis':
             self._analysis_request = None
         self._job_cancel_requested = False
-        self._job_cancel_button.show()
-        self.statusBar().showMessage(description)
+        self.set_cancel_visible(True)
+        self.publish_status(description)
         self._background_jobs.start(
             work, apply, on_error=on_error or (lambda exc: self._show_error(str(exc))),
-            on_progress=self.statusBar().showMessage)
+            on_progress=self.publish_status)
         self._refresh_analysis_controls()
         self._refresh_processing_controls()
         self._refresh_graph_commands()
@@ -7898,13 +6081,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _cancel_background_job(self) -> None:
         if self._project_io_jobs.busy:
             if self._project_io_finalizing:
-                self.statusBar().showMessage('Finishing opened project…')
+                self.publish_status('Finishing opened project…')
                 return
             self._project_io_cancelled = True
             if not self._project_io_committed:
                 self._project_io_completion = None
             self._project_io_cancel_event.set()
-            self.statusBar().showMessage('Cancelling project operation…')
+            self.publish_status('Cancelling project operation…')
             return
         self._workbench_cancel_job()
         self._finish_xy_analysis_jobs(cancelled=True)
@@ -7917,18 +6100,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._background_jobs.cancel()
             self._set_dat_import_pending(False)
             self._job_cancel_requested = False
-            self._job_cancel_button.hide()
+            self.set_cancel_visible(False)
             message = 'Data import cancelled. No new sources were added.'
-            self.dat_import_status_label.setText(message)
-            self.statusBar().showMessage(message)
+            self.source_navigation.set_import_status(message)
+            self.publish_status(message)
             return
         self._background_jobs.cancel()
         self._job_cancel_requested = self._background_jobs.busy
         if self.current_cube is not None:
-            with QSignalBlocker(self.x_axis_override_combo):
-                self.x_axis_override_combo.setCurrentIndex(
-                    self.x_axis_override_combo.findData(self.current_cube.x_override))
-        self.statusBar().showMessage(
+            self.dat_properties._axis_override = self.current_cube.x_override
+            self.dat_properties.syncFromOwner()
+        self.publish_status(
             "Cancelling; waiting for the current operation…"
             if self._job_cancel_requested else "Operation cancelled.")
         self._refresh_analysis_controls()
@@ -7944,10 +6126,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._refresh_processing_controls()
         self._refresh_graph_commands()
         if not self._dat_import_pending:
-            self._job_cancel_button.hide()
+            self.set_cancel_visible(False)
         if self._job_cancel_requested:
             self._job_cancel_requested = False
-            self.statusBar().showMessage("Operation cancelled.")
+            self.publish_status("Operation cancelled.")
         if self._close_pending:
             QTimer.singleShot(0, self._retry_pending_close)
         pending, self._pending_data_review = self._pending_data_review, None
@@ -7995,15 +6177,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return
         settings = self._annotation_settings
         state = (self.workspace.active or self._unregistered_session).fixed_recipes['processing']
-        state.enabled = self.fix_processing_chk.isChecked()
-        settings.setValue("fixed_processing/enabled", self.fix_processing_chk.isChecked())
-        if self.fix_processing_chk.isChecked():
-            state.recipe = {
-                "mode": self.processing_mode_combo.currentData(),
-                "smooth": self.processing_smooth_chk.isChecked(),
-                "window_length": self.processing_window_spin.value(),
-            }
-            settings.setValue("fixed_processing/recipe", json.dumps(state.recipe))
+        settings.setValue('fixed_processing/enabled', state.enabled)
+        if state.enabled:
+            pending = self.processing.owner().pending
+            state.recipe = {'mode': pending.mode, 'smooth': pending.smooth,
+                            'window_length': pending.window_length}
+            settings.setValue('fixed_processing/recipe', json.dumps(state.recipe))
         self._sync_annotation_settings()
 
     def _remember_fixed_regions(self, *_args) -> None:
@@ -8011,9 +6190,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return
         settings = self._annotation_settings
         state = (self.workspace.active or self._unregistered_session).fixed_recipes['regions']
-        state.enabled = self.fix_regions_chk.isChecked()
-        settings.setValue("fixed_regions/enabled", self.fix_regions_chk.isChecked())
-        if self.fix_regions_chk.isChecked():
+        state.enabled = (self.workspace.active or self._unregistered_session).fixed_recipes['regions'].enabled
+        settings.setValue("fixed_regions/enabled", (self.workspace.active or self._unregistered_session).fixed_recipes['regions'].enabled)
+        if (self.workspace.active or self._unregistered_session).fixed_recipes['regions'].enabled:
             state.recipe = {
                 "mode": self._color_scale_mode,
             }
@@ -8025,9 +6204,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return
         settings = self._annotation_settings
         state = (self.workspace.active or self._unregistered_session).fixed_recipes['region_edges']
-        state.enabled = self.fix_region_edges_chk.isChecked()
-        settings.setValue("fixed_region_edges/enabled", self.fix_region_edges_chk.isChecked())
-        if self.fix_region_edges_chk.isChecked():
+        state.enabled = (self.workspace.active or self._unregistered_session).fixed_recipes['region_edges'].enabled
+        settings.setValue("fixed_region_edges/enabled", (self.workspace.active or self._unregistered_session).fixed_recipes['region_edges'].enabled)
+        if (self.workspace.active or self._unregistered_session).fixed_recipes['region_edges'].enabled:
             state.recipe = {
                 "boundaries": self._color_region_boundaries,
             }
@@ -8035,7 +6214,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._sync_annotation_settings()
 
     def _apply_fixed_region_edges(self) -> None:
-        if self.fix_region_edges_chk.isChecked():
+        if (self.workspace.active or self._unregistered_session).fixed_recipes['region_edges'].enabled:
             boundaries = self._fixed_recipe("region_edges").get("boundaries", [])
             if len(boundaries) == self._requested_region_count() - 1:
                 self._color_region_boundaries = list(boundaries)
@@ -8068,66 +6247,28 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return {}
 
     def _set_processing_controls(self, settings: dict | None = None) -> None:
-        settings = settings or {"mode": "original", "smooth": True, "window_length": 21,
-                                "original_signal_title": RAW_LABEL}
-        mode = settings.get("mode", "original")
-        index = self.processing_mode_combo.findData(mode)
-        if index < 0:
-            index = self.processing_mode_combo.findData("original")
-        with QSignalBlocker(self.processing_mode_combo):
-            self.processing_mode_combo.setCurrentIndex(index)
-        with QSignalBlocker(self.processing_smooth_chk):
-            self.processing_smooth_chk.setChecked(bool(settings.get("smooth", True)))
-        with QSignalBlocker(self.processing_window_spin):
-            self.processing_window_spin.setValue(int(settings.get("window_length", 21)))
-        self._processing_smooth = self.processing_smooth_chk.isChecked()
-        self._processing_window_length = int(self.processing_window_spin.value())
+        settings = settings or {'mode': 'original', 'smooth': True, 'window_length': 21,
+                                'original_signal_title': RAW_LABEL}
+        mode = settings.get('mode', 'original')
+        if mode not in ('original', 'energy_second_derivative'):
+            mode = 'original'
+        owner = self.processing.owner()
+        owner.pending = ProcessingState(mode, bool(settings.get('smooth', True)),
+                                        int(settings.get('window_length', 21)))
+        self._processing_smooth = owner.pending.smooth
+        self._processing_window_length = owner.pending.window_length
         self._processing_original_signal_title = (
-            str(settings.get("original_signal_title", RAW_LABEL))
-            if mode == "energy_second_derivative" else None
-        )
+            str(settings.get('original_signal_title', RAW_LABEL))
+            if mode == 'energy_second_derivative' else None)
         self._refresh_processing_controls()
 
     def _processing_validation_error(self) -> str:
-        if self.processing_mode_combo.currentData() == 'energy_second_derivative':
-            return self._sg_window_error('Processing SG', self.processing_window_spin.value(),
-                                         minimum=5)
-        return ''
+        return self.processing.validation_error()
 
     def _refresh_processing_controls(self, *_args) -> None:
         self._refresh_analysis_context()
-        if not hasattr(self, 'processing_status_label'):
-            return
         self._refresh_source_axis_control()
-        derivative = self.processing_mode_combo.currentData() == 'energy_second_derivative'
-        self.processing_smooth_chk.setEnabled(derivative)
-        self.processing_window_spin.setEnabled(derivative and self.processing_smooth_chk.isChecked())
-        applied = 'D²' if self._processing_mode == 'energy_second_derivative' else 'Original'
-        message = f'Applied: {applied}'
-        if self.current_cube is None:
-            message += ' — no data loaded.'
-        else:
-            pending = (str(self.processing_mode_combo.currentData() or 'original'),
-                       self.processing_smooth_chk.isChecked(), self.processing_window_spin.value())
-            actual = (self._processing_mode, self._processing_smooth, self._processing_window_length)
-            if self._background_job_owner == 'processing' and self._processing_request is not None:
-                message += ' | Applying processing…'
-            elif pending[0] != actual[0] or derivative and pending != actual:
-                recipe = (f'D², SG {pending[2]} points' if pending[1] else 'D², no smoothing') if derivative else 'Original'
-                message += f' | Pending: {recipe} — choose Apply processing.'
-            error = self._processing_validation_error()
-            if error:
-                message += f'\n{error}'
-            elif derivative and pending[1]:
-                base = self._base_cube or self.current_cube
-                note = self._sg_window_note(pending[2], base.energy.size)
-                if note:
-                    message += '\n' + note
-        self.processing_status_label.setText(message)
-        running = self._background_job_owner == 'processing' and self._processing_request is not None
-        self.generate_heatmap_btn.setText('Applying processing…' if running else 'Apply processing')
-        self.generate_heatmap_btn.setEnabled(not self._dat_import_pending and self.current_cube is not None
-                                             and not self._processing_validation_error() and not running)
+        self.processing.syncFromOwner()
 
     def _clear_processing_analysis_state(self) -> None:
         self._schedule_project_modified()
@@ -8154,13 +6295,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._update_lasso_actions()
         self._refresh_peak_delete_controls()
 
-    def _on_processing_mode_changed(self) -> None:
-        if self._dat_import_pending:
-            return
-        self._refresh_processing_controls()
-
     def _on_generate_heatmap(self) -> None:
-        if self._dat_import_pending:
+        if not self.processing.enabled:
             return
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
@@ -8170,13 +6306,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if error:
             self._show_error(error)
             return
-        mode = str(self.processing_mode_combo.currentData() or "original")
+        if self.processing.mode == "energy_second_derivative" and not self.processing.commitWindow():
+            self._show_error(self.processing.error)
+            return
+        mode = self.processing.mode
         if mode == "original":
             self._restore_original_data()
             return
         self._apply_energy_second_derivative(
-            smooth=self.processing_smooth_chk.isChecked(),
-            window_length=int(self.processing_window_spin.value()),
+            smooth=self.processing.smoothing,
+            window_length=self.processing.windowLength,
         )
 
     def _apply_energy_second_derivative(self, *, smooth: bool, window_length: int) -> None:
@@ -8197,11 +6336,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         session = self.workspace.active or self._unregistered_session
         recipe = ('energy_second_derivative', bool(smooth), window_length)
         source = (id(base), id(self.current_cube))
-        applied = (self._processing_mode, self._processing_smooth,
-                   self._processing_window_length)
+        applied = (self._processing_mode, self._processing_smooth, self._processing_window_length)
         if (applied == recipe and self.current_cube is not base
                 and self._applied_derivative_sources.get(session.dataset_id) == source):
             self._cancel_processing_job()
+            if session.dataset_id not in self.workspace.datasets or session.active_graph.analysis is not None:
+                return
+            # Cached values are immutable scientific buffers. A fresh cube and
+            # result identity still give this explicit run its own Sheet/graph.
+            cube = replace(self.current_cube)
+            self._replace_current_data(cube, mode=recipe[0], smooth=recipe[1], window_length=recipe[2])
+            self._applied_derivative_sources[session.dataset_id] = (id(base), id(cube))
             return
         key = (session.dataset_id, id(base), id(self.current_cube), self._data_generation,
                self.current_dat_path, self._loaded_source_fingerprint, recipe)
@@ -8217,9 +6362,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                     and self._data_generation == key[3]
                     and self.current_dat_path == key[4]
                     and self._loaded_source_fingerprint == key[5]
-                    and (str(self.processing_mode_combo.currentData() or 'original'),
-                         self.processing_smooth_chk.isChecked(),
-                         int(self.processing_window_spin.value())) == recipe)
+                    and (self.processing.mode, self.processing.smoothing,
+                         self.processing.windowLength) == recipe)
 
         def work(context):
             context.check_cancelled()
@@ -8270,6 +6414,22 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return
         if self._processing_mode == "original" and self.current_cube is base:
             return
+        session = self.workspace.active
+        if session is not None and session.active_graph.analysis is None:
+            self._finish_graph_editors()
+            retain_current_processing_result(self.workspace, session.dataset_id)
+        if session is not None and session.active_graph.analysis is None and session.processing_results:
+            gates = deepcopy(session.active_graph.gate_indices)
+            graph = next((graph for graph in session.graphs.values() if graph.analysis is None
+                          and graph.source_mode == 'raw' and graph.gate_indices == gates), None)
+            if graph is None:
+                name, count = 'Original Heatmap', 2
+                while any(graph.name == name for graph in session.graphs.values()):
+                    name, count = f'Original Heatmap {count}', count + 1
+                graph = session.create_graph(name)
+                graph.source_mode, graph.result_id = 'raw', None
+            session.activate_graph(graph.graph_id)
+            self._select_graph_page(session, show=True)
         self._replace_current_data(base, mode="original", smooth=self._processing_smooth,
                                    window_length=self._processing_window_length)
 
@@ -8282,26 +6442,39 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         window_length: int,
     ) -> None:
         self._clear_edit_history(self.workspace.active or self._unregistered_session)
+        self.dat_properties._drafts.pop(self.dat_properties.owner_key(), None)
         if self._base_cube is None:
             self._base_cube = self.current_cube
         if self._base_cube is None:
             self._base_cube = cube
         xlim = self._heat_ax.get_xlim() if self._heat_ax is not None else (
-            self.xmin_spin.value(), self.xmax_spin.value())
+            self._dat_number('xmin'), self._dat_number('xmax'))
         ylim = self._heat_ax.get_ylim() if self._heat_ax is not None else (
-            self.ymin_spin.value(), self.ymax_spin.value())
+            self._dat_number('ymin'), self._dat_number('ymax'))
         base_cube = self._base_cube or self.current_cube or cube
         if float(xlim[0]) == float(xlim[1]):
             xlim = (float(np.nanmin(base_cube.energy)), float(np.nanmax(base_cube.energy)))
         if float(ylim[0]) == float(ylim[1]):
             ylim = (float(np.nanmin(base_cube.gate)), float(np.nanmax(base_cube.gate)))
+        session = self.workspace.active or self._unregistered_session
+        grouped = session.dataset_id in self.workspace.datasets and session.active_graph.analysis is None
+        if grouped and mode == 'energy_second_derivative':
+            self._finish_graph_editors()
+            add_processing_result(self.workspace, session.dataset_id, cube,
+                ProcessingState(mode, bool(smooth), int(window_length), session.applied.original_signal_title))
+            self._select_graph_page(session, show=True)
+        elif grouped and mode == 'original':
+            retain_current_processing_result(self.workspace, session.dataset_id)
         self.current_cube = cube
         self._processing_mode = mode
         self._data_generation += 1
         self._processing_smooth = bool(smooth)
         self._processing_window_length = int(window_length)
-        session = self.workspace.active or self._unregistered_session
         for graph in session.graphs.values():
+            if grouped and graph is not session.active_graph:
+                continue
+            if graph is not session.active_graph and (graph.result_id is not None or graph.analysis is not None):
+                continue
             refresh_graph_colors(graph, graph_cube(session, graph))
             if graph.view.signal_title_auto:
                 graph.view.annotations['signal_title'] = graph_signal_label(session, graph)
@@ -8309,10 +6482,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._refresh_auto_signal_title()
         self._last_valid_color_limits = None
         self._last_valid_region_color_limits = []
-        for spin, value in ((self.xmin_spin, xlim[0]), (self.xmax_spin, xlim[1]),
-                            (self.ymin_spin, ylim[0]), (self.ymax_spin, ylim[1])):
-            with QSignalBlocker(spin):
-                spin.setValue(float(value))
+        for spin, value in (('xmin', xlim[0]), ('xmax', xlim[1]),
+                            ('ymin', ylim[0]), ('ymax', ylim[1])):
+            self._dat_project_number(spin, value)
         self._update_auto_color_limits_from_visible_view(use_spin_values=True)
         self._plot_cube()
         self._heat_ax.set_xlim(xlim)
@@ -8320,12 +6492,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._update_auto_color_limits_from_visible_view(xlim=xlim, ylim=ylim)
         self._refresh_axis_status()
         self._refresh_processing_controls()
-        self.statusBar().showMessage(
-            "Heatmap restored to original data." if mode == "original"
-            else 'Applied energy 2nd derivative processing.'
-        )
+        self.publish_status('')
         if self.workspace.active_dataset_id is not None:
             self._sync_result_sheets()
+            self._refresh_source_axis_control()
+            self._refresh_document_titles()
+            self._refresh_graph_selector()
+            self._refresh_graph_commands()
 
     def _load_dat_file_direct(self, path: Path) -> None:
         """Synchronous internal entry point, sharing GUI application with async loading."""
@@ -8340,7 +6513,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             saved_plot, recall_notice = self._plot_state_store.load(path, fingerprint)
             recipes = ([record['plot'] for record in saved_plot['graphs']] if saved_plot and 'graphs' in saved_plot
                        else [saved_plot] if saved_plot else [])
-            if any(self.cmap_combo.findData(canonical_colormap(recipe['colormap'])) < 0 for recipe in recipes):
+            if any(canonical_colormap(recipe['colormap']) not in self._available_colormaps() for recipe in recipes):
                 saved_plot = None
                 recall_notice = "Saved plot settings ignored: the colormap is unavailable."
             override = saved_plot["axis_override"] if saved_plot else self._selected_x_axis_override()
@@ -8350,7 +6523,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         except Exception as exc:
             self._show_error(str(exc))
             return
-        self._apply_loaded_dat(path, cube, fingerprint, saved_plot, recall_notice, save_notice)
+        try:
+            self._apply_loaded_dat(path, cube, fingerprint, saved_plot, recall_notice, save_notice)
+        except ValueError as exc:
+            self._show_error(str(exc))
 
     def _apply_loaded_dat(self, path, cube, fingerprint, saved_plot, recall_notice, save_notice,
                           defaults_snapshot: DatasetDefaults | None = None) -> None:
@@ -8366,8 +6542,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self.activate_dataset(session.dataset_id, capture_outgoing=False)
         notice = ' '.join(dict.fromkeys(part for part in
                          (save_notice, latest_notice, session.initialization_notice) if part))
-        suffix = f' — {notice}' if notice else (' — saved plot restored' if saved_plot else '')
-        self.statusBar().showMessage(f'Loaded: {Path(path).name}{suffix}')
+        self.publish_status(notice or '')
 
     def _current_plot_state(self) -> dict | None:
         if (self.current_dat_path is None or self.current_cube is None
@@ -8378,13 +6553,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return {
             "axis_override": self.current_cube.x_override,
             "colormap": self._selected_colormap(),
-            "annotations": {**{name: edit.text() for name, edit in self._annotation_edits.items()},
-                            "signal_title": self.signal_title_combo.currentText()},
-            "fix_annotations": self.fix_annotations_chk.isChecked(),
-            "signal_title_auto": self.signal_title_auto_chk.isChecked(),
+            "annotations": dict(self._dat_view().annotations),
+            "fix_annotations": self._dat_view().fix_annotations,
+            "signal_title_auto": self._dat_view().signal_title_auto,
             "title_settings": self._copy_title_settings(self._title_settings),
-            "bounds": {name: getattr(self, f"{name}_spin").value() for name in bounds},
-            "locks": {name: getattr(self, f"{name}_lock").isChecked() for name in bounds},
+            "bounds": {name: self._dat_number(name) for name in bounds},
+            "locks": {name: self._dat_lock(name) for name in bounds},
             "x_limits": list(map(float, self._heat_ax.get_xlim())),
             "y_limits": list(map(float, self._heat_ax.get_ylim())),
             "color_limits": list(map(float, self._heat_mesh.get_clim())),
@@ -8426,45 +6600,36 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _restore_plot_controls(self, plot: dict) -> None:
         session = self.workspace.active or self._unregistered_session
-        session.view.norm = NormSpec.from_dict(plot.get('norm', {}))
+        view = session.view
+        view.norm = NormSpec.from_dict(plot.get('norm', {}))
         session.presentation = PlotPresentation.from_dict(plot.get('presentation', {}))
         if self.plot_page.presentation != session.presentation:
             self.plot_page.set_presentation(session.presentation)
-        with QSignalBlocker(self.mapping_combo), QSignalBlocker(self.linthresh_spin):
-            self.mapping_combo.setCurrentIndex(self.mapping_combo.findData(session.view.norm.kind))
-            self.linthresh_spin.setValue(session.view.norm.linthresh)
-        self.linthresh_spin.setEnabled(session.view.norm.kind == 'symlog')
-        self._title_settings = self._copy_title_settings(plot["title_settings"])
+        view.title_settings = self._copy_title_settings(plot['title_settings'])
+        view.colormap = canonical_colormap(plot['colormap'])
+        view.annotations = dict(plot['annotations'])
+        view.fix_annotations = plot['fix_annotations']
+        view.signal_title_auto = plot.get('signal_title_auto', False)
+        view.bounds = dict(plot['bounds'])
+        view.locks = dict(plot['locks'])
+        view.x_limits = tuple(plot.get('x_limits', view.x_limits))
+        view.y_limits = tuple(plot.get('y_limits', view.y_limits))
+        view.color_limits = tuple(plot.get('color_limits', view.color_limits))
+        self.dat_properties._axis_override = plot['axis_override']
         self._title_source = self.current_cube.source_path or id(self.current_cube)
         self._show_title_settings()
-        controls = [(self.x_axis_override_combo, "index", self.x_axis_override_combo.findData(plot["axis_override"])),
-                    (self.cmap_combo, "index", self.cmap_combo.findData(canonical_colormap(plot["colormap"]))),
-                    (self.signal_title_combo, "text", plot["annotations"]["signal_title"]),
-                    (self.signal_title_auto_chk, "checked", plot.get("signal_title_auto", False)),
-                    (self.fix_annotations_chk, "checked", plot["fix_annotations"])]
-        controls.extend((edit, "edit", plot["annotations"][name])
-                        for name, edit in self._annotation_edits.items())
-        controls.extend((getattr(self, f"{name}_spin"), "value", value)
-                        for name, value in plot["bounds"].items())
-        controls.extend((getattr(self, f"{name}_lock"), "checked", value)
-                        for name, value in plot["locks"].items())
-        setters = {"index": "setCurrentIndex", "text": "setCurrentText", "edit": "setText",
-                   "checked": "setChecked", "value": "setValue"}
-        for widget, kind, value in controls:
-            with QSignalBlocker(widget):
-                getattr(widget, setters[kind])(value)
-        mode = plot.get("color_scale_mode", "global")
-        mode_index = self.color_scale_combo.findData(mode)
-        with QSignalBlocker(self.color_scale_combo):
-            self.color_scale_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
-        self._color_scale_mode = mode if mode in ("global", "2", "3") else "global"
-        self._color_region_boundaries = [float(value) for value in plot.get("color_region_boundaries", [])]
-        self._last_valid_region_color_limits = [tuple(pair) for pair in plot.get('color_region_limits', [])]
+        mode = plot.get('color_scale_mode', 'global')
+        view.color_scale_mode = mode if mode in ('global', '2', '3') else 'global'
+        view.color_region_boundaries = [float(value) for value in plot.get('color_region_boundaries', [])]
+        view.last_valid_region_color_limits = [tuple(pair) for pair in plot.get('color_region_limits', [])]
         self._sync_region_controls()
         self._annotation_source = self.current_cube.source_path or id(self.current_cube)
-        gate_idx = int(np.argmin(np.abs(self.current_cube.gate - plot["gate"])))
+        gate_idx = int(np.argmin(np.abs(self.current_cube.gate - plot['gate'])))
+        if float(self.current_gate) != float(self.current_cube.gate[gate_idx]):
+            self._retire_peak_menu()
         self.current_gate = float(self.current_cube.gate[gate_idx])
         self._sync_gate_controls()
+        self.dat_properties.syncFromOwner()
 
     def _restore_effective_plot_limits(self, plot: dict, *, refresh_colors: bool = False) -> None:
         if self._heat_mesh is None:
@@ -8492,14 +6657,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _show_updates(self):
         from .update_ui import UpdateController
         if getattr(self, '_update_controller', None) is None:
-            self._update_controller = UpdateController(self)
+            self._update_controller = UpdateController(self.root_window)
             self._update_controller.install_requested.connect(self.close)
         self._update_controller.open()
 
     def closeEvent(self, event) -> None:
         updater = getattr(self, '_update_controller', None)
         if updater is not None and not updater.prepare_close():
-            self.statusBar().showMessage('Stopping the update operation before closing…')
+            self.publish_status('Stopping the update operation before closing…')
             event.ignore()
             return
         self._plot_render_timer.stop()
@@ -8513,7 +6678,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if self._background_jobs.busy:
             self._close_pending = True
             self._cancel_background_job()
-            self.statusBar().showMessage("Stopping operation before closing…")
+            self.publish_status("Stopping operation before closing…")
             event.ignore()
             return
         # Consume the retry before asking: Cancel must not leave a later idle
@@ -8535,16 +6700,28 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._project_close_approved = False
         notice = self._save_current_plot_state()
         if notice:
-            self.statusBar().showMessage(notice)
+            self.publish_status(notice)
         for window in tuple(self._plot_comparison_windows):
             window.close()
-        super().closeEvent(event)
+        event.accept()
+        if event.isAccepted():
+            self._closing = True
+            self._quick_host.detach_scenes()
+            self.dat_canvas.dispose()
+            self.analysis_navigation.close()
+            self.analysis_header.close()
+            self.ordinary_analysis.close()
         if event.isAccepted() and updater is not None:
             try:
                 updater.accept_close()
             except Exception as exc:
                 event.ignore()
                 updater.install_failed(exc)
+        if event.isAccepted():
+            # Focus-out emitted as Quick items retire must not edit a closed
+            # owner after native commands have begun QObject destruction.
+            self.analysis_workbench.shutdown()
+            self.dat_properties._closed = True
 
     def _on_x_axis_override_changed(self) -> None:
         """Synchronous internal axis-change entry point."""
@@ -8566,9 +6743,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if fingerprint is not None and source_fingerprint(self.current_dat_path) != fingerprint:
                 raise ValueError("DAT content changed while loading. Please load it again.")
         except Exception as exc:
-            with QSignalBlocker(self.x_axis_override_combo):
-                self.x_axis_override_combo.setCurrentIndex(
-                    self.x_axis_override_combo.findData(self.current_cube.x_override))
+            self.dat_properties._axis_override = self.current_cube.x_override
+            self.dat_properties.syncFromOwner()
             self._show_error(str(exc))
             return
         self._apply_axis_override(cube, fingerprint, gate)
@@ -8584,9 +6760,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         request = LoadRequest(self.current_dat_path, self._selected_x_axis_override(), recall=False)
         gate = self.current_gate
         def failed(exc):
-            with QSignalBlocker(self.x_axis_override_combo):
-                self.x_axis_override_combo.setCurrentIndex(
-                    self.x_axis_override_combo.findData(self.current_cube.x_override))
+            self.dat_properties._axis_override = self.current_cube.x_override
+            self.dat_properties.syncFromOwner()
             self._show_error(str(exc))
         self._start_background_job(
             lambda context: prepare_dat(request, context),
@@ -8595,6 +6770,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _apply_axis_override(self, cube, fingerprint, gate) -> None:
         session = self.workspace.active or self._unregistered_session
+        if session.processing_results:
+            self.dat_properties._axis_override = session.base_cube.x_override
+            self.dat_properties.syncFromOwner()
+            self._show_error('Retained processing results use this saved axis. Import the DAT as a new copy to change its axis interpretation.')
+            return
         self._clear_edit_history(session)
         candidate = replace(session, base_cube=cube, current_cube=cube)
         for graph in session.graphs.values():
@@ -8658,11 +6838,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._plot_cube()
 
     def _selected_colormap(self) -> str:
-        return str(self.cmap_combo.currentData() or 'RdBu_r')
+        return self._dat_view().colormap
 
     def _available_colormaps(self) -> tuple[str, ...]:
-        return tuple(self.cmap_combo.itemData(i) for i in range(self.cmap_combo.count())
-                     if self.cmap_combo.itemData(i))
+        return tuple(value for _label, value in COLORMAPS)
 
     def _on_colormap_changed(self, *_args) -> None:
         with self._edit_transaction('Colormap', ('view.colormap',)):
@@ -8680,37 +6859,33 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._invalidate_plot_page()
             self.canvas.draw_idle()
 
-    def _lock_user_color_bound(self, spin) -> None:
+    def _lock_user_color_bound(self, field) -> None:
         with self._edit_transaction('Color range', RANGE_FIELDS):
-            if self._restoring_dataset or self._view_syncing or not spin.isEnabled():
+            if self._restoring_dataset or self._view_syncing or field not in ('vmin', 'vmax'):
                 return
-            self._view_lock_controls[spin].setChecked(True)
+            self._dat_view().locks[field] = True
             self._refresh_color_range_status()
 
     def _on_auto_colors(self) -> None:
         with self._edit_transaction('Auto colors', COLOR_FIELDS):
-            for lock in (self.vmin_lock, self.vmax_lock):
-                with QSignalBlocker(lock):
-                    lock.setChecked(False)
+            self._dat_view().locks.update(vmin=False, vmax=False)
             self._update_auto_color_limits_from_visible_view()
             self._capture_dataset_controls()
             self._refresh_color_range_status()
 
     def _refresh_color_range_status(self, *, visible_values=None) -> None:
-        if not hasattr(self, 'color_range_status'):
-            return
         regional = self._color_scale_mode in ('2', '3')
-        low, high = self.vmin_lock.isChecked(), self.vmax_lock.isChecked()
+        low, high = self._dat_lock('vmin'), self._dat_lock('vmax')
         mode = ('Manual' if low and high else 'Partial manual (min)' if low else
                 'Partial manual (max)' if high else 'Auto')
         regional_mode = ('Fixed endpoints' if low and high else 'Partial Fixed (min)' if low else
                          'Partial Fixed (max)' if high else 'independent Auto')
-        self.color_range_status.setText(
+        self._dat_status('color_range_status', 
             f'{self._color_scale_mode} regions: {regional_mode}; global bound editors disabled. '
             'Visible data, 0.5–99.5 percentiles for unlocked endpoints.'
             if regional else f'Global: {mode}. Visible data, 0.5–99.5 percentiles for unlocked bounds.')
         if self.current_cube is None:
-            self.color_clipping_status.setText('')
+            self._dat_status('color_clipping_status', '')
             return
         values = (visible_values if visible_values is not None else
                   self._visible_color_values_by_region() if regional else [self._visible_color_values()])
@@ -8721,36 +6896,38 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 total += cells.size
                 under += int(np.count_nonzero(cells < limits[0]))
                 over += int(np.count_nonzero(cells > limits[1]))
-        self.color_clipping_status.setText(
+        self._dat_status('color_clipping_status', 
             f'Below: {under} ({100*under/total if total else 0:.2f}%) · Above: {over} ({100*over/total if total else 0:.2f}%) of {total} visible valid cells')
 
-    def _on_view_limit_changed(self, spin: QDoubleSpinBox) -> None:
+    def _on_view_limit_changed(self, field: str) -> None:
         if self._view_syncing:
             return
-        if spin in (self.vmin_spin, self.vmax_spin):
-            self._begin_history_text('Color range', RANGE_FIELDS)
         with self._edit_transaction('View range', RANGE_FIELDS):
-            self._apply_view_limit_change(spin)
+            if field.startswith('x'):
+                self._invalidate_analysis_jobs()
+            self._apply_view_limit_change(field)
+            self._capture_dataset_controls(visual_only=True)
 
-    def _apply_view_limit_change(self, spin):
-        xy_spins = {
-            self.xmin_spin, self.xmax_spin, self.ymin_spin, self.ymax_spin,
-        }
-        if spin in xy_spins:
+    def _apply_view_limit_change(self, field):
+        xy_changed = field in ('xmin', 'xmax', 'ymin', 'ymax')
+        if xy_changed:
+            intended_x = self._ordered_pair(self._dat_number('xmin'), self._dat_number('xmax'))
+            intended_y = self._ordered_pair(self._dat_number('ymin'), self._dat_number('ymax'))
             self._update_auto_color_limits_from_visible_view(use_spin_values=True)
+            self._dat_view().x_limits, self._dat_view().y_limits = intended_x, intended_y
         else:
-            self._last_valid_color_limits = self._ordered_pair(
-                float(self.vmin_spin.value()), float(self.vmax_spin.value())
-            )
+            self._last_valid_color_limits = self._ordered_pair(self._dat_number('vmin'), self._dat_number('vmax'))
         if self._heat_ax is None:
             self._plot_cube()
             return
         previous_syncing = self._view_syncing
         self._view_syncing = True
         try:
-            if spin in xy_spins:
-                self._heat_ax.set_xlim(self._ordered_pair(self.xmin_spin.value(), self.xmax_spin.value()))
-                self._heat_ax.set_ylim(self._ordered_pair(self.ymin_spin.value(), self.ymax_spin.value()))
+            if xy_changed:
+                self._heat_ax.set_xlim(intended_x)
+                self._heat_ax.set_ylim(intended_y)
+                self._dat_view().x_limits = intended_x
+                self._dat_view().y_limits = intended_y
                 self._update_spectrum_only()
                 self._schedule_view_layout()
             else:
@@ -8760,17 +6937,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._invalidate_plot_page()
         self.canvas.draw_idle()
 
-    def _on_view_lock_toggled(self, lock_box: QCheckBox, checked: bool) -> None:
+    def _on_view_lock_toggled(self, field: str, checked: bool) -> None:
         with self._edit_transaction('Range lock', RANGE_FIELDS):
             self._refresh_color_range_status()
-            if checked or self.current_cube is None:
-                return
-            color_spins = (self.vmin_spin, self.vmax_spin)
-            unlocked_spin = next(
-                (spin for spin, current_lock in self._view_lock_controls.items() if current_lock is lock_box),
-                None,
-            )
-            if unlocked_spin in color_spins:
+            if not checked and self.current_cube is not None and field in ('vmin', 'vmax'):
                 self._update_auto_color_limits_from_visible_view()
 
     def _on_plot_x_limits_changed(self, axes: Any) -> None:
@@ -8785,10 +6955,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._view_syncing = True
         try:
             xmin, xmax = self._ordered_pair(*axes.get_xlim())
-            for spin, value in ((self.xmin_spin, xmin), (self.xmax_spin, xmax)):
-                spin.blockSignals(True)
-                spin.setValue(float(value))
-                spin.blockSignals(False)
+            if (self._dat_number('xmin'), self._dat_number('xmax')) != (xmin, xmax):
+                self._invalidate_analysis_jobs()
+            self._dat_view().x_limits = (xmin, xmax)
+            for spin, value in (('xmin', xmin), ('xmax', xmax)):
+                self._dat_project_number(spin, value)
             self._update_auto_color_limits_from_visible_view(xlim=(xmin, xmax))
             self._refresh_fit_range_summary()
             self._refresh_fit_readiness()
@@ -8808,10 +6979,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._view_syncing = True
         try:
             ymin, ymax = self._ordered_pair(*self._heat_ax.get_ylim())
-            for spin, value in ((self.ymin_spin, ymin), (self.ymax_spin, ymax)):
-                spin.blockSignals(True)
-                spin.setValue(float(value))
-                spin.blockSignals(False)
+            self._dat_view().y_limits = (ymin, ymax)
+            for spin, value in (('ymin', ymin), ('ymax', ymax)):
+                self._dat_project_number(spin, value)
             self._update_auto_color_limits_from_visible_view(ylim=(ymin, ymax))
         finally:
             self._view_syncing = False
@@ -8819,13 +6989,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_color_scale_changed(self) -> None:
         with self._edit_transaction('Color regions', STYLE_FIELDS):
-            self._color_scale_mode = str(self.color_scale_combo.currentData() or "global")
+            self._color_scale_mode = str(self._dat_view().color_scale_mode or "global")
             self._last_valid_region_color_limits = []
             # A user-selected color mode starts independent autoscaling. Projection
             # restores stored regional locks with signals blocked in its own path.
-            for lock in (self.vmin_lock, self.vmax_lock):
-                with QSignalBlocker(lock):
-                    lock.setChecked(False)
+            self._dat_view().locks.update(vmin=False, vmax=False)
             self._apply_fixed_region_edges()
             self._sync_region_controls()
             self._remember_fixed_regions()
@@ -8843,37 +7011,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         return region_layout(self.current_cube, (self.workspace.active or self._unregistered_session).view)
 
     def _sync_region_controls(self) -> None:
-        if not hasattr(self, "region_boundary_spins"):
+        if not hasattr(self, 'dat_properties'):
             return
-        regional = self._color_scale_mode in ("2", "3")
-        for spin in (self.vmin_spin, self.vmax_spin):
-            spin.setEnabled(not regional)
-        for lock in (self.vmin_lock, self.vmax_lock):
-            lock.setEnabled(True)
-            lock.setToolTip('Fix this endpoint independently for every regional bar.' if regional else
-                            'Fix this global color endpoint.')
-        if hasattr(self, 'auto_color_btn'):
-            self.auto_color_btn.setEnabled(True)
-        edges, slices, boundaries = self._region_layout()
-        count = len(slices)
-        if regional and len(boundaries) != count - 1:
-            self._color_region_boundaries = boundaries
-        elif not regional:
-            self._color_region_boundaries = []
-        else:
-            self._color_region_boundaries = boundaries
-        for idx, spin in enumerate(self.region_boundary_spins):
-            visible = regional and idx < count - 1
-            spin.setVisible(visible)
-            if visible:
-                with QSignalBlocker(spin):
-                    spin.setRange(float(edges[1]), float(edges[-2]))
-                    spin.setValue(float(self._color_region_boundaries[idx]))
-        if hasattr(self, "_region_edges_row"):
-            self._region_edges_row.setVisible(regional and count > 1)
+        regional = self._color_scale_mode in ('2', '3')
+        _edges, _slices, boundaries = self._region_layout()
+        self._color_region_boundaries = boundaries if regional else []
+        self.dat_properties.syncFromOwner()
         self._refresh_color_range_status()
 
-    def _on_color_region_boundary_changed(self, boundary_idx: int, value: float) -> None:
+    def _on_color_region_boundary_changed(self, boundary_idx: int, value: float, *, render=True) -> None:
         with self._edit_transaction('Region boundary', ('view.color_region_boundaries',) + COLOR_FIELDS):
             if self.current_cube is None or self._color_scale_mode not in ("2", "3"):
                 return
@@ -8892,7 +7038,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._last_valid_region_color_limits = []
             self._sync_region_controls()
             self._remember_fixed_region_edges()
-            self._plot_cube()
+            if render:
+                self._plot_cube()
 
     def _visible_color_values_by_region(
         self,
@@ -8905,11 +7052,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return [np.asarray([], dtype=float)]
         cube = graph_cube(self.workspace.active or self._unregistered_session)
         if xlim is None and (use_spin_values or self._heat_ax is None):
-            xlim = (float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+            xlim = (float(self._dat_number('xmin')), float(self._dat_number('xmax')))
         elif xlim is None:
             xlim = self._heat_ax.get_xlim()
         if ylim is None and (use_spin_values or self._heat_ax is None):
-            ylim = (float(self.ymin_spin.value()), float(self.ymax_spin.value()))
+            ylim = (float(self._dat_number('ymin')), float(self._dat_number('ymax')))
         elif ylim is None:
             ylim = self._heat_ax.get_ylim()
         xmin, xmax = self._ordered_pair(*xlim)
@@ -8932,7 +7079,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _regional_color_ranges(self, values: list[np.ndarray]) -> list[tuple[float, float]]:
         previous = self._last_valid_region_color_limits
-        low_locked, high_locked = self.vmin_lock.isChecked(), self.vmax_lock.isChecked()
+        low_locked, high_locked = self._dat_lock('vmin'), self._dat_lock('vmax')
         ranges: list[tuple[float, float]] = []
         for index, region_values in enumerate(values):
             if low_locked and high_locked and index < len(previous):
@@ -8943,7 +7090,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             elif index < len(previous):
                 low, high = previous[index]
             else:
-                low, high = float(self.vmin_spin.value()), float(self.vmax_spin.value())
+                low, high = float(self._dat_number('vmin')), float(self._dat_number('vmax'))
             # A copied regional view keeps independent cached endpoints. Global
             # bound editors describe the first bar, never all regional bars.
             if index < len(previous):
@@ -8962,7 +7109,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 low = min(low, -self._color_gap(high))
                 high = max(high, self._color_gap(low))
             ranges.append((low, high))
-        return ranges or [(float(self.vmin_spin.value()), float(self.vmax_spin.value()))]
+        return ranges or [(float(self._dat_number('vmin')), float(self._dat_number('vmax')))]
 
     def _visible_color_values(
         self,
@@ -8975,11 +7122,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return np.asarray([], dtype=float)
         cube = graph_cube(self.workspace.active or self._unregistered_session)
         if xlim is None and (use_spin_values or self._heat_ax is None):
-            xlim = (float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+            xlim = (float(self._dat_number('xmin')), float(self._dat_number('xmax')))
         elif xlim is None:
             xlim = self._heat_ax.get_xlim()
         if ylim is None and (use_spin_values or self._heat_ax is None):
-            ylim = (float(self.ymin_spin.value()), float(self.ymax_spin.value()))
+            ylim = (float(self._dat_number('ymin')), float(self._dat_number('ymax')))
         elif ylim is None:
             ylim = self._heat_ax.get_ylim()
         xmin, xmax = self._ordered_pair(*xlim)
@@ -9010,16 +7157,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._apply_color_limits_to_mesh(visible_values=values_by_region)
             return
         values = self._visible_color_values(use_spin_values=use_spin_values, xlim=xlim, ylim=ylim)
-        low_locked = self._view_lock_controls.get(self.vmin_spin)
-        high_locked = self._view_lock_controls.get(self.vmax_spin)
-        is_low_locked = bool(low_locked is not None and low_locked.isChecked())
-        is_high_locked = bool(high_locked is not None and high_locked.isChecked())
+        is_low_locked = self._dat_lock('vmin')
+        is_high_locked = self._dat_lock('vmax')
 
         if not values.size and self._current_norm_spec().kind == 'log':
             self._display_mapping_error('Log mapping requires positive visible values; none are available.')
             return
         if is_low_locked and is_high_locked:
-            candidate = (float(self.vmin_spin.value()), float(self.vmax_spin.value()))
+            candidate = (float(self._dat_number('vmin')), float(self._dat_number('vmax')))
         elif values.size:
             candidate_low, candidate_high = np.nanpercentile(values, [0.5, 99.5])
             candidate = (float(candidate_low), float(candidate_high))
@@ -9027,11 +7172,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             candidate = self._last_valid_color_limits
         else:
             candidate = (
-                float(self.vmin_spin.value()), float(self.vmax_spin.value())
+                float(self._dat_number('vmin')), float(self._dat_number('vmax'))
             )
 
-        low = float(self.vmin_spin.value()) if is_low_locked else float(candidate[0])
-        high = float(self.vmax_spin.value()) if is_high_locked else float(candidate[1])
+        low = float(self._dat_number('vmin')) if is_low_locked else float(candidate[0])
+        high = float(self._dat_number('vmax')) if is_high_locked else float(candidate[1])
         if not is_low_locked and not is_high_locked:
             if low == high:
                 pad = self._color_gap(low)
@@ -9052,17 +7197,15 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 high = max(high, self._color_gap(low))
 
         for spin, value, locked in (
-            (self.vmin_spin, low, is_low_locked),
-            (self.vmax_spin, high, is_high_locked),
+            ('vmin', low, is_low_locked),
+            ('vmax', high, is_high_locked),
         ):
             if locked:
                 continue
-            spin.blockSignals(True)
-            spin.setValue(float(value))
-            spin.blockSignals(False)
+            self._dat_project_number(spin, value)
 
         self._last_valid_color_limits = self._ordered_pair(
-            float(self.vmin_spin.value()), float(self.vmax_spin.value())
+            float(self._dat_number('vmin')), float(self._dat_number('vmax'))
         )
         self._apply_color_limits_to_mesh(visible_values=[values])
 
@@ -9088,7 +7231,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self.canvas.draw_idle()
             return
         vmin, vmax = self._ordered_pair(
-            float(self.vmin_spin.value()), float(self.vmax_spin.value())
+            float(self._dat_number('vmin')), float(self._dat_number('vmax'))
         )
         self._heat_mesh.set_norm(build_color_norm(self._current_norm_spec(), (float(vmin), float(vmax))))
         if self._heat_colorbar is not None:
@@ -9096,29 +7239,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._layout_live_plots()
         self.canvas.draw_idle()
 
-    def _on_plot_gate_spin_changed(self, value: float) -> None:
-        self._set_current_gate_from_value(float(value), update_plot=True)
-
-    def _on_plot_gate_spin_edit_finished(self) -> None:
-        self._set_current_gate_from_value(float(self.plot_gate_spin.value()), update_plot=True)
-
-    def _on_plot_gate_index_changed(self, value: int) -> None:
-        if self.current_cube is None:
-            return
-        self._set_current_gate_from_index(int(value) - 1, update_plot=True)
-
-    def _step_gate_index(self, step: int) -> None:
-        if self.current_cube is None:
-            return
-        self._set_current_gate_from_index(self._current_gate_index() + int(step), update_plot=True)
-
     def _on_toggle_circle_delete_mode(self, on: bool) -> None:
+        self._circle_delete_mode = bool(on)
+        self._analysis_status()
         self._batch_delete_circle_start = None
         msg = "Circle delete ON: drag on the heatmap to remove all-gate peaks inside the circle." if on else "Circle delete OFF."
-        self.statusBar().showMessage(msg)
+        self.publish_status(msg)
 
     def _on_set_fit_full_range(self) -> None:
+        before = (self._analysis_controls().fit_xmin, self._analysis_controls().fit_xmax)
         self._set_fit_range_to_full()
+        if before != (self._analysis_controls().fit_xmin, self._analysis_controls().fit_xmax):
+            self._invalidate_analysis_jobs()
         self._capture_dataset_controls()
         self._update_spectrum_only()
 
@@ -9131,44 +7263,42 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _on_use_current_x_range(self) -> None:
         if self.current_cube is None:
             return
-        xmin, xmax = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
-        for spin, value in ((self.fit_xmin_spin, xmin), (self.fit_xmax_spin, xmax)):
-            spin.blockSignals(True)
-            spin.setValue(float(value))
-            spin.blockSignals(False)
+        controls = self._analysis_controls()
+        before = (controls.fit_xmin, controls.fit_xmax)
+        xmin, xmax = self._ordered_pair(float(self._dat_number('xmin')), float(self._dat_number('xmax')))
+        controls.fit_xmin = self.ordinary_analysis.normalized_number('fit_xmin', xmin)
+        controls.fit_xmax = self.ordinary_analysis.normalized_number('fit_xmax', xmax)
+        if before != (controls.fit_xmin, controls.fit_xmax):
+            self._invalidate_analysis_jobs()
         self._refresh_fit_range_summary()
         self._refresh_fit_readiness()
         self._capture_dataset_controls()
         self._update_spectrum_only()
 
     def _refresh_fit_range_summary(self) -> None:
-        if not hasattr(self, "fit_range_summary_label"):
+        if not hasattr(self, 'ordinary_analysis'):
             return
         if self.current_cube is None:
-            self.fit_range_summary_label.setText("Detection range: —\nFit range: —")
+            self._analysis_status(rangeText="Detection range: —\nFit range: —")
             return
-        detection = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+        detection = self._ordered_pair(float(self._dat_number('xmin')), float(self._dat_number('xmax')))
         fitting = self._fit_range_bounds()
         unit = self.current_cube.energy_label
-        self.fit_range_summary_label.setText(
+        self._analysis_status(rangeText=
             f"Detection range (visible X): {detection[0]:.6g}–{detection[1]:.6g} {unit}\n"
             f"Fit range (independent): {fitting[0]:.6g}–{fitting[1]:.6g} {unit}"
         )
-        if hasattr(self, 'peak_validation_label'):
+        if hasattr(self, 'ordinary_analysis'):
             self._refresh_analysis_controls()
 
     def _set_fit_range_to_full(self) -> None:
         if self.current_cube is None:
             return
-        xmin = float(np.nanmin(self.current_cube.energy))
-        xmax = float(np.nanmax(self.current_cube.energy))
-        for spin, val in ((self.fit_xmin_spin, xmin), (self.fit_xmax_spin, xmax)):
-            lock_box = self._fit_lock_controls.get(spin)
-            if lock_box is not None and lock_box.isChecked():
-                continue
-            spin.blockSignals(True)
-            spin.setValue(val)
-            spin.blockSignals(False)
+        controls = self._analysis_controls()
+        if not controls.fit_xmin_fixed:
+            controls.fit_xmin = self.ordinary_analysis.normalized_number('fit_xmin', np.nanmin(self.current_cube.energy))
+        if not controls.fit_xmax_fixed:
+            controls.fit_xmax = self.ordinary_analysis.normalized_number('fit_xmax', np.nanmax(self.current_cube.energy))
         self._refresh_fit_range_summary()
 
     def _set_view_limits_to_auto(self) -> None:
@@ -9180,37 +7310,29 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         ymin = float(np.nanmin(cube.gate))
         ymax = float(np.nanmax(cube.gate))
         for spin, val in (
-            (self.xmin_spin, xmin), (self.xmax_spin, xmax),
-            (self.ymin_spin, ymin), (self.ymax_spin, ymax),
+            ('xmin', xmin), ('xmax', xmax),
+            ('ymin', ymin), ('ymax', ymax),
         ):
-            lock_box = self._view_lock_controls.get(spin)
-            if lock_box is not None and lock_box.isChecked():
+            if self._dat_lock(spin):
                 continue
-            spin.blockSignals(True)
-            spin.setValue(float(val))
-            spin.blockSignals(False)
+            self._dat_project_number(spin, val)
+        intended_x, intended_y = self._dat_view().x_limits, self._dat_view().y_limits
         self._update_auto_color_limits_from_visible_view(use_spin_values=True)
+        self._dat_view().x_limits, self._dat_view().y_limits = intended_x, intended_y
 
     # =========================================================================
     #  Find Peak logic
     # =========================================================================
 
     def _on_detect_mode_changed(self, orig_is_checked: bool) -> None:
-        self._orig_params_widget.setVisible(orig_is_checked)
-        self._d2_params_widget.setVisible(not orig_is_checked)
         self._cached_d2 = None
+        self._analysis_status()
 
     def _on_orig_type_changed(self, text: str) -> None:
-        both = (text == "Both")
-        orig_form = self._orig_params_widget.layout()
-        orig_form.labelForField(self.max_dips_spin).setVisible(both)
-        self.max_dips_spin.setVisible(both)
+        self._analysis_status()
 
     def _on_d2_type_changed(self, text: str) -> None:
-        both = (text == "Both")
-        d2_form = self._d2_params_widget.layout()
-        d2_form.labelForField(self.d2_max_dips_spin).setVisible(both)
-        self.d2_max_dips_spin.setVisible(both)
+        self._analysis_status()
 
     def _auto_kind(self, y: np.ndarray, idx: int) -> bool:
         """Return True if index looks like a peak (concave-down), False for dip."""
@@ -9241,9 +7363,36 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         """Return tab10 hex color string for a 1-based label index."""
         return _TAB10[(int(label) - 1) % len(_TAB10)]
 
-    def _show_peak_context_menu(self, x_click: float) -> None:
-        """Right-click context menu on spectrum plot: Set Label or Delete Peak."""
-        if self.current_cube is None:
+    def _retire_peak_menu(self) -> None:
+        self._peak_menu_epoch = getattr(self, '_peak_menu_epoch', 0) + 1
+        view = getattr(self, 'dat_canvas', None)
+        if view is not None:
+            view.clear_peak_menu()
+
+    def _peak_menu_request_valid(self, request: PeakMenuRequest) -> bool:
+        session = self.workspace.active or self._unregistered_session
+        bridge = self.dat_canvas
+        if (not bridge.allowed(request.pointer.owner) or self.toolbar.mode
+                or request.request_id != str(bridge._peak_menu_serial)
+                or self._dat_import_pending or session is not request.session
+                or session.active_graph is not request.graph
+                or self.current_cube is not request.cube or self._spec_ax is not request.axes
+                or self._current_gate_index() != request.gate
+                or getattr(self, '_peak_menu_epoch', 0) != request.epoch
+                or self.peak_indices is not request.targets
+                or tuple(int(i) for i in self._current_trace_peak_indices()) != request.target_indices):
+            return False
+        key = (request.gate, request.energy_index)
+        return (request.energy_index in request.target_indices
+                and 0 <= request.energy_index < self.current_cube.energy.size
+                and float(self.current_cube.energy[request.energy_index]) == request.energy
+                and self._resolved_peak_label(*key) == request.label
+                and self.peak_label_lookup.get(key) == request.override)
+
+    def _show_peak_context_menu(self, x_click: float, pointer: CanvasPointerContext) -> None:
+        """Capture science on press; the canvas publishes only after right release."""
+        if (not isinstance(pointer, CanvasPointerContext) or self.current_cube is None
+                or not self.dat_canvas.allowed(pointer.owner)):
             return
         trace_peak_indices = self._current_trace_peak_indices()
         if trace_peak_indices.size == 0:
@@ -9259,33 +7408,35 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         gate_idx = self._current_gate_index()
         current_label = self._resolved_peak_label(gate_idx, nearest_idx)
 
-        menu = QMenu(self)
-        set_label_action = menu.addAction(f"Set Label…  (current: {current_label})")
-        set_label_action.setData("set_label")
-        menu.addSeparator()
-        delete_action = menu.addAction("Delete Peak")
-        delete_action.setData("delete")
-        chosen = menu.exec(QCursor.pos())
+        session = self.workspace.active or self._unregistered_session
+        bridge = self.dat_canvas
+        request = PeakMenuRequest(bridge.next_peak_menu_id(), pointer, session,
+            session.active_graph, self.current_cube, self._spec_ax, gate_idx,
+            nearest_idx, float(x[nearest_idx]), current_label,
+            self.peak_label_lookup.get((gate_idx, nearest_idx)),
+            getattr(self, '_peak_menu_epoch', 0), self.peak_indices,
+            tuple(int(i) for i in trace_peak_indices))
+        if self._peak_menu_request_valid(request):
+            bridge.request_peak_menu(request)
 
-        if chosen is None:
+    def _continue_peak_menu(self, request: PeakMenuRequest, choice: str) -> None:
+        if choice not in ('delete', 'set_label') or not self._peak_menu_request_valid(request):
             return
-        chosen_data = chosen.data()
-
-        if chosen_data == "delete":
-            if self._remove_manual_peak_near(float(x[nearest_idx])):
+        if choice == 'delete':
+            if self._remove_manual_peak_near(request.energy):
                 gate_used, y = self._nearest_spectrum(self.current_gate)
                 self._update_spectrum_only()
                 self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
-        elif chosen_data == "set_label":
-            new_label, ok = QInputDialog.getInt(
-                self, "Set Peak Label",
+        else:
+            new_label, ok = prompt_int(self.root_window, "Set Peak Label",
                 "Label index (1 = first peak, 2 = second, …):",
-                value=current_label, min=1, max=99,
+                value=request.label, min=1, max=99,
             )
-            if ok and new_label != current_label:
+            if (ok and isinstance(new_label, int) and 1 <= new_label <= 99
+                    and new_label != request.label and self._peak_menu_request_valid(request)):
                 self._finish_history_edit()
-                session = self.workspace.active or self._unregistered_session
-                key = (gate_idx, nearest_idx)
+                session = request.session
+                key = (request.gate, request.energy_index)
                 old = session.peak_label_lookup.get(key)
                 change = FieldChange(('peak_label_lookup', key), old, new_label, key in session.peak_label_lookup, True)
                 session.peak_label_lookup[key] = new_label
@@ -9298,7 +7449,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_find_peaks(self) -> None:
         if self._workbench_document() is not None:
-            self.workbench_scope.setCurrentIndex(0)
+            self.analysis_workbench.setChoice('scope', 'current', self.analysis_workbench.ownerToken)
             return self._workbench_find()
         if self._dat_import_pending:
             return
@@ -9308,17 +7459,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if self.current_cube is None:
             self._show_error("Load a DAT file first.")
             return
-        self.find_btn.setText('Detecting Current Gate…')
-        self.find_btn.setEnabled(False)
-        self.peak_validation_label.setText('Detecting current gate…')
-        self.statusBar().showMessage('Detecting current gate…')
+        self._analysis_status(findText='Detecting Current Gate…')
+        self._analysis_status(findEnabled=False)
+        self._analysis_status(detectionText='Detecting current gate…')
+        self.publish_status('Detecting current gate…')
         # Paint local feedback before the synchronous finder occupies the GUI.
-        self.find_btn.repaint()
-        self.peak_validation_label.repaint()
         try:
             self._find_current_gate_peaks()
         finally:
-            self.find_btn.setText('Find Peaks (This Gate)')
+            self._analysis_status(findText='Find Peaks (This Gate)')
+            if self._status_text == 'Detecting current gate…':
+                self.publish_status('')
             self._refresh_analysis_controls()
 
     def _find_current_gate_peaks(self) -> None:
@@ -9332,42 +7483,42 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return
         mask_idx = np.where(mask)[0]
 
-        if self._d2_radio.isChecked():
+        if self._analysis_controls().derivative_detection:
             # Second-derivative mode
             try:
                 idx_local, kinds_local, d2y = find_peaks_second_derivative(
                     xr, yr,
                     mode=self._peak_mode(),  # type: ignore[arg-type]
-                    sg_window=int(self.d2_sg_win_spin.value()),
-                    sg_polyorder=int(self.d2_sg_poly_spin.value()),
-                    d2_prom_frac=float(self.d2_prom_spin.value()),
-                    d2_distance=int(self.d2_dist_spin.value()),
-                    d2_sep_ev=float(self.d2_sep_spin.value()),
-                    max_peaks=int(self.d2_max_peaks_spin.value()),
-                    max_dips=int(self.d2_max_dips_spin.value()),
-                    target_count=int(self.d2_target_spin.value()),
+                    sg_window=int(self._analysis_controls().d2_window),
+                    sg_polyorder=int(self._analysis_controls().d2_polyorder),
+                    d2_prom_frac=float(self._analysis_controls().d2_prominence),
+                    d2_distance=int(self._analysis_controls().d2_distance),
+                    d2_sep_ev=float(self._analysis_controls().d2_separation),
+                    max_peaks=int(self._analysis_controls().d2_max_peaks),
+                    max_dips=int(self._analysis_controls().d2_max_dips),
+                    target_count=int(self._analysis_controls().d2_target),
                 )
                 self._cached_d2 = (xr, d2y)
-                window = _clamp_sg_window(xr.size, int(self.d2_sg_win_spin.value()))
-                polyorder = min(max(1, int(self.d2_sg_poly_spin.value())), window - 1)
+                window = _clamp_sg_window(xr.size, int(self._analysis_controls().d2_window))
+                polyorder = min(max(1, int(self._analysis_controls().d2_polyorder)), window - 1)
                 self._cached_d2_key = self._second_derivative_key(mask, window, polyorder)
             except Exception as exc:
                 self._show_error(str(exc))
                 return
         else:
             # Original spectrum mode
-            if self.peak_smooth_chk.isChecked():
-                win = _clamp_sg_window(yr.size, int(self.peak_smooth_win_spin.value()))
+            if self._analysis_controls().peak_smooth:
+                win = _clamp_sg_window(yr.size, int(self._analysis_controls().peak_smooth_window))
                 if win >= 3 and yr.size > win:
                     yr = savgol_filter(yr, window_length=win, polyorder=2, mode="interp")
             try:
                 idx_local, kinds_local = find_peak_indices(
                     xr, yr,
                     mode=self._peak_mode(),  # type: ignore[arg-type]
-                    prominence_frac=float(self.prom_spin.value()),
-                    min_distance=int(self.distance_spin.value()),
-                    max_peaks=int(self.max_peaks_spin.value()),
-                    max_dips=int(self.max_dips_spin.value()),
+                    prominence_frac=float(self._analysis_controls().prominence),
+                    min_distance=int(self._analysis_controls().distance),
+                    max_peaks=int(self._analysis_controls().max_peaks),
+                    max_dips=int(self._analysis_controls().max_dips),
                 )
             except Exception as exc:
                 self._show_error(str(exc))
@@ -9391,6 +7542,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._sync_batch_peak_coords()
         self._invalidate_peak_fits(self.workspace.active or self._unregistered_session, {gate_idx})
         self._refresh_peak_delete_controls()
+        if float(self.current_gate) != float(gate_used):
+            self._retire_peak_menu()
         self.current_gate = gate_used
         self._sync_gate_controls()
         self._update_spectrum_only()
@@ -9398,7 +7551,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_batch_find_peaks_all_gates(self) -> None:
         if self._workbench_document() is not None:
-            self.workbench_scope.setCurrentIndex(1)
+            self.analysis_workbench.setChoice('scope', 'all', self.analysis_workbench.ownerToken)
             return self._workbench_find()
         if self._dat_import_pending:
             return
@@ -9418,24 +7571,24 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error("Visible x-range is too narrow for batch peak finding.")
             return
 
-        use_d2 = self._d2_radio.isChecked()
+        use_d2 = self._analysis_controls().derivative_detection
         peak_mode = self._peak_mode()
-        prom = float(self.prom_spin.value())
-        min_dist = int(self.distance_spin.value())
-        max_peaks_o = int(self.max_peaks_spin.value())
-        max_dips_o = int(self.max_dips_spin.value())
-        sg_win = int(self.d2_sg_win_spin.value())
-        sg_poly = int(self.d2_sg_poly_spin.value())
-        d2_prom = float(self.d2_prom_spin.value())
-        d2_dist = int(self.d2_dist_spin.value())
-        d2_sep = float(self.d2_sep_spin.value())
-        d2_max = int(self.d2_max_peaks_spin.value())
-        d2_max_dips = int(self.d2_max_dips_spin.value())
-        d2_tgt = int(self.d2_target_spin.value())
+        prom = float(self._analysis_controls().prominence)
+        min_dist = int(self._analysis_controls().distance)
+        max_peaks_o = int(self._analysis_controls().max_peaks)
+        max_dips_o = int(self._analysis_controls().max_dips)
+        sg_win = int(self._analysis_controls().d2_window)
+        sg_poly = int(self._analysis_controls().d2_polyorder)
+        d2_prom = float(self._analysis_controls().d2_prominence)
+        d2_dist = int(self._analysis_controls().d2_distance)
+        d2_sep = float(self._analysis_controls().d2_separation)
+        d2_max = int(self._analysis_controls().d2_max_peaks)
+        d2_max_dips = int(self._analysis_controls().d2_max_dips)
+        d2_tgt = int(self._analysis_controls().d2_target)
 
         key = self._analysis_job_key()
-        smooth = self.peak_smooth_chk.isChecked()
-        smooth_window = int(self.peak_smooth_win_spin.value())
+        smooth = self._analysis_controls().peak_smooth
+        smooth_window = int(self._analysis_controls().peak_smooth_window)
         cube = replace(cube, energy=cube.energy.copy(), gate=cube.gate.copy(), z=cube.z.copy())
 
         def work(context):
@@ -9494,7 +7647,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
         def apply(payload):
             if key != self._analysis_job_key():
-                self.statusBar().showMessage("Batch peaks discarded because analysis inputs changed.")
+                self.publish_status("Batch peaks discarded because analysis inputs changed.")
                 return
             peak_map, batch_kind_lookup, ok_count, peak_total, completed_gates = payload
             self.batch_peak_map = peak_map
@@ -9515,8 +7668,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             gate_used, y = self._nearest_spectrum(self.current_gate)
             self._update_peak_text(gate_used, x, y, title_prefix="UI-detected")
             mode_str = "2nd-derivative" if use_d2 else "original-spectrum"
-            self.statusBar().showMessage(f"Batch peaks ({mode_str}): {ok_count} gates, {peak_total} peaks total.")
-            self.analysis_text.setPlainText(
+            self.publish_status('')
+            self._set_analysis_summary(
                 f"Batch peak finding ({mode_str}).\n"
                 f"Gates processed: {cube.gate.size}\n"
                 f"Gates with peaks: {ok_count}\n"
@@ -9534,7 +7687,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._sync_current_trace_peaks_to_batch_map()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default = self._output_folder() / f"{cube.title}_peaks_{stamp}.csv"
-        out_path, _ = QFileDialog.getSaveFileName(self, "Save Peaks CSV", str(default), "CSV Files (*.csv)")
+        out_path, _ = FilePicker.getSaveFileName(self.root_window, "Save Peaks CSV", str(default), "CSV Files (*.csv)")
         if not out_path:
             return
         rows_by_gate = self._current_peak_overlay_by_gate()
@@ -9575,7 +7728,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         except Exception as exc:
             self._show_error(f"Failed to save peaks CSV: {exc}")
             return
-        self.statusBar().showMessage(f"Saved peaks CSV: {out_path} ({len(rows_by_gate)} gates)")
+        self.publish_status('')
 
     def _on_delete_peak_by_number(self) -> None:
         with self._peak_edit('Remove peak', (self._current_gate_index(),)):
@@ -9585,7 +7738,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 return
             if self._peak_gate_idx != self._current_gate_index():
                 return
-            n = int(self.peak_delete_spin.value())
+            n = int(self.ordinary_analysis.state['peakNumber'])
             if n < 1 or n > int(self.peak_indices.size):
                 return
             self._invalidate_analysis_jobs()
@@ -9601,6 +7754,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_clear_peaks(self) -> None:
         if self._workbench_document() is not None:
+            if not self.analysis_workbench.allowed() or not self.analysis_workbench.commitEditors(self.analysis_workbench.ownerToken):
+                return
             self._workbench_document().set_seeds(self._current_gate_index(), [])
             return self._workbench_changed()
         with self._peak_edit('Clear gate peaks', (self._current_gate_index(),)):
@@ -9628,6 +7783,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_clear_batch_peaks(self) -> None:
         if self._workbench_document() is not None:
+            if not self.analysis_workbench.allowed() or not self.analysis_workbench.commitEditors(self.analysis_workbench.ownerToken):
+                return
             for gate in range(self.current_cube.gate.size):
                 self._workbench_document().set_seeds(gate, [])
             return self._workbench_changed()
@@ -9647,7 +7804,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._clear_lasso_selection_visual()
             self._update_lasso_actions()
             self._update_spectrum_only()
-            self.statusBar().showMessage("Cleared all-gate peak overlay.")
+            self.publish_status('')
 
     # =========================================================================
     #  Lasso selection
@@ -9656,11 +7813,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _on_detect_mode_changed_lasso_guard(self) -> None:
         """Called when detection mode changes; disconnect lasso if active."""
         if self._lasso_mode:
-            self.lasso_mode_btn.setChecked(False)
+            self._on_lasso_mode_toggled(False)
 
     def _on_lasso_mode_toggled(self, on: bool) -> None:
         self._lasso_mode = on
-        self.lasso_helper_label.setVisible(on)
+        self._analysis_status()
         if not on:
             self._lasso_selected_peak_ids = []
             self._clear_lasso_selection_visual()
@@ -9670,11 +7827,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._connect_lasso_selector()
             if not self._lasso_mode:
                 return
-            self.statusBar().showMessage(
+            self.publish_status(
                 "Lasso mode active: drag on heatmap to select peaks. Normal heatmap click is temporarily disabled."
             )
         else:
-            self.statusBar().showMessage("Lasso mode OFF. Heatmap clicks select gate again.")
+            self.publish_status('')
         self._set_canvas_cursor_for_event(None)
         self._update_spectrum_only()
 
@@ -9685,7 +7842,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._lasso_selected_peak_ids = []
             self._clear_lasso_selection_visual()
             self._update_lasso_actions()
-            self.statusBar().showMessage("Lasso: no all-gate heatmap peaks are available to select.")
+            self.publish_status("Lasso: no all-gate heatmap peaks are available to select.")
             return
         if not hasattr(verts, "__len__") or len(verts) < 3:
             return
@@ -9711,11 +7868,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         n_sel = len(self._lasso_selected_peak_ids)
         n_total = len(self.batch_peak_records)
         if n_sel:
-            self.statusBar().showMessage(
+            self.publish_status(
                 f"Lasso: selected {n_sel} of {n_total} heatmap peaks. Press 'Delete Lasso Selection (Heatmap)' to remove."
             )
         else:
-            self.statusBar().showMessage(f"Lasso: 0 of {n_total} heatmap peaks fell inside the selection.")
+            self.publish_status(f"Lasso: 0 of {n_total} heatmap peaks fell inside the selection.")
 
     def _on_delete_lasso_selection(self) -> None:
         with self._peak_edit('Delete lasso peaks', {gi for gi, _ in self._lasso_selected_peak_ids}):
@@ -9748,14 +7905,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 gate_used, y = self._nearest_spectrum(self.current_gate)
                 self._update_spectrum_only()
                 self._update_peak_text(gate_used, self.current_cube.energy, y, title_prefix="Manual")
-            self.statusBar().showMessage(f"Deleted {deleted} heatmap peak(s) from the all-gate peak set.")
+            self.publish_status('')
 
     def _on_clear_lasso_selection(self) -> None:
         self._lasso_selected_peak_ids = []
         self._clear_lasso_selection_visual()
         self._update_lasso_actions()
         self._update_spectrum_only()
-        self.statusBar().showMessage("Cleared the current heatmap lasso selection.")
+        self.publish_status('')
 
     # =========================================================================
     #  Lorentz fit logic
@@ -9800,17 +7957,17 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         # Read only on the GUI thread. Gate navigation deliberately is not part
         # of the key: completed fits belong to their captured gate.
         controls = (
-            self.fit_smooth_chk.isChecked(), self.fit_smooth_win_spin.value(),
-            self.fit_model_combo.currentText(), self.lw_min_spin.value(),
-            self.lw_max_spin.value(), self.peak_move_limit_spin.value(), self.maxfev_spin.value(),
+            self._analysis_controls().fit_smooth, self._analysis_controls().fit_smooth_window,
+            self._analysis_controls().fit_model, self._analysis_controls().linewidth_min,
+            self._analysis_controls().linewidth_max, self._analysis_controls().peak_move_limit, self._analysis_controls().maxfev,
             self._fit_range_bounds(), self._peak_search_bounds(), self._peak_mode(),
-            self._seeds_from_csv_radio.isChecked(), self._d2_radio.isChecked(),
-            self.prom_spin.value(), self.distance_spin.value(), self.max_peaks_spin.value(),
-            self.max_dips_spin.value(), self.peak_smooth_chk.isChecked(),
-            self.peak_smooth_win_spin.value(), self.d2_sg_win_spin.value(),
-            self.d2_sg_poly_spin.value(), self.d2_prom_spin.value(), self.d2_dist_spin.value(),
-            self.d2_sep_spin.value(), self.d2_max_peaks_spin.value(),
-            self.d2_max_dips_spin.value(), self.d2_target_spin.value(),
+            self._analysis_controls().csv_source, self._analysis_controls().derivative_detection,
+            self._analysis_controls().prominence, self._analysis_controls().distance, self._analysis_controls().max_peaks,
+            self._analysis_controls().max_dips, self._analysis_controls().peak_smooth,
+            self._analysis_controls().peak_smooth_window, self._analysis_controls().d2_window,
+            self._analysis_controls().d2_polyorder, self._analysis_controls().d2_prominence, self._analysis_controls().d2_distance,
+            self._analysis_controls().d2_separation, self._analysis_controls().d2_max_peaks,
+            self._analysis_controls().d2_max_dips, self._analysis_controls().d2_target,
         )
         seeds = (
             tuple((gi, tuple(np.asarray(indices, dtype=int))) for gi, indices in sorted(self.batch_peak_map.items())),
@@ -9827,7 +7984,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_fit(self) -> None:
         if self._workbench_document() is not None:
-            self.workbench_scope.setCurrentIndex(0)
+            self.analysis_workbench.setChoice('scope', 'current', self.analysis_workbench.ownerToken)
             return self._workbench_fit()
         if self._dat_import_pending:
             return
@@ -9843,8 +8000,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         try:
             xr, yr, mask = self._analysis_xy(
                 x, y,
-                smooth=self.fit_smooth_chk.isChecked(),
-                smooth_window=int(self.fit_smooth_win_spin.value()),
+                smooth=self._analysis_controls().fit_smooth,
+                smooth_window=int(self._analysis_controls().fit_smooth_window),
             )
         except Exception as exc:
             self._show_error(str(exc))
@@ -9859,11 +8016,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error(f"{message}\n{action}")
             return
 
-        lw_min = float(self._pts_to_axis_units(int(self.lw_min_spin.value())) or 0.0)
-        lw_max_v = float(self._pts_to_axis_units(int(self.lw_max_spin.value())) or 0.0)
+        lw_min = float(self._pts_to_axis_units(int(self._analysis_controls().linewidth_min)) or 0.0)
+        lw_max_v = float(self._pts_to_axis_units(int(self._analysis_controls().linewidth_max)) or 0.0)
         lw_max = lw_max_v
-        peak_move = float(self._pts_to_axis_units(int(self.peak_move_limit_spin.value())) or 0.0)
-        maxfev = int(self.maxfev_spin.value())
+        peak_move = float(self._pts_to_axis_units(int(self._analysis_controls().peak_move_limit)) or 0.0)
+        maxfev = int(self._analysis_controls().maxfev)
 
         fit_mode = self._peak_mode()
         fit_kinds: np.ndarray | None = None
@@ -9875,7 +8032,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             ], dtype=bool)
         key = self._analysis_job_key()
         gate_idx = self._current_gate_index()
-        model = str(self.fit_model_combo.currentText())
+        model = str(self._analysis_controls().fit_model)
         energy_label = self.current_cube.energy_label
         xr, yr, centers_in = xr.copy(), yr.copy(), centers_in.copy()
 
@@ -9897,7 +8054,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
         def apply(res):
             if key != self._analysis_job_key():
-                self.statusBar().showMessage("Fit discarded because analysis inputs changed.")
+                self.publish_status("Fit discarded because analysis inputs changed.")
                 return
             self.batch_fit_map[gate_idx] = np.asarray(res.centers, dtype=float)
             self.batch_fit_result_map[gate_idx] = res
@@ -9909,7 +8066,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._refresh_export_actions()
             self._sync_batch_fit_coords()
             if self._current_gate_index() != gate_idx:
-                self.statusBar().showMessage(f"Fit completed for gate {gate_used:.6g}.")
+                self.publish_status('')
                 self._update_spectrum_only()
                 return
             self.fit_result = res
@@ -9924,14 +8081,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             ]
             for i in range(res.centers.size):
                 lines.append(f"  {i+1}. cen={res.centers[i]:.6g}, amp={res.amplitudes[i]:.6g}, {width_name}={res.widths[i]:.6g}")
-            self.analysis_text.setPlainText("\n".join(lines))
-            self.statusBar().showMessage(f"Fit completed for gate {gate_used:.6g}.")
+            self._set_analysis_summary("\n".join(lines))
+            self.publish_status('')
 
         self._start_analysis_job('fit', gate_idx, key, work, apply, "Fitting current gate…",
                                  prefix='Fit failed: ')
 
     def _on_clear_fit(self) -> None:
         if self._workbench_document() is not None:
+            if not self.analysis_workbench.allowed() or not self.analysis_workbench.commitEditors(self.analysis_workbench.ownerToken):
+                return
             self._workbench_document().retire_fit(self._current_gate_index())
             return self._workbench_changed()
         if self._dat_import_pending:
@@ -9950,7 +8109,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _on_batch_fit_all_gates(self) -> None:
         if self._workbench_document() is not None:
-            self.workbench_scope.setCurrentIndex(1)
+            self.analysis_workbench.setChoice('scope', 'all', self.analysis_workbench.ownerToken)
             return self._workbench_fit()
         if self._dat_import_pending:
             return
@@ -9962,10 +8121,10 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if self._analysis_request_matches('batch-fit', None):
             return
         cube = self.current_cube
-        if self._seeds_from_csv_radio.isChecked() and self._csv_seeds_map is None:
+        if self._analysis_controls().csv_source and self._csv_seeds_map is None:
             self._show_error("CSV seed source is selected, but no seeds CSV is loaded.")
             return
-        use_csv = self._seeds_from_csv_radio.isChecked()
+        use_csv = self._analysis_controls().csv_source
         if not use_csv and not self.batch_peak_map:
             self._show_error(
                 "No seeds available for batch fit.\n"
@@ -9974,7 +8133,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             )
             return
 
-        model = str(self.fit_model_combo.currentText())
+        model = str(self._analysis_controls().fit_model)
         peak_mode = self._peak_mode()
         use_kinds = (peak_mode == "Both")
         x = cube.energy
@@ -9984,16 +8143,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error("Fit range is too narrow for batch fit.")
             return
 
-        lw_min = float(self._pts_to_axis_units(int(self.lw_min_spin.value())) or 0.0)
-        lw_max_v = float(self._pts_to_axis_units(int(self.lw_max_spin.value())) or 0.0)
+        lw_min = float(self._pts_to_axis_units(int(self._analysis_controls().linewidth_min)) or 0.0)
+        lw_max_v = float(self._pts_to_axis_units(int(self._analysis_controls().linewidth_max)) or 0.0)
         lw_max = lw_max_v
-        peak_move = float(self._pts_to_axis_units(int(self.peak_move_limit_spin.value())) or 0.0)
-        maxfev = int(self.maxfev_spin.value())
+        peak_move = float(self._pts_to_axis_units(int(self._analysis_controls().peak_move_limit)) or 0.0)
+        maxfev = int(self._analysis_controls().maxfev)
         xlo, xhi = self._fit_range_bounds()
 
         key = self._analysis_job_key()
-        smooth = self.fit_smooth_chk.isChecked()
-        smooth_window = int(self.fit_smooth_win_spin.value())
+        smooth = self._analysis_controls().fit_smooth
+        smooth_window = int(self._analysis_controls().fit_smooth_window)
         seeds = tuple(self._get_seeds_for_gate_idx(gi).copy() for gi in range(cube.gate.size))
         kind_lookup = dict(self.batch_peak_kind_lookup)
         cube = replace(cube, energy=cube.energy.copy(), gate=cube.gate.copy(), z=cube.z.copy())
@@ -10059,7 +8218,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
         def apply(payload):
             if key != self._analysis_job_key():
-                self.statusBar().showMessage("Batch fit discarded because analysis inputs changed.")
+                self.publish_status("Batch fit discarded because analysis inputs changed.")
                 return
             fit_map, fit_result_map, rows, ok_count, fail_count = payload
             self.batch_fit_map = fit_map
@@ -10074,8 +8233,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 self.fit_result = self.batch_fit_result_map.get(current_gate_idx)
                 self._fit_gate_idx = current_gate_idx if self.fit_result is not None else None
             self._sync_result_sheets()
-            self.statusBar().showMessage(f"Batch fit done: OK={ok_count}, fail={fail_count}")
-            self.analysis_text.setPlainText(
+            self.publish_status(f"Batch fit done: OK={ok_count}, fail={fail_count}" if fail_count else '')
+            self._set_analysis_summary(
                 f"Batch fit done.\nGates: {cube.gate.size}  OK: {ok_count}  Failed: {fail_count}\n"
                 "Use 'Export All Results CSV' to save the results."
             )
@@ -10094,7 +8253,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._show_error("Load a DAT file first.")
             return
         default_dir = str(self.current_folder) if self.current_folder else "."
-        path, _ = QFileDialog.getOpenFileName(self, "Load Seeds CSV", default_dir, "CSV Files (*.csv)")
+        path, _ = FilePicker.getOpenFileName(self.root_window, "Load Seeds CSV", default_dir, "CSV Files (*.csv)")
         if not path:
             return
         self._load_seeds_csv_file(Path(path))
@@ -10132,14 +8291,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                     seeds_map.setdefault(gi, []).append(peak_e)
             self._invalidate_analysis_jobs()
             self._csv_seeds_map = seeds_map
-            self._csv_seeds_path = str(path)
+            self._csv_seeds_path = str(path.resolve())
             self._schedule_project_modified()
-            self._csv_path_label.setText(path.name)
-            self._seeds_from_csv_radio.setChecked(True)
-            total = sum(len(v) for v in seeds_map.values())
-            self.statusBar().showMessage(
-                f"Loaded seeds CSV: {path.name}  ({len(seeds_map)} gates, {total} seeds)"
-            )
+            self._analysis_controls().csv_source = True
+            self._analysis_status()
+            self.publish_status('')
             self._refresh_fit_readiness()
         except Exception as exc:
             self._show_error(f"Failed to load seeds CSV: {exc}")
@@ -10172,20 +8328,27 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _refresh_export_actions(self) -> None:
         self._schedule_project_modified()
-        if not hasattr(self, "export_current_fit_btn"):
+        if not hasattr(self, 'ordinary_analysis'):
             return
         current_available = self._active_fit_result() is not None if self.current_cube is not None else False
-        self.export_current_fit_btn.setEnabled(current_available)
+        live = self.current_cube is not None and not self._dat_import_pending
+        self._analysis_status(exportCurrentFitEnabled=current_available,
+            clearFitEnabled=current_available or bool(self.batch_fit_result_map or self.batch_fit_map),
+            exportSpectrumEnabled=live, loadCsvEnabled=live,
+            savePeaksEnabled=live and (any(np.asarray(indices).size for indices in self.batch_peak_map.values())
+                                       or bool(self._current_trace_peak_indices().size)),
+            lassoEnabled=live, circleEnabled=live,
+            clearBatchEnabled=live and bool(self.batch_peak_map))
         graph_available = current_available or bool(self._active_graph_peaks()[0].size)
-        self.create_analysis_graph_btn.setEnabled(graph_available and self.workspace.active is not None
+        self._analysis_status(createAnalysisEnabled=graph_available and self.workspace.active is not None
                                                   and not self._project_busy())
         # Keep refreshes cheap during axis navigation; serialize rows only when
         # the user invokes the all-results export action.
-        self.export_all_fit_btn.setEnabled(bool(
+        self._analysis_status(exportAllFitEnabled=bool(
             self._batch_fit_export_rows or self.batch_fit_result_map or self.fit_result
         ))
-        if hasattr(self, "export_png_btn"):
-            self.export_png_btn.setEnabled(
+        if hasattr(self, 'plot_page'):
+            self.plot_page.set_command_availability('export_png',
                 self.current_cube is not None
                 and self._heat_ax is not None
                 and self.plot_page.rendered_page is not None
@@ -10278,81 +8441,19 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             default = manual_settings()
         return presets, default
 
-    def _build_title_controls(self, form: QFormLayout) -> None:
-        self.title_preset_combo = QComboBox()
-        form.addRow("Title preset:", self.title_preset_combo)
-        self.title_template_panel = QWidget()
-        editor = QFormLayout(self.title_template_panel)
-        editor.setContentsMargins(0, 0, 0, 0)
-        editor.setSpacing(3)
-        self.title_pattern_edit = QLineEdit()
-        self.title_pattern_edit.setToolTip(
-            "Arrange any fields: {voltage}, {field}, {angle}, {valley}, {temperature}, {sample}. "
-            "Add units as text. Use {{ and }} for literal braces. No expressions or formatting codes.")
-        editor.addRow("Format:", self.title_pattern_edit)
-        fields = QVBoxLayout()
-        self.title_field_combo = QComboBox()
-        self.title_field_combo.addItems(FIELDS)
-        insert = QPushButton("Insert field")
-        insert.clicked.connect(lambda: self.title_pattern_edit.insert("{" + self.title_field_combo.currentText() + "}"))
-        fields.addWidget(self.title_field_combo)
-        fields.addWidget(insert)
-        editor.addRow("Fields:", fields)
-        self.title_angle_map_edit = QLineEdit()
-        self.title_angle_map_edit.setPlaceholderText("85=K;175=Kp (optional)")
-        self.title_angle_map_edit.setToolTip("Map filename angles to valley labels for this preset only. Separate entries with semicolons.")
-        editor.addRow("Angle map:", self.title_angle_map_edit)
-        actions = QVBoxLayout()
-        self.title_preset_name_edit = QLineEdit()
-        self.title_preset_name_edit.setPlaceholderText("Preset name")
-        self.title_save_button = QPushButton("Save preset")
-        self.title_save_button.clicked.connect(self._save_title_preset)
-        self.title_apply_button = QPushButton("Apply template")
-        self.title_apply_button.clicked.connect(self._apply_current_title_template)
-        actions.addWidget(self.title_preset_name_edit)
-        actions.addWidget(self.title_save_button)
-        actions.addWidget(self.title_apply_button)
-        editor.addRow(actions)
-        form.addRow(self.title_template_panel)
-        self.title_template_status = QLabel()
-        self.title_template_status.setWordWrap(True)
-        form.addRow(self.title_template_status)
-        self._show_title_settings()
-        self.title_preset_combo.currentIndexChanged.connect(self._on_title_preset_selected)
-        self.title_pattern_edit.textChanged.connect(self._on_title_template_edited)
-        self.title_angle_map_edit.textChanged.connect(self._on_title_template_edited)
 
     def _show_title_settings(self) -> None:
         settings = self._title_settings
-        preset = settings["preset"] if settings["mode"] == "template" else BUILTIN_PRESET
-        selected = preset["name"] if settings["mode"] == "template" else "Manual"
-        with QSignalBlocker(self.title_preset_combo):
-            self.title_preset_combo.clear()
-            self.title_preset_combo.addItem("Manual", None)
-            self.title_preset_combo.addItem("Current group", BUILTIN_PRESET)
-            for name, saved in self._title_presets.items():
-                self.title_preset_combo.addItem(name, saved)
-            index = self.title_preset_combo.findText(selected)
-            if index < 0:
-                self.title_preset_combo.addItem(selected, preset)
-                index = self.title_preset_combo.count() - 1
-            self.title_preset_combo.setCurrentIndex(index)
-        with QSignalBlocker(self.title_pattern_edit), QSignalBlocker(self.title_angle_map_edit):
-            self.title_pattern_edit.setText(preset["pattern"])
-            self.title_angle_map_edit.setText(";".join(f"{angle}={label}" for angle, label in preset["angle_map"].items()))
-        self.title_preset_name_edit.setText("" if selected in ("Manual", "Current group") else selected)
-        active = settings["mode"] == "template"
-        self.title_template_panel.setVisible(active)
-        self.title_template_status.setVisible(active)
-        notice = "Load a DAT to preview this template."
-        if settings["manual_override"] is not None:
-            notice = "Manual override for this DAT; Apply template to regenerate."
-        elif active and self.current_cube is not None:
+        preset = settings['preset'] if settings['mode'] == 'template' else BUILTIN_PRESET
+        notice = 'Load a DAT to preview this template.'
+        if settings['manual_override'] is not None:
+            notice = 'Manual override for this DAT; Apply template to regenerate.'
+        elif settings['mode'] == 'template' and self.current_cube is not None:
             try:
-                notice = "Preview: " + render_title(self.current_cube.source_path or "", preset)
+                notice = 'Preview: ' + render_title(self.current_cube.source_path or '', preset)
             except ValueError as exc:
                 notice = str(exc)
-        self.title_template_status.setText(notice)
+        self._dat_status('title_template_status', notice)
 
     def _remember_title_selection(self) -> None:
         self._default_title_settings = self._copy_title_settings(self._title_settings)
@@ -10360,10 +8461,11 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._annotation_settings.setValue("plot_titles/selection", json.dumps(self._default_title_settings))
         self._sync_annotation_settings()
 
-    def _on_title_preset_selected(self, _index: int) -> None:
+    def _on_title_preset_selected(self, name: str) -> None:
         with self._edit_transaction('Title preset', TITLE_FIELDS):
-            preset = self.title_preset_combo.currentData()
-            self._title_settings = (manual_settings(self.plot_title_edit.text()) if preset is None else
+            preset = None if name == 'Manual' else (BUILTIN_PRESET if name == 'Current group' else self._title_presets[name])
+            self.dat_properties._templates.pop(self.dat_properties.owner_key(), None)
+            self._title_settings = (manual_settings(self._dat_annotation('plot_title')) if preset is None else
                                     {"mode": "template", "preset": self._copy_title_settings(preset), "manual_override": None})
             self._show_title_settings()
             self._remember_title_selection()
@@ -10372,8 +8474,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
     def _edited_title_preset(self, name: str | None = None) -> dict:
         preset = {"name": name or self._title_settings["preset"]["name"],
-                  "pattern": self.title_pattern_edit.text(),
-                  "angle_map": parse_angle_map(self.title_angle_map_edit.text())}
+                  "pattern": self.dat_properties.template('title_pattern'),
+                  "angle_map": parse_angle_map(self.dat_properties.template('title_angle_map'))}
         return validate_preset(preset)
 
     def _on_title_template_edited(self, *_args) -> None:
@@ -10384,7 +8486,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         except ValueError as exc:
             self._title_settings["manual_override"] = ""
             self._set_title_text("")
-            self.title_template_status.setText(str(exc))
+            self._dat_status('title_template_status', str(exc))
             return
         self._begin_history_text('Title template', TITLE_FIELDS)
         self._title_settings = {"mode": "template", "preset": preset, "manual_override": None}
@@ -10396,20 +8498,20 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             try:
                 preset = self._edited_title_preset()
             except ValueError as exc:
-                self.title_template_status.setText(str(exc))
+                self._dat_status('title_template_status', str(exc))
                 return
             self._title_settings = {"mode": "template", "preset": preset, "manual_override": None}
             self._apply_title_template()
 
     def _save_title_preset(self) -> None:
         with self._edit_transaction('Title preset', TITLE_FIELDS):
-            name = self.title_preset_name_edit.text().strip()
+            name = self.dat_properties.template('title_preset_name').strip()
             try:
                 if not name or name in ("Manual", "Current group"):
                     raise ValueError("Choose a name other than Manual or Current group.")
                 preset = self._edited_title_preset(name)
             except ValueError as exc:
-                self.title_template_status.setText(str(exc))
+                self._dat_status('title_template_status', str(exc))
                 return
             self._title_presets[name] = preset
             self._annotation_settings.setValue("plot_titles/presets", json.dumps(self._title_presets))
@@ -10419,16 +8521,16 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._apply_title_template()
 
     def _set_title_text(self, text: str) -> None:
-        with QSignalBlocker(self.plot_title_edit):
-            self.plot_title_edit.setText(text)
-        (self.workspace.active or self._unregistered_session).view.annotations['plot_title'] = text
-        self._update_plot_annotations()
+        self._dat_view().annotations['plot_title'] = text
+        self._update_plot_annotations(layout=False, title_only=True)
+        self.canvas.draw_idle()
+        self.dat_properties.syncFromOwner()
 
     def _apply_title_template(self) -> None:
         self._title_settings["manual_override"] = None
         if self.current_cube is None:
             self._set_title_text("")
-            self.title_template_status.setText("Load a DAT to preview this template.")
+            self._dat_status('title_template_status', "Load a DAT to preview this template.")
             return
         try:
             title = render_title(self.current_cube.source_path or "", self._title_settings["preset"])
@@ -10436,7 +8538,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         except ValueError as exc:
             title, notice = "", str(exc)
         self._set_title_text(title)
-        self.title_template_status.setText(notice)
+        self._dat_status('title_template_status', notice)
 
     def _initialize_plot_annotations(self) -> None:
         cube = self.current_cube
@@ -10446,74 +8548,46 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             if source != self._title_source or source != self._annotation_source:
                 self._title_source = self._annotation_source = source
                 self._show_title_settings()
-                for name, edit in self._annotation_edits.items():
-                    with QSignalBlocker(edit):
-                        edit.setText(session.view.annotations[name])
-                with QSignalBlocker(self.signal_title_auto_chk), QSignalBlocker(self.signal_title_combo):
-                    self.signal_title_auto_chk.setChecked(session.view.signal_title_auto)
-                    self.signal_title_combo.setCurrentText(session.view.annotations['signal_title'])
             self._refresh_auto_signal_title()
             return
         if source != self._title_source:
             self._title_source = source
             self._title_settings = self._copy_title_settings(self._default_title_settings)
             self._show_title_settings()
-            if self._title_settings["mode"] == "template":
+            if self._title_settings['mode'] == 'template':
                 self._apply_title_template()
             else:
-                text = (self._annotation_settings.value("plot_annotations/plot_title", "", type=str)
-                        if self.fix_annotations_chk.isChecked() else "")
-                self._set_title_text(text)
-        if source == self._annotation_source:
-            self._refresh_auto_signal_title()
-            return
-        self._annotation_source = source
-        match = re.fullmatch(r"(.*?)\s*\(([^()]*)\)\s*", cube.gate_label)
-        name, unit = match.groups() if match else (cube.gate_label, "")
-        for field, text in (("y_axis_name", name), ("y_axis_unit", unit)):
-            # Key presence distinguishes an intentional blank from a source default.
-            if (self.fix_annotations_chk.isChecked()
-                    and self._annotation_settings.contains(f"plot_annotations/{field}")):
-                text = self._annotation_settings.value(f"plot_annotations/{field}", "", type=str)
-            edit = self._annotation_edits[field]
-            edit.blockSignals(True)
-            edit.setText(text)
-            edit.blockSignals(False)
-        with QSignalBlocker(self.signal_title_auto_chk):
-            self.signal_title_auto_chk.setChecked(self._annotation_settings.value(
-                "plot_annotations/signal_auto",
-                not self._annotation_settings.contains("plot_annotations/signal_title"), type=bool)
-                if self.fix_annotations_chk.isChecked() else True)
-        if not self.signal_title_auto_chk.isChecked():
-            with QSignalBlocker(self.signal_title_combo):
-                self.signal_title_combo.setCurrentText(self._annotation_settings.value(
-                    "plot_annotations/signal_title", self.signal_title_combo.currentText(), type=str))
+                self._set_title_text(self._annotation_settings.value('plot_annotations/plot_title', '', type=str)
+                                     if self._dat_view().fix_annotations else '')
+        if source != self._annotation_source:
+            self._annotation_source = source
+            match = re.fullmatch(r'(.*?)\s*\(([^()]*)\)\s*', cube.gate_label)
+            name, unit = match.groups() if match else (cube.gate_label, '')
+            for field, text in (('y_axis_name', name), ('y_axis_unit', unit)):
+                if self._dat_view().fix_annotations and self._annotation_settings.contains('plot_annotations/' + field):
+                    text = self._annotation_settings.value('plot_annotations/' + field, '', type=str)
+                self._dat_view().annotations[field] = text
         self._refresh_auto_signal_title()
 
     def _refresh_auto_signal_title(self) -> None:
-        if not self.signal_title_auto_chk.isChecked():
-            self.signal_title_combo.setToolTip("Manual colorbar label. Enable Auto from data to use signal metadata or filename.")
+        if not self._dat_view().signal_title_auto:
             return
         cube = self._base_cube or self.current_cube
-        kind = cube.signal_kind if cube is not None else "unknown"
-        if kind == "unknown" and cube is not None:
+        kind = cube.signal_kind if cube is not None else 'unknown'
+        if kind == 'unknown' and cube is not None:
             kind = infer_signal_kind(cube.source_path)
         source = cube.signal_source_kind if cube is not None else 'unknown'
         if source == 'unknown' and cube is not None:
             source = infer_source_signal_kind(cube.source_path or '')
         session = self.workspace.active or self._unregistered_session
-        derivative = session.active_graph.source_mode == 'processed' and self._processing_mode == "energy_second_derivative"
-        with QSignalBlocker(self.signal_title_combo):
-            self.signal_title_combo.setCurrentText(automatic_signal_label(source, derivative, kind == 'energy_second_derivative'))
-        (self.workspace.active or self._unregistered_session).view.annotations['signal_title'] = self.signal_title_combo.currentText()
-        self.signal_title_combo.setToolTip(
-            "Signal unrecognized; neutral Signal label. Edit to set a manual title."
-            if source == "unknown" else "Automatic signal title from explicit metadata, filename, or applied processing.")
+        derivative = session.active_graph.source_mode == 'processed' and self._processing_mode == 'energy_second_derivative'
+        session.view.annotations['signal_title'] = automatic_signal_label(source, derivative, kind == 'energy_second_derivative')
+        self.dat_properties.syncFromOwner()
 
     def _on_signal_auto_toggled(self, checked: bool) -> None:
         self._finish_annotation_edit(render=False)
         with self._edit_transaction('Automatic signal title', ('view.signal_title_auto', 'view.annotations.signal_title')):
-            if self.fix_annotations_chk.isChecked():
+            if self._dat_view().fix_annotations:
                 self._annotation_settings.setValue("plot_annotations/signal_auto", checked)
                 self._sync_annotation_settings()
             self._refresh_auto_signal_title()
@@ -10524,84 +8598,100 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                  ('view.annotations.signal_title', 'view.signal_title_auto') if field == 'signal_title' else
                  ('view.annotations.' + field,))
         self._begin_history_text('Edit ' + field.replace('_', ' '), names)
+        self._dat_view().annotations[field] = text
         if field == "signal_title":
             # Avoid the auto-toggle handler doing a synchronous layout while typing.
-            with QSignalBlocker(self.signal_title_auto_chk):
-                self.signal_title_auto_chk.setChecked(False)
-            if self.fix_annotations_chk.isChecked():
+            self._dat_view().signal_title_auto = False
+            if self._dat_view().fix_annotations:
                 self._annotation_settings.setValue("plot_annotations/signal_auto", False)
         if field == "plot_title":
             self._title_settings["manual_override"] = text
             if self._title_settings["mode"] == "template":
-                self.title_template_status.setText("Manual override for this DAT; Apply template to regenerate.")
-        if self.fix_annotations_chk.isChecked() and not (
+                self._dat_status('title_template_status', "Manual override for this DAT; Apply template to regenerate.")
+        if self._dat_view().fix_annotations and not (
                 field == "plot_title" and self._title_settings["mode"] == "template"):
             self._annotation_settings.setValue(f"plot_annotations/{field}", text)
         # Retire export bytes once per draft, retaining the last displayed page.
         # Enter/focus-out (or explicit capture) is the render boundary.
         first_edit = not self._annotation_edit_pending
         can_export = first_edit and self.plot_page.rendered_page is not None
+        # The clipped transAxes title does not size the frame. Accumulate all
+        # labels in this draft so a later title cannot hide an axis/signal edit.
+        self._annotation_edit_requires_layout = (
+            field != 'plot_title' or (not first_edit and self._annotation_edit_requires_layout))
         self._annotation_edit_pending = True
         self._plot_render_timer.stop()
-        self._update_plot_annotations(layout=False, invalidate=first_edit)
+        self._update_plot_annotations(layout=False, invalidate=first_edit,
+                                      title_only=field == 'plot_title')
         if can_export:
             # A valid text draft can be committed by Export itself. The
             # controller prepares fresh bytes before writing, including when
             # the click's FocusOut has already committed the text.
-            self.plot_page.export_svg_btn.setEnabled(True)
-            self.plot_page.export_png_btn.setEnabled(True)
-            self.plot_page.copy_graph_btn.setEnabled(True)
+            for command in ('export_svg', 'export_png', 'copy_svg'):
+                self.plot_page.set_command_availability(command, True)
         self._refresh_graph_commands()
 
     def _finish_annotation_edit(self, *, render: bool = True) -> None:
         if not self._annotation_edit_pending:
             return
+        needs_layout = self._annotation_edit_requires_layout
         self._annotation_edit_pending = False
+        self._annotation_edit_requires_layout = False
         self._annotation_edit_timer.stop()
         self._sync_annotation_settings()
+        # Capture/save may finish without drawing; preserve any outstanding
+        # geometry until a real layout succeeds, including across hidden views.
+        self._annotation_layout_pending |= needs_layout
         if render:
-            visible = self.plot_tabs.currentWidget() is self.graph_documents
-            self._annotation_layout_pending = visible
-            self._update_plot_annotations(layout=not visible, invalidate=False)
+            visible = self._outer_view == 'workspace'
+            self._update_plot_annotations(
+                layout=self._annotation_layout_pending and not visible, invalidate=False,
+                title_only=not needs_layout)
+            if not visible:
+                self.canvas.draw_idle()
             self._schedule_plot_page_render(delay=0)
 
     def _on_fix_annotations_toggled(self, checked: bool) -> None:
         with self._edit_transaction('Fix annotations', ('view.fix_annotations',)):
             self._annotation_settings.setValue("plot_annotations/fixed", checked)
             if checked:
-                self._annotation_settings.setValue("plot_annotations/signal_auto", self.signal_title_auto_chk.isChecked())
-                for field, edit in self._annotation_edits.items():
-                    if field == "plot_title" and self._title_settings["mode"] == "template":
+                self._annotation_settings.setValue("plot_annotations/signal_auto", self._dat_view().signal_title_auto)
+                for field, text in self._dat_view().annotations.items():
+                    if field == 'plot_title' and self._title_settings['mode'] == 'template':
                         continue
-                    self._annotation_settings.setValue(f"plot_annotations/{field}", edit.text())
+                    self._annotation_settings.setValue('plot_annotations/' + field, text)
                 self._annotation_settings.setValue(
-                    "plot_annotations/signal_title", self.signal_title_combo.currentText())
+                    "plot_annotations/signal_title", self._dat_annotation('signal_title'))
             self._sync_annotation_settings()
 
     def _sync_annotation_settings(self) -> None:
         self._annotation_settings.sync()
         if self._annotation_settings.status() != QSettings.NoError:
-            self.statusBar().showMessage("Could not save plot annotations for the next session.")
+            self.publish_status("Could not save plot annotations for the next session.")
 
-    def _update_plot_annotations(self, *, layout: bool = True, invalidate: bool = True) -> None:
+    def _update_plot_annotations(self, *, layout: bool = True, invalidate: bool = True,
+                                 title_only: bool = False) -> None:
         owner = self._plot_owner_token()
         page = self.plot_page.rendered_page
         cached_owner, cached_frame = getattr(self, '_annotation_auto_frame', (None, None))
         frame = (page.plot_size_in if page is not None and page.owner_token == owner
                  else cached_frame if cached_owner == owner else None)
         if invalidate:
-            self._invalidate_plot_page()
+            self._invalidate_plot_page(schedule=not self._annotation_edit_pending)
         if frame is not None:
             # Annotation typing retires export bytes, while the current Auto
             # frame remains visible until the replacement page is prepared.
             self._annotation_auto_frame = (self._plot_owner_token(), frame)
         if self._heat_ax is None:
             return
-        self._heat_ax.title.set_text(self.plot_title_edit.text())
+        self._heat_ax.title.set_text(self._dat_annotation('plot_title'))
         self._heat_ax.title.set_parse_math(False)
-        name, unit = self.y_axis_name_edit.text(), self.y_axis_unit_edit.text()
-        self._heat_ax.set_ylabel(f"{name} ({unit})" if unit else name, parse_math=False)
-        self._apply_live_heatmap_style()
+        if not title_only:
+            name, unit = self._dat_annotation('y_axis_name'), self._dat_annotation('y_axis_unit')
+            self._heat_ax.set_ylabel(f"{name} ({unit})" if unit else name, parse_math=False)
+            # Styling resets colorbar label coordinates; only a full layout
+            # restores their measured clearance. Title overlays leave them alone.
+            self._apply_live_heatmap_style()
         if not layout:
             self._position_live_heatmap_title()
         if layout:
@@ -10615,16 +8705,21 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._view_layout_timer = QTimer(self)
             self._view_layout_timer.setSingleShot(True)
             self._view_layout_timer.timeout.connect(lambda: self._layout_live_plots())
-            self._view_layout_timer.timeout.connect(self.canvas.draw_idle)
+            self._view_layout_timer.timeout.connect(
+                lambda: self.canvas.draw_idle() if self._outer_view == 'analysis' else None)
+        if self._view_layout_timer.isActive() and self._view_layout_timer.remainingTime() == 0:
+            # Reflow delivered after a synchronous render must not postpone an
+            # already-due final layout for another debounce interval.
+            return
         self._view_layout_timer.start(40)
 
     def _sync_display_zoom(self, zoom):
-        with QSignalBlocker(self.analysis_zoom_combo):
-            self.analysis_zoom_combo.setCurrentText(zoom)
-        self._layout_live_plots()
-        self.canvas.draw_idle()
-
-    def _on_display_scale_changed(self, _scale):
+        # The cache records only the applied layout projection. The FormalPlotController
+        # remains the zoom owner, including when graph pages are rebound.
+        if self._analysis_display_zoom == zoom:
+            return
+        self._analysis_display_zoom = zoom
+        self.analysis_navigation.refresh()
         self._layout_live_plots()
         self.canvas.draw_idle()
 
@@ -10640,12 +8735,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 else (PlotPresentation().frame_width_in, PlotPresentation().frame_height_in))
 
     def _analysis_display_scale(self):
-        zoom = self.plot_page.zoom_combo.currentText()
+        zoom = self.plot_page.zoom_text
         if zoom != 'Fit':
             return int(zoom.rstrip('%')) / 100
         # Before the window is shown Qt supplies placeholder viewport geometry.
         # Hidden Analysis tabs in a shown window keep their own real viewport.
-        if not self.isVisible():
+        if self.root_window is None or not self.root_window.isVisible():
             return 1.
         saved = (self.workspace.active or self._unregistered_session).presentation
         frame_width, frame_height = self._live_heatmap_frame_size(saved)
@@ -10653,10 +8748,13 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                      + saved.colorbar.frame_gap_in + .06)
         if len(self._heat_colorbars) > 1:
             header += .2
-        viewport = self.analysis_scroll.viewport().size()
-        # Fit the Analysis footprint, including its fixed spectrum reserve.
+        viewport = QSize(round(self.dat_canvas.viewportWidth), round(self.dat_canvas.viewportHeight))
+        # Fit the Analysis footprint while keeping its smallest text readable
+        # at 9 logical pixels. A short viewport uses the existing canvas scroll.
+        # Derive the floor from saved point sizes; DPR is applied only later.
+        readable_scale = 9 * 72 / (96 * min(saved.numeric_pt, saved.text_pt))
         # Never measure the grown canvas: that would feed zoom back into Fit.
-        return max(.1, min((viewport.width()-12) / (96*(frame_width+1.35)),
+        return max(.1, readable_scale, min((viewport.width()-12) / (96*(frame_width+1.35)),
                            (viewport.height()-180-12) / (96*(frame_height+header+.85))))
 
     def _live_display_presentation(self):
@@ -10696,7 +8794,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self.plot_page.set_colorbar_norms({
             f'region-{index+1}' if regional else 'global': bar.mappable.norm
             for index, bar in enumerate(self._heat_colorbars)})
-        signal = (display_signal_label(self.signal_title_combo.currentText(), presentation.colorbar.show_unit)
+        signal = (display_signal_label(self._dat_annotation('signal_title'), presentation.colorbar.show_unit)
                   if presentation.colorbar.show_label else '')
         for index, bar in enumerate(self._heat_colorbars):
             bar_id = f'region-{index+1}' if regional else 'global'
@@ -10713,7 +8811,18 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._heat_signal_label.set_visible(presentation.colorbar.visible)
 
     def _layout_live_plots(self, _event=None) -> None:
-        if getattr(self, '_laying_out_live_plots', False):
+        if self._outer_view == 'workspace':
+            # Cached graph activation still rebuilds artists and restores exact
+            # limits. Only hidden presentation geometry waits for Analysis.
+            self._annotation_layout_pending = True
+            return
+        if (getattr(self, '_defer_dataset_layout', False)
+                or getattr(self, '_laying_out_live_plots', False)):
+            return
+        if isinstance(_event, ResizeEvent):
+            # Width/height reflow can report several intermediate viewports.
+            # Direct science/style edits still keep their synchronous layout.
+            self._schedule_view_layout()
             return
         self._laying_out_live_plots = True
         try:
@@ -10756,10 +8865,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         # lower spectrum remains an interactive 12 pt view with a fixed reserve.
         minimum_width = round(frame_size[0]*logical_scale + 1.35*logical_scale)
         minimum_height = round(frame_size[1]*logical_scale + header_reserve + .85*logical_scale + 180)
-        if self.canvas.minimumWidth() != minimum_width or self.canvas.minimumHeight() != minimum_height:
-            self.canvas.setMinimumSize(minimum_width, minimum_height)
-        if self.canvas.width() < minimum_width or self.canvas.height() < minimum_height:
-            self.canvas.resize(max(self.canvas.width(), minimum_width), max(self.canvas.height(), minimum_height))
+        self.dat_canvas.set_content_minimum(minimum_width, minimum_height)
         width, height = self.figure.get_size_inches()
         left = (width - plot_width) / 2
         bottom = (180 + .70*logical_scale)*self.canvas.device_pixel_ratio/self.figure.dpi
@@ -10786,7 +8892,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             ])
             cursor += bar_widths[index] + (bar_gaps[index] if index < len(bar_gaps) else 0.)
         if regional:
-            signal_label = (display_signal_label(self.signal_title_combo.currentText(), colorbar_style.show_unit)
+            signal_label = (display_signal_label(self._dat_annotation('signal_title'), colorbar_style.show_unit)
                             if colorbar_style.show_label else '')
             if self._heat_signal_label is None:
                 self._heat_signal_label = self.figure.text(
@@ -10806,7 +8912,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         elif self._heat_signal_label is not None:
             self._heat_signal_label.remove()
             self._heat_signal_label = None
-        self._heat_ax.set_title(self.plot_title_edit.text(), fontsize=presentation.text_pt,
+        self._heat_ax.set_title(self._dat_annotation('plot_title'), fontsize=presentation.text_pt,
                                 parse_math=False, y=.98, pad=0)
         if not regional and colorbar_style.visible:
             # Preserve the signal's clearance independently of overlay text.
@@ -10846,6 +8952,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._position_live_heatmap_title()
 
         _update_heatmap_tick_contrast(self._heat_ax, self.canvas.get_renderer())
+        # Do not consume pending work on hidden, reentrant or empty requests.
+        self._annotation_layout_pending = False
 
     def _position_live_heatmap_title(self):
         if self._heat_ax is None:
@@ -10865,11 +8973,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _on_create_analysis_graph(self) -> None:
         try:
             self._require_project_idle()
-            # Current analysis controls are drafts, never historical fit/detection settings.
-            for _, name, _, _ in ANALYSIS_BINDINGS:
-                control = getattr(self, name)
-                if isinstance(control, QAbstractSpinBox) and control.isEnabled() and not control.hasAcceptableInput():
-                    raise ValueError('Correct the pending numeric editor before creating an analysis graph.')
+            self.ordinary_analysis.validate_editor()
             self._finish_current_document()
             session = self.workspace.active
             if session is None or self.current_cube is None:
@@ -10923,7 +9027,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 graph_id=graph_id, source_label='Source data (applied)', has_fit=fit is not None)
             self._dat_analysis_graph_results[key] = (cube, fit, signature,
                 (book.workbook_id, tuple(s.sheet_id for s in sheets)), graph_id)
-            self.statusBar().showMessage('Created analysis graph in Workspace with detached source and result curves.')
+            self.publish_status('')
         except ValueError as exc:
             self._show_error(str(exc))
 
@@ -10939,7 +9043,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         gate_used, _ = self._nearest_spectrum(self.current_gate)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default = self._output_folder() / f"{cube.title}_gate_{gate_used:.6g}_{active_fit.model}_fit_{stamp}.csv"
-        out_path, _ = QFileDialog.getSaveFileName(self, "Export Current Gate CSV", str(default), "CSV Files (*.csv)")
+        out_path, _ = FilePicker.getSaveFileName(self.root_window, "Export Current Gate CSV", str(default), "CSV Files (*.csv)")
         if not out_path:
             return
         rows = [self._fit_result_to_export_row(
@@ -10953,7 +9057,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         except Exception as exc:
             self._show_error(f"Failed to export current-gate fit: {exc}")
             return
-        self.statusBar().showMessage(f"Exported current-gate fit CSV: {out_path}")
+        self.publish_status('')
 
     def _on_export_all_fit_csv(self) -> None:
         if self.current_cube is None:
@@ -10966,7 +9070,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         cube = self.current_cube
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default = self._output_folder() / f"{cube.title}_all_fit_{stamp}.csv"
-        out_path, _ = QFileDialog.getSaveFileName(self, "Export All Results CSV", str(default), "CSV Files (*.csv)")
+        out_path, _ = FilePicker.getSaveFileName(self.root_window, "Export All Results CSV", str(default), "CSV Files (*.csv)")
         if not out_path:
             return
         try:
@@ -10977,7 +9081,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         except Exception as exc:
             self._show_error(f"Failed to export all fit results: {exc}")
             return
-        self.statusBar().showMessage(f"Exported all fit results CSV: {out_path}")
+        self.publish_status('')
 
     def _on_export_spectrum_csv(self) -> None:
         if self.current_cube is None:
@@ -10988,14 +9092,14 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         try:
             _xr, y_analysis, mask = self._analysis_xy(
                 x, y,
-                smooth=self.fit_smooth_chk.isChecked(),
-                smooth_window=int(self.fit_smooth_win_spin.value()),
+                smooth=self._analysis_controls().fit_smooth,
+                smooth_window=int(self._analysis_controls().fit_smooth_window),
             )
         except Exception:
             y_analysis = np.asarray([], dtype=float)
             mask = self._fit_mask(x)
         default = self._output_folder() / f"{self.current_cube.title}_gate_{gate_used:.6g}_spectrum.csv"
-        out_path, _ = QFileDialog.getSaveFileName(self, "Export Spectrum CSV", str(default), "CSV Files (*.csv)")
+        out_path, _ = FilePicker.getSaveFileName(self.root_window, "Export Spectrum CSV", str(default), "CSV Files (*.csv)")
         if not out_path:
             return
         try:
@@ -11029,28 +9133,12 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         except Exception as exc:
             self._show_error(f"Failed to export spectrum CSV: {exc}")
             return
-        self.statusBar().showMessage(f"Exported spectrum CSV: {out_path}")
+        self.publish_status('')
 
     # =========================================================================
     #  Drag-and-drop
     # =========================================================================
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        paths = self._drop_paths(event)
-        if paths and not self._drop_busy(paths) and self._supported_drop(paths):
-            event.acceptProposedAction()
-            cw = self.centralWidget()
-            if cw:
-                self._dnd_overlay.resize(cw.size())
-            label = (f'Open project: {paths[0].name}' if paths[0].suffix.lower() in ('.spectra', '.spextra')
-                     else f'Import {len(paths)} data file(s) into Workspace')
-            self._dnd_overlay.setText(f'Drop to {label.lower()}')
-            self._dnd_overlay.setVisible(True)
-            self._dnd_overlay.raise_()
-            return
-        if paths:
-            self.statusBar().showMessage(self._drop_rejection_message())
-        event.ignore()
 
     @staticmethod
     def _drop_paths(event) -> list[Path]:
@@ -11074,21 +9162,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             return 'Wait for the current operation or cancel it before dropping files.'
         return 'Drop numeric data files together, or one Spectra project separately. Projects and data cannot be mixed.'
 
-    def dragLeaveEvent(self, event: Any) -> None:
-        self._dnd_overlay.setVisible(False)
 
-    def dropEvent(self, event: QDropEvent) -> None:
-        self._dnd_overlay.setVisible(False)
-        paths = self._drop_paths(event)
-        if not paths or self._drop_busy(paths) or not self._supported_drop(paths):
-            self.statusBar().showMessage(self._drop_rejection_message())
-            event.ignore()
-            return
-        event.acceptProposedAction()
-        if paths[0].suffix.lower() in ('.spectra', '.spextra'):
-            self._open_project_path(paths[0])
-        else:
-            self._import_data_files(paths)
 
     # =========================================================================
     #  Matplotlib plotting
@@ -11103,7 +9177,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if cube_changed:
             self._invalidate_dataset_documents(session.dataset_id)
         else:
-            self._invalidate_plot_page(kind='view')
+            self._invalidate_plot_page(kind='view', sync=False)
         try:
             self._plot_cube_impl()
         except ValueError as exc:
@@ -11112,6 +9186,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
             self._display_mapping_error(str(exc))
 
     def _plot_cube_impl(self) -> None:
+        self.dat_canvas.retire_interaction()
+        effective_x = self._dat_view().x_limits
+        effective_y = self._dat_view().y_limits
         self._finish_annotation_edit(render=False)
         if self.current_cube is None:
             return
@@ -11160,7 +9237,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                       if len(self._last_valid_region_color_limits) == len(slices) else
                       self._regional_color_ranges(self._visible_color_values_by_region(use_spin_values=True)))
         else:
-            vmin, vmax = self._ordered_pair(float(self.vmin_spin.value()), float(self.vmax_spin.value()))
+            vmin, vmax = self._ordered_pair(float(self._dat_number('vmin')), float(self._dat_number('vmax')))
             ranges = [(float(vmin), float(vmax))]
         cmap = resolve_colormap(self._selected_colormap())
         cmap = (colormaps[cmap] if isinstance(cmap, str) else cmap).with_extremes(bad=MISSING_COLOR)
@@ -11184,8 +9261,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._last_valid_color_limits = tuple(ranges[0])
         self._update_plot_annotations(layout=False)
         self._heat_ax.set_xlabel(cube.energy_label)
-        xmin, xmax = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
-        ymin, ymax = self._ordered_pair(float(self.ymin_spin.value()), float(self.ymax_spin.value()))
+        xmin, xmax = self._ordered_pair(*effective_x)
+        ymin, ymax = self._ordered_pair(*effective_y)
         self._heat_ax.set_xlim((xmin, xmax))
         self._heat_ax.set_ylim((ymin, ymax))
         self._layout_live_plots()
@@ -11210,7 +9287,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._refresh_color_range_status()
 
     def _update_spectrum_only(self) -> None:
-        if self._workbench_document() is not None and hasattr(self, 'workbench_seeds'):
+        if self._workbench_document() is not None and hasattr(self, 'analysis_workbench'):
             self._workbench_refresh()
             self._sync_gate_controls()
             self._schedule_project_modified()
@@ -11251,8 +9328,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if d2_trace is not None:
             d2_xr, d2y = d2_trace
             if d2_xr.size == d2y.size and d2_xr.size > 0:
-                view_xlo = float(self.xmin_spin.value())
-                view_xhi = float(self.xmax_spin.value())
+                view_xlo = float(self._dat_number('xmin'))
+                view_xhi = float(self._dat_number('xmax'))
                 vy = y[(x >= view_xlo) & (x <= view_xhi)]
                 y0_v = float(np.nanmin(vy)) if vy.size else 0.0
                 y1_v = float(np.nanmax(vy)) if vy.size else 1.0
@@ -11268,7 +9345,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         sel_idx = self._selected_peak_array_index()
         current_gate_idx = self._current_gate_index()
         lasso_energy_idxs = {int(ei) for gi, ei in self._lasso_selected_peak_ids if int(gi) == int(current_gate_idx)}
-        view_xmin, view_xmax = self._ordered_pair(float(self.xmin_spin.value()), float(self.xmax_spin.value()))
+        view_xmin, view_xmax = self._ordered_pair(float(self._dat_number('xmin')), float(self._dat_number('xmax')))
         y0, y1 = self._auto_spectrum_ylim(x, y, (view_xmin, view_xmax))
 
         if trace_peak_indices.size > 0:
@@ -11364,6 +9441,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         self._spec_ax.set_xlim((view_xmin, view_xmax))
         self._spec_ax.set_ylim((y0, y1))
 
+        if float(self.current_gate) != float(gate_used):
+            self._retire_peak_menu()
         self.current_gate = gate_used
         self._sync_gate_controls()
         self._refresh_fit_range_summary()
@@ -11561,6 +9640,8 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
     def _on_canvas_click(self, event: Any) -> None:
         if self.current_cube is None:
             return
+        if self.toolbar.mode:
+            return
         if self._dat_import_pending:
             if event.inaxes is self._heat_ax and event.button == 1 and event.ydata is not None:
                 self._set_current_gate_from_value(float(event.ydata), update_plot=True)
@@ -11594,7 +9675,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 return
 
             if event.button == 3:
-                self._show_peak_context_menu(float(event.xdata))
+                self._show_peak_context_menu(float(event.xdata), getattr(event, 'guiEvent', None))
                 return
 
         # ── Heatmap ───────────────────────────────────────────────────────────
@@ -11605,7 +9686,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
 
         # Circle-delete drag start
         if (
-            self.circle_delete_btn.isChecked()
+            self._circle_delete_mode
             and event.inaxes is self._heat_ax
             and event.button == 1
             and event.xdata is not None
@@ -11625,7 +9706,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         # Left-click on heatmap → select gate (ORIGINAL BEHAVIOR, UNCHANGED)
         if event.button != 1 or event.inaxes is not self._heat_ax or event.ydata is None:
             return
-        if self.circle_delete_btn.isChecked():
+        if self._circle_delete_mode:
             return  # already handled above
         g = self.current_cube.gate
         idx = int(np.argmin(np.abs(g - float(event.ydata))))
@@ -11715,7 +9796,7 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
         if (
             self.current_cube is not None
             and self._heat_ax is not None
-            and self.circle_delete_btn.isChecked()
+            and self._circle_delete_mode
             and self._batch_delete_circle_start is not None
         ):
             start_x, start_y = self._batch_delete_circle_start
@@ -11731,9 +9812,9 @@ class MainWindow(AnalysisWorkbenchMixin, QMainWindow):
                 )
                 if deleted > 0:
                     self._update_spectrum_only()
-                    self.statusBar().showMessage(f"Deleted {deleted} all-gate peak(s) inside circle.")
+                    self.publish_status('')
                 else:
-                    self.statusBar().showMessage("No all-gate peaks inside circle.")
+                    self.publish_status("No all-gate peaks inside circle.")
             else:
                 self._batch_delete_circle_start = None
 

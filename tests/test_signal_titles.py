@@ -4,7 +4,10 @@ from pathlib import Path
 from spectra_app.dat_io import load_dat_cube
 from spectra_app.plot_state import active_plot_recipe
 from tests import test_annotation_persistence as annotations
-from tests.settings_helpers import wait_for_background_jobs
+from tests import dat_properties_quick_helpers as dp
+from tests.background_helpers import wait_jobs as wait_for_background_jobs
+from tests import quick_migration_case as migration
+from spectra_app.plot_state import source_fingerprint
 
 class SignalDetectionTests(unittest.TestCase):
     def test_unit_suppression_preserves_literal_manual_meanings(self):
@@ -53,9 +56,28 @@ class SignalDetectionTests(unittest.TestCase):
                     path.write_text(header + 'Energy 0 1\n1 1 2\n2 3 4\n3 5 6\n', encoding='utf-8')
                     self.assertEqual(getattr(load_dat_cube(path), 'signal_kind', None), kind)
 
-class AutoSignalTests(unittest.TestCase):
-    setUp = annotations.AnnotationPersistenceTests.setUp
-    tearDown = annotations.AnnotationPersistenceTests.tearDown
+class AutoSignalTests(migration.QuickMigrationCase):
+    def setUp(self):
+        super().setUp()
+        self.settings_path = self.folder / 'profile.ini'
+        self.windows = []
+        self.host_errors = [self.quick_errors]
+
+    def tearDown(self):
+        for errors in self.host_errors:
+            self.assertEqual(errors, [], 'Unexpected production Quick error')
+
+    def arrange_cube(self, window, cube):
+        from dataclasses import replace
+        import numpy as np
+        path = self.folder / Path(cube.source_path).name
+        cube = replace(cube, source_path=str(path))
+        np.savetxt(path, np.column_stack((cube.energy, cube.z.T)),
+                   header='Energy(eV) ' + ' '.join(map(str, cube.gate)), comments='')
+        window._apply_loaded_dat(path, cube, source_fingerprint(path), None, '', '')
+        window.open_graph_document()
+        return cube
+
     make_window = annotations.AnnotationPersistenceTests.make_window
     load_source = annotations.AnnotationPersistenceTests.load_source
 
@@ -63,37 +85,37 @@ class AutoSignalTests(unittest.TestCase):
         from tests.test_heatmap_processing import _cube
         import numpy as np
         window = self.make_window()
-        window.current_cube = _cube(np.ones((2, 13)))
+        self.arrange_cube(window, _cube(np.ones((2, 13))))
         window._set_view_limits_to_auto()
         window._plot_cube()
-        window.processing_mode_combo.setCurrentIndex(1)
+        window.processing.setMode('energy_second_derivative')
         window._on_generate_heatmap()
         wait_for_background_jobs(window)
-        self.assertIn('d²', window.signal_title_combo.currentText())
-        window.processing_mode_combo.setCurrentIndex(0)
+        self.assertIn('d²', dp.state(window)['signal_title'])
+        window.processing.setMode('original')
         window._on_generate_heatmap()
-        self.assertEqual(window.signal_title_combo.currentText(), 'Signal (arb. units)')
-        window.signal_title_combo.setCurrentText('Manual')
-        window.processing_mode_combo.setCurrentIndex(1)
+        self.assertEqual(dp.state(window)['signal_title'], 'Signal (arb. units)')
+        window.dat_properties.setLabel('signal_title', 'Manual', window.dat_properties.ownerToken)
+        window.processing.setMode('energy_second_derivative')
         window._on_generate_heatmap()
         wait_for_background_jobs(window)
-        self.assertEqual(window.signal_title_combo.currentText(), 'Manual')
-        window.signal_title_auto_chk.setChecked(True)
-        self.assertIn('d²', window.signal_title_combo.currentText())
+        self.assertEqual(dp.state(window)['signal_title'], 'Manual')
+        dp.set_flag(window, 'signal_title_auto', True)
+        self.assertIn('d²', dp.state(window)['signal_title'])
 
     def test_auto_tracks_files_despite_fixed_annotations(self):
         window = self.make_window()
         self.load_source(window, 'scan_DR_R.dat')
         self.load_source(window, 'scan_DR_R_d2E.dat')
-        self.assertIn('d²', window.signal_title_combo.currentText())
-        window.signal_title_combo.setCurrentText('Custom')
-        self.assertFalse(window.signal_title_auto_chk.isChecked())
+        self.assertIn('d²', dp.state(window)['signal_title'])
+        window.dat_properties.setLabel('signal_title', 'Custom', window.dat_properties.ownerToken)
+        self.assertFalse(dp.state(window)['signal_title_auto'])
         self.load_source(window, 'scan_DR_R.dat')
-        self.assertEqual(window.signal_title_combo.currentText(), 'Custom')
-        window.signal_title_auto_chk.setChecked(True)
-        self.assertEqual(window.signal_title_combo.currentText(), 'ΔR/R₀ (arb. units)')
+        self.assertEqual(dp.state(window)['signal_title'], 'Custom')
+        dp.set_flag(window, 'signal_title_auto', True)
+        self.assertEqual(dp.state(window)['signal_title'], 'ΔR/R₀ (arb. units)')
         self.load_source(window, 'mystery.dat')
-        self.assertIn('unrecognized', window.signal_title_combo.toolTip().lower())
+        self.assertIn('unrecognized', dp.state(window)['signal_title_tooltip'].lower())
 
     def test_applied_derivatives_follow_pl_and_unknown_sources(self):
         from dataclasses import replace
@@ -103,12 +125,12 @@ class AutoSignalTests(unittest.TestCase):
                                  ('mystery.dat', 'd²Signal/dE² (arb. units)'),
                                  ('scan_DR_R.dat', 'd²(ΔR/R₀)/dE² (arb. units)')]:
             window = self.make_window()
-            window.current_cube = replace(_cube(np.ones((2, 13))), source_path=source)
+            self.arrange_cube(window, replace(_cube(np.ones((2, 13))), source_path=source))
             window._set_view_limits_to_auto(); window._plot_cube()
-            window.processing_mode_combo.setCurrentIndex(1)
+            window.processing.setMode('energy_second_derivative')
             window._on_generate_heatmap()
             wait_for_background_jobs(window)
-            self.assertEqual(window.signal_title_combo.currentText(), expected)
+            self.assertEqual(dp.state(window)['signal_title'], expected)
 
     def test_applied_derivative_of_declared_derivative_has_fourth_order_label(self):
         from dataclasses import replace
@@ -117,16 +139,16 @@ class AutoSignalTests(unittest.TestCase):
         for kind, expected in [('pl', 'd⁴PL/dE⁴ (arb. units)'),
                                ('reflection', 'd⁴(ΔR/R₀)/dE⁴ (arb. units)')]:
             window = self.make_window()
-            window.current_cube = replace(_cube(np.ones((2, 13))),
-                                          signal_kind='energy_second_derivative', signal_source_kind=kind)
+            self.arrange_cube(window, replace(_cube(np.ones((2, 13))),
+                                          signal_kind='energy_second_derivative', signal_source_kind=kind))
             window._set_view_limits_to_auto(); window._plot_cube()
-            self.assertIn('d²', window.signal_title_combo.currentText())
-            window.processing_mode_combo.setCurrentIndex(1); window._on_generate_heatmap()
+            self.assertIn('d²', dp.state(window)['signal_title'])
+            window.processing.setMode('energy_second_derivative'); window._on_generate_heatmap()
             wait_for_background_jobs(window)
-            self.assertEqual(window.signal_title_combo.currentText(), expected)
-            window.processing_mode_combo.setCurrentIndex(0)
+            self.assertEqual(dp.state(window)['signal_title'], expected)
+            window.processing.setMode('original')
             window._on_generate_heatmap()
-            self.assertIn('d²', window.signal_title_combo.currentText())
+            self.assertIn('d²', dp.state(window)['signal_title'])
 
     def test_legacy_recipe_remains_manual_and_new_auto_recipe_roundtrips(self):
         import json
@@ -146,8 +168,8 @@ class AutoSignalTests(unittest.TestCase):
             payload['plot']['annotations']['signal_title'] = 'Legacy custom'
             recipe.write_text(json.dumps(payload), encoding='utf-8')
             window._load_dat_file_direct(path)
-            self.assertFalse(window.signal_title_auto_chk.isChecked())
-            self.assertEqual(window.signal_title_combo.currentText(), 'Legacy custom')
-            window.signal_title_auto_chk.setChecked(True)
-            self.assertIn('d²', window.signal_title_combo.currentText())
+            self.assertFalse(dp.state(window)['signal_title_auto'])
+            self.assertEqual(dp.state(window)['signal_title'], 'Legacy custom')
+            dp.set_flag(window, 'signal_title_auto', True)
+            self.assertIn('d²', dp.state(window)['signal_title'])
             window.current_dat_path = None

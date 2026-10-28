@@ -1,3 +1,7 @@
+from tests import dat_properties_quick_helpers as dat
+from tests import source_navigation_helpers as sn
+from tests import quick_migration_case as migration
+from tests.quick_application_helpers import application, wait_until
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from copy import deepcopy
@@ -8,27 +12,23 @@ from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtQuick import QQuickItem
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QAbstractItemView
-from spectra_app.main_window import MainWindow
+from spectra_app.common_prompts import PromptAction
 from spectra_app.dataset_state import graph_export_stem
 from spectra_app.plot_state import active_plot_recipe
 from spectra_app.plot_presentation import ColorbarTicks, NormSpec, PlotAnnotation
 from spectra_app.plot_templates import FORMAT_TEMPLATES_KEY
-from tests.settings_helpers import isolate_settings
 from tests.background_helpers import wait_jobs
+from tests.formal_quick_helpers import click_item, item as quick_item, pump
 
-APP = QApplication.instance() or QApplication([])
-
-
-class PlotEditingWorkflowTests(unittest.TestCase):
+class PlotEditingWorkflowTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.w = MainWindow()
-        self.windows = [self.w]
-        self.errors = []
-        self.w._show_error = self.errors.append
+        super().setUp()
+        self.w = self.controller
+        self.window_errors = [self.quick_errors]
+        self.errors = self.quick_errors
         self.paths = []
         for name in ('a', 'b'):
             path = self.folder / (name + '.dat')
@@ -38,25 +38,58 @@ class PlotEditingWorkflowTests(unittest.TestCase):
             self.w._load_dat_file_direct(path)
             self.w.open_graph_document()
         self.a, self.b = self.w.workspace.datasets.values()
-        self.w.resize(1500, 950)
-        self.w.plot_tabs.setCurrentIndex(1)
-        self.w.show()
-        APP.processEvents()
+        self.w.root_window.resize(1500, 950)
+        self.w.request_outer_view('workspace')
+        self.w.dat_details_action.setChecked(True)
+        self.w.request_task(2)
+        self.w.root_window.show()
+        pump()
 
     def tearDown(self):
-        for window in self.windows:
-            wait_jobs(window)
+        for errors in self.window_errors:
+            self.assertEqual(errors, [], 'Unexpected production Quick error')
+
+    def window(self):
+        host, folder, errors = self.enterContext(application())
+        self.window_errors.append(errors)
+        return host.controller
+
+    def close_window(self, window):
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.DISCARD):
             window.close()
-            APP.processEvents()
-            window.deleteLater()
-        APP.processEvents()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+            wait_until(lambda: window._closing)
+        self.assertFalse(window.root_window.isVisible())
+
+    def canvas(self):
+        return self.w.graph_documents.content_item(self.w._document_key())
+
+    def canvas_point(self, annotation, endpoint=False):
+        point = self.w.plot_page.preview.annotation_point(annotation, endpoint=endpoint)
+        return quick_item(self.canvas(), 'formalPaper').mapToScene(QPointF(point)).toPoint()
+
+    def focus_canvas(self):
+        quick_item(self.canvas(), 'formalViewport').forceActiveFocus()
+
+    def formal_value(self, field, value, *, draft=False):
+        # Use the real current Properties surface and its captured owner token.
+        source = quick_item(self.w, 'formalProperties')
+        bridge = self.w.plot_page.formal
+        token = bridge.capturePropertiesInput(source)
+        self.assertTrue(token)
+        method = bridge.setDraft if draft else bridge.setValue
+        method(field, value, source, token)
+
+    def apply_annotation(self):
+        source = quick_item(self.w, 'formalProperties')
+        bridge = self.w.plot_page.formal
+        token = bridge.capturePropertiesInput(source)
+        self.assertTrue(token)
+        return bridge.applyAnnotation(source, token)
 
     def render(self):
         self.w._render_plot_page()
-        self.assertIsNotNone(self.w.plot_page.rendered_page, self.w.plot_page.status_label.text())
-        APP.processEvents()
+        self.assertIsNotNone(self.w.plot_page.rendered_page, self.w.plot_page.status_text)
+        pump()
         return self.w.plot_page.rendered_page
 
     def export_path(self, session, index=1, extension='svg'):
@@ -67,7 +100,7 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         w = self.w
         self.assertTrue(hasattr(w, 'save_plot_format'), 'Named plot formats need UI integration')
         w.set_plot_presentation(replace(self.b.presentation, width_in=4.2, aspect_locked=False))
-        w.cmap_combo.setCurrentText('plasma')
+        dat.set_choice(w, 'colormap', 'plasma')
         w.save_plot_format('Paper')
         w.set_plot_presentation(replace(self.b.presentation, width_in=3.3))
         for i, owner in enumerate((self.a, self.b)):
@@ -100,12 +133,12 @@ class PlotEditingWorkflowTests(unittest.TestCase):
             np.testing.assert_array_equal(cube.z, z)
             payload = json.loads(w._plot_state_store.path_for(owner.source_path).read_text(encoding='utf-8'))
             self.assertEqual(active_plot_recipe(payload['plot'])['presentation']['width_in'], 4.2)
-        self.assertEqual(w.cmap_combo.currentText(), 'plasma')
+        self.assertEqual(dat.state(w)['colormap'], 'plasma')
         self.assertEqual(tuple(w._heat_ax.get_xlim()), self.b.view.x_limits)
         self.assertEqual(tuple(w._heat_mesh.get_clim()), (-51.,151.))
         self.render()
         w.delete_plot_format('Paper')
-        self.assertEqual(w.plot_page.format_combo.count(), 0)
+        self.assertEqual(w.plot_page.formal.state['formats'], [])
 
     def test_target_checkboxes_preview_and_partial_errors_are_independent_of_navigation(self):
         w = self.w
@@ -115,19 +148,24 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         self.a.view.color_limits = (-1., 5.)
         # Explicit limits copied to a regional target must fail, independently.
         self.a.view.color_scale_mode = '2'
+        sn.reveal(w)
         dialog = w.create_format_dialog('Paper')
-        self.assertFalse(dialog.copy_mapping.isChecked())
-        self.assertFalse(dialog.copy_limits.isChecked())
-        dialog.select_all_btn.click()
+        self.assertFalse(quick_item(dialog, 'formatOption_mapping').property('checked'))
+        self.assertFalse(quick_item(dialog, 'formatOption_color_limits').property('checked'))
+        dialog.show()
+        pump()
+        click_item(dialog, 'plotTargetsAll')
         self.assertEqual(set(dialog.selected_ids()), {self.a.dataset_id,self.b.dataset_id})
-        dialog.copy_limits.setChecked(True)
-        self.assertIn('same global or regional', dialog.preview_text.toPlainText())
-        self.assertEqual(w.imported_dataset_list.selectionMode(), QAbstractItemView.SingleSelection)
+        click_item(dialog, 'formatOption_color_limits')
+        self.assertIn('same global or regional', quick_item(dialog, 'formatChanges').property('text'))
+        self.assertEqual(w.source_navigation.activeDatasetId, self.b.dataset_id)
+        self.assertEqual(quick_item(w, 'sourceDatasets').property('currentIndex'), 1)
         self.assertEqual(w.workspace.active_dataset_id, self.b.dataset_id)
         results = w.apply_plot_format('Paper', dialog.selected_ids(), copy_color_limits=True)
         self.assertFalse(results[0]['success'])
         self.assertTrue(results[1]['success'])
-        dialog.clear_btn.click()
+        click_item(dialog, 'plotTargetsClear')
+        dialog.close()
         self.assertEqual(dialog.selected_ids(), [])
 
     def test_malformed_format_preferences_are_reported_and_preserved(self):
@@ -138,14 +176,15 @@ class PlotEditingWorkflowTests(unittest.TestCase):
             w.save_plot_format('Paper')
         w._refresh_plot_formats()
         self.assertEqual(w._annotation_settings.value(FORMAT_TEMPLATES_KEY), '{bad')
-        self.assertIn('malformed', w.plot_page.status_label.text())
+        self.assertIn('malformed', w.plot_page.status_text)
+        self.assertTrue(quick_item(w, 'formal_status').isVisible())
 
     def test_qtimer_batch_freezes_jobs_and_preserves_active_owner_and_png_metadata(self):
         w = self.w
         self.assertTrue(hasattr(w, 'start_plot_batch'), 'Serial GUI batch binding is missing')
         self.render()
         before = (w.workspace.active_dataset_id, w._data_generation, w.plot_page.preview.svg_bytes,
-                  w.cmap_combo.currentText(), self.b.current_cube.z.copy())
+                  dat.state(w)['colormap'], self.b.current_cube.z.copy())
         w.start_plot_batch([self.a.dataset_id,self.b.dataset_id], formats=('svg','png'))
         self.assertTrue(w._plot_batch_timer.isActive())
         # The queued inactive job must retain its captured settings.
@@ -155,7 +194,7 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         self.assertEqual(w.workspace.active_dataset_id, before[0])
         self.assertEqual(w._data_generation, before[1])
         self.assertEqual(w.plot_page.preview.svg_bytes, before[2])
-        self.assertEqual(w.cmap_combo.currentText(), before[3])
+        self.assertEqual(dat.state(w)['colormap'], before[3])
         np.testing.assert_array_equal(self.b.current_cube.z, before[4])
         with Image.open(self.export_path(self.a, extension='png')) as image:
             meta=json.loads(image.info['SpectraAnalyzer'])
@@ -194,40 +233,45 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         self.render()
         annotation=self.b.presentation.annotations[0]
         self.assertEqual(annotation.position,(.15,.85))
-        start=p.preview.annotation_point(annotation)
+        start=self.canvas_point(annotation)
         end=start+QPoint(24,18)
-        QTest.mousePress(p.preview,Qt.LeftButton,pos=start)
-        QTest.mouseMove(p.preview,end,delay=10)
+        QTest.mousePress(w.root_window,Qt.LeftButton,pos=start)
+        QTest.mouseMove(w.root_window,end,delay=10)
         self.assertIsNotNone(p.rendered_page, 'Dragging must retain the paper geometry')
-        QTest.mouseRelease(p.preview,Qt.LeftButton,pos=end)
+        QTest.mouseRelease(w.root_window,Qt.LeftButton,pos=end)
         self.assertNotEqual(self.b.presentation.annotations[0].position,annotation.position)
         self.render()
-        p.annotation_text.setText('10T σ⁺')
-        p.annotation_apply_btn.click()
+        self.formal_value('annotation_text', '10T σ⁺', draft=True)
+        click_item(w, 'annotation_apply')
         page=self.render()
         self.assertIn('10T',page.svg_bytes.decode())
         self.assertNotIn('editing-handle',page.svg_bytes.decode())
         w._save_current_plot_state()
         other_page = w.open_graph_document(self.a.dataset_id)
-        self.assertEqual(other_page.annotation_list.count(),0)
+        self.assertEqual(len(other_page.formal.state['annotations']),0)
         self.assertIs(w.open_graph_document(self.b.dataset_id), p)
-        self.assertEqual(p.annotation_list.count(),1)
-        p.preview.setFocus()
-        QTest.keyClick(p.preview,Qt.Key_Delete)
+        self.assertEqual(len(p.formal.state['annotations']),1)
+        self.focus_canvas()
+        QTest.keyClick(w.root_window,Qt.Key_Delete)
         self.assertEqual(self.b.presentation.annotations,())
         self.assertEqual(self.a.presentation.annotations,())
 
     def test_batch_common_folder_blank_is_rejected_and_results_are_selectable(self):
         from spectra_app.plot_dialogs import BatchExportDialog
         dialog=BatchExportDialog((self.a,self.b),self.b.dataset_id,self.w)
-        dialog.common_folder.setChecked(True)
+        self.addCleanup(dialog.deleteLater)
+        dialog.bridge.setCommonFolder(True)
         with self.assertRaises(ValueError):
             self.w.start_plot_batch(dialog.selected_ids(),common_folder=dialog.destination())
         self.w.start_plot_batch([self.b.dataset_id],formats=('svg',))
         QTest.qWait(700)
         self.assertTrue(hasattr(self.w,'create_plot_batch_results_dialog'), 'Batch details need a selectable report')
         result=self.w.create_plot_batch_results_dialog()
-        self.assertIn(self.export_path(self.b).name,result.report_text.toPlainText())
+        self.assertIn(self.export_path(self.b).name, result.property('reportText'))
+        report = next(control for control in result.findChildren(QQuickItem)
+                      if control.inherits('QQuickTextArea'))
+        self.assertTrue(report.property('readOnly'))
+        self.assertTrue(report.property('selectByMouse'))
 
     def test_format_renderer_rejects_invalid_target_without_mutating_it(self):
         w=self.w
@@ -250,23 +294,28 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         p.add_annotation('arrow','1')
         self.render(); old=self.b.presentation.annotations[0]
         self.assertEqual(old.font_role,'numeric')
-        p.set_zoom('200%'); APP.processEvents()
-        start=p.preview.annotation_point(old,endpoint=True)
-        QTest.mousePress(p.preview,Qt.LeftButton,pos=start)
-        QTest.mouseMove(p.preview,start+QPoint(20,0),delay=10)
-        QTest.mouseRelease(p.preview,Qt.LeftButton,pos=start+QPoint(20,0))
+        p.set_zoom('200%'); pump()
+        paper_point=p.preview.annotation_point(old,endpoint=True)
+        viewport=quick_item(self.canvas(), 'formalViewport')
+        viewport.setProperty('contentX', max(0., paper_point.x()-viewport.width()/2))
+        viewport.setProperty('contentY', max(0., paper_point.y()-viewport.height()/2))
+        pump()
+        start=quick_item(self.canvas(), 'formalPaper').mapToScene(QPointF(paper_point)).toPoint()
+        QTest.mousePress(w.root_window,Qt.LeftButton,pos=start)
+        QTest.mouseMove(w.root_window,start+QPoint(20,0),delay=10)
+        QTest.mouseRelease(w.root_window,Qt.LeftButton,pos=start+QPoint(20,0))
         moved=self.b.presentation.annotations[0]
         self.assertEqual(moved.position,old.position)
         self.assertGreater(moved.target[0],old.target[0])
-        self.render(); p.preview.setFocus()
-        QTest.keyClick(p.preview,Qt.Key_Right)
+        self.render(); self.focus_canvas()
+        QTest.keyClick(w.root_window,Qt.Key_Right)
         nudged=self.b.presentation.annotations[0]
         self.assertGreater(nudged.position[0],old.position[0])
         self.assertEqual(nudged.target,moved.target)
         w._save_current_plot_state()
-        w.close()
-        APP.processEvents()
-        w2=MainWindow(); self.windows.append(w2)
+        self.close_window(w)
+        pump()
+        w2=self.window()
         w2._load_dat_file_direct(self.paths[1])
         self.assertEqual(w2.workspace.active.presentation.annotations,(nudged,))
 
@@ -290,7 +339,7 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         self.w.start_plot_batch([self.a.dataset_id,self.b.dataset_id],formats=('svg',))
         self.w._plot_batch_timer.stop()
         self.w._step_plot_batch()
-        self.w.close()
+        self.close_window(self.w)
         self.assertEqual(self.w.plot_batch_summary.canceled,1)
         self.assertFalse(self.w._plot_batch_timer.isActive())
         self.assertTrue(self.export_path(self.a, 2).exists())
@@ -304,18 +353,18 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         p.add_annotation('text','9T σ⁺')
         self.render()
         before=p.preview.annotation_point(self.b.presentation.annotations[0])
-        p.annotation_space.setCurrentIndex(p.annotation_space.findData('data'))
-        p.annotation_apply_btn.click()
+        self.formal_value('annotation_coordinate_space', 'data')
+        self.assertTrue(self.apply_annotation())
         self.render()
         item=self.b.presentation.annotations[0]
         self.assertEqual(item.coordinate_space,'data')
         after=p.preview.annotation_point(item)
         self.assertLessEqual((before-after).manhattanLength(),1)
         position=item.position
-        p.set_zoom('200%'); APP.processEvents()
+        p.set_zoom('200%'); pump()
         self.assertEqual(self.b.presentation.annotations[0].position,position)
-        p.annotation_visible.setChecked(False)
-        p.annotation_apply_btn.click()
+        self.formal_value('annotation_visible', False)
+        self.assertTrue(self.apply_annotation())
         page=self.render()
         self.assertNotIn('annotation-'+item.id,page.svg_bytes.decode())
         self.assertFalse(self.b.presentation.annotations[0].visible)
@@ -323,8 +372,8 @@ class PlotEditingWorkflowTests(unittest.TestCase):
     def test_invalid_active_tick_edit_cannot_be_saved_or_exported_through_batch(self):
         w=self.w; p=w.plot_page
         self.render()
-        p.tick_values_edit.setText('not three numbers')
-        p.custom_ticks.setChecked(True)
+        self.formal_value('tick_values', 'not three numbers', draft=True)
+        self.formal_value('custom_ticks', True)
         self.assertIsNotNone(p.presentation_error)
         with self.assertRaises(ValueError):
             w.save_plot_format('Invalid editor')
@@ -340,25 +389,34 @@ class PlotEditingWorkflowTests(unittest.TestCase):
         p.add_annotation('text','9T σ⁺')
         self.render()
         p.preview.set_geometry(replace(p.preview.snapshot,x_scale='log'),p.presentation)
-        p.annotation_space.setCurrentIndex(p.annotation_space.findData('data'))
-        p.annotation_x.setValue(-1.)
+        self.formal_value('annotation_coordinate_space', 'data')
+        self.formal_value('annotation_x', '-1', draft=True)
         before=self.b.presentation.annotations[0]
-        p.annotation_apply_btn.click()
+        self.assertFalse(self.apply_annotation())
         self.assertEqual(self.b.presentation.annotations[0],before)
-        self.assertIn('positive',p.status_label.text())
-        p.preview.grab()  # A rejected coordinate must never raise during overlay painting.
+        self.assertIn('positive',p.formal.state['error'])
+        pump(60)
+        error_editor = quick_item(self.w, p.formal.state['errorField'])
+        self.assertTrue(error_editor.isVisible())
+        self.assertTrue(error_editor.parentItem().property('invalid'))
+        self.assertFalse(self.w.root_window.grabWindow().isNull())  # Paint the actual mounted overlay.
 
     def test_annotation_add_buttons_require_a_valid_page_and_block_empty_window(self):
-        empty=MainWindow()
-        self.windows.append(empty)
-        self.assertFalse(empty.plot_page.add_text_btn.isEnabled())
-        self.assertFalse(empty.plot_page.add_arrow_btn.isEnabled())
+        empty=self.window()
+        self.assertEqual(empty.contextKind, 'empty')
+        # The production empty context does not mount publication editors.
+        # No annotation add control may be available before a graph exists.
+        self.assertFalse(any(control.isVisible() and control.isEnabled()
+                             for control in empty.root_window.findChildren(QQuickItem)
+                             if control.objectName() in ('add_text', 'add_arrow')))
         with self.assertRaises(ValueError):
             empty.plot_page.add_annotation('text','No data')
         self.render()
-        self.assertTrue(self.w.plot_page.add_text_btn.isEnabled())
+        self.w.plot_page.formal.focusRequested.emit('annotations', 'annotation_text')
+        pump(60)
+        self.assertTrue(quick_item(self.w, 'add_text').isEnabled())
         self.w._invalidate_plot_page(schedule=False)
-        self.assertFalse(self.w.plot_page.add_arrow_btn.isEnabled())
+        self.assertFalse(quick_item(self.w, 'add_arrow').isEnabled())
 
 
 if __name__=='__main__':

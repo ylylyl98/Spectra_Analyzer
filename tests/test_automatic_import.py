@@ -2,43 +2,32 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from threading import Event
-import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtCore import QEvent, QMimeData, QPointF, Qt, QUrl
-from PySide6.QtGui import QDropEvent
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem
 
 from spectra_app.background_jobs import JobContext, LoadRequest
 from spectra_app.data_import import prepare_data_batch
 from spectra_app.dataset_state import graph_cube
-from spectra_app.main_window import MainWindow
 from spectra_app.workbook_state import (create_comparison, ensure_dataset_sheet,
     set_sheet_mapping, sheet_values)
 from spectra_app.xy_import_dialog import XYImportDialog
 from tests.background_helpers import wait_jobs
-from tests.settings_helpers import isolate_settings
+from tests.quick_migration_case import QuickMigrationCase
+from tests import formal_quick_helpers as quick
+from tests import source_navigation_helpers as sn
 
-APP = QApplication.instance() or QApplication([])
 
-
-class AutomaticImportTests(unittest.TestCase):
+class AutomaticImportTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
-        self.addCleanup(self.dispose)
+        super().setUp()
+        self.window = self.controller
+        self.errors = self.quick_errors
 
-    def dispose(self):
+    def tearDown(self):
         wait_jobs(self.window)
-        self.window._close_pending = False
-        self.window.close()
-        self.window.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
 
     def file(self, name='table.csv', text='x,a,b\n3,10,20\n1,30,40\n'):
         path = self.folder / name
@@ -57,31 +46,30 @@ class AutomaticImportTests(unittest.TestCase):
         for route in ('file', 'project', 'source', 'inventory', 'drop'):
             with self.subTest(route=route):
                 path = self.file(route + '.csv')
-                with patch('spectra_app.main_window.QFileDialog.getOpenFileNames', return_value=([str(path)], '')), \
+                with patch('spectra_app.main_window.FilePicker.getOpenFileNames', return_value=([str(path)], '')), \
                         patch.object(XYImportDialog, 'exec', side_effect=AssertionError('automatic import opened review')):
                     if route == 'file':
                         w._graph_command_actions['import'].trigger()
                     elif route == 'project':
-                        w.import_xy_btn.click()
+                        quick.click_item(w, 'projectImport')
                     elif route == 'source':
-                        w.import_dats_btn.click()
+                        self.assertTrue(w.request_outer_view('analysis'))
+                        sn.reveal(w)
+                        quick.click_item(w, 'sourceImport')
                     elif route == 'inventory':
-                        item = QListWidgetItem(path.name)
-                        item.setData(Qt.UserRole, str(path))
-                        w.file_list.addItem(item)
-                        w.file_list.setCurrentItem(item)
-                        w.load_btn.click()
+                        self.assertTrue(w.request_outer_view('analysis'))
+                        ticket = w.source_navigation.begin_folder(path.parent)
+                        w.source_navigation.apply_files(ticket, [path.name])
+                        sn.reveal(w, inventory=True)
+                        quick.click_item(w, 'sourceLoad')
                     else:
-                        mime = QMimeData()
-                        mime.setUrls([QUrl.fromLocalFile(str(path))])
-                        event = QDropEvent(QPointF(10, 10), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
-                        w.dropEvent(event)
-                        self.assertTrue(event.isAccepted())
+                        self.assertTrue(w.dropUrls([QUrl.fromLocalFile(str(path))]))
                     wait_jobs(w)
                 sheet = next(s for s in w.workspace.sheets.values() if s.source_path == path)
                 self.assertEqual((sheet.x_column, sheet.y_columns), (0, [1, 2]))
                 np.testing.assert_equal(sheet.data, [[3, 10, 20], [1, 30, 40]])
-                self.assertIs(w.plot_tabs.currentWidget(), w.graph_documents)
+                self.assertEqual(w.outerView, 'workspace')
+                self.assertIsNotNone(w.graph_documents.content_item(w.graph_documents.registry.active_key))
                 self.assertIsNone(w.workspace.active_dataset_id)
                 self.assertFalse(w.workspace.comparisons)
         self.assertEqual(len(w.workspace.workbooks), 5)
@@ -117,7 +105,8 @@ class AutomaticImportTests(unittest.TestCase):
         identity, owner = sheet.sheet_id, w._sheet_owner(sheet.sheet_id).workbook_id
         saved = w.save_project(self.folder / 'automatic.spectra')
         path.unlink()
-        self.assertTrue(w.open_project(saved))
+        with patch.object(w, '_confirm_project_discard', return_value=True):
+            self.assertTrue(w.open_project(saved))
         self.assertEqual(w.workspace.sheets[identity].y_columns, list(range(1, 102)))
         self.assertEqual(w._sheet_owner(identity).workbook_id, owner)
         np.testing.assert_equal(sheet_values(w.workspace, identity), values)
@@ -139,7 +128,7 @@ class AutomaticImportTests(unittest.TestCase):
         with patch.object(XYImportDialog, 'exec', side_effect=AssertionError('unexpected import review')):
             w._import_data_files([*paths, ordinary])
             wait_jobs(w)
-        w.show()
+        self.host.show()
         for path in paths:
             with self.subTest(path=path.name):
                 sheet = next(s for s in w.workspace.sheets.values() if s.source_path == path)
@@ -148,16 +137,18 @@ class AutomaticImportTests(unittest.TestCase):
                 self.assertEqual(session.base_cube.x_detection_source, 'header label')
                 self.assertEqual(session.base_cube.x_detection_note,
                                  "Detected from x-axis header 'Photon energy(eV)'.")
-                page = w.open_workbook(w._sheet_owner(sheet.sheet_id).workbook_id,
-                                       sheet.sheet_id).tabs.currentWidget()
+                book = w.open_workbook(w._sheet_owner(sheet.sheet_id).workbook_id, sheet.sheet_id)
+                page = book.current_sheet
                 set_sheet_mapping(w.workspace, sheet.sheet_id, 0, [1])
                 page.refresh()
-                page.table.setFocus()
-                QTest.keyClick(page.table, Qt.Key_A, Qt.ControlModifier)
-                APP.processEvents()
+                quick.pump()
+                scene = w.graph_documents.content_item(('workbook', book.workbook_id, ''))
+                quick.item(scene, 'sheetCells').forceActiveFocus()
+                QTest.keyClick(self.host.window, Qt.Key_A, Qt.ControlModifier)
+                quick.pump()
                 self.assertEqual(sheet.y_columns, list(range(1, 302)))
-                self.assertTrue(w.workbook_commands.heatmap_action.isEnabled())
-                w.workbook_commands.heatmap_action.trigger()
+                self.assertTrue(w.workbook_commands.heatmapReady)
+                quick.click_item(w, 'workbookHeatmap')
                 self.assertEqual(session.active_graph.gate_indices, list(range(301)))
                 cube = graph_cube(session)
                 np.testing.assert_allclose(cube.gate, gates[::-1])
@@ -171,30 +162,35 @@ class AutomaticImportTests(unittest.TestCase):
     def test_optional_shared_action_reviews_type_mapping_and_cancel_without_publication(self):
         w = self.window
         path = self.file('matrix.csv', 'Energy(eV),2,-1\n1,20,10\n2,40,30\n')
-        action = next((a for a in w._file_menu.actions() if a.text() == 'Import with options…'), None)
+        action = w._graph_command_actions['import_options']
         self.assertIsNotNone(action)
-        self.assertIn(action, w.project_actions_menu.actions())
+        project_action = next(a for a in w.app_bridge.project.actions if a.key == 'import_options')
+        self.assertIs(project_action._action, action)
+        self.host.show()
+        quick.pump()
         seen = []
         def review(dialog):
             self.assertFalse(w._background_jobs.busy)
             self.assertEqual(dialog.mappings, [(0, [1, 2])])
-            self.assertIn('comparison', dialog.type_reason.text().lower())
-            dialog.type_combo.setCurrentIndex(dialog.type_combo.findData('xy'))
+            self.assertIn('comparison', dialog.bridge.typeReason.lower())
+            dialog.bridge.setKind('xy')
             self.assertEqual(dialog.mappings, [(0, [1, 2])])
             dialog.mappings = [(2, [0])]
             seen.append(True)
-            return QDialog.Accepted
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileNames', return_value=([str(path)], '')), \
+            return XYImportDialog.Accepted
+        with patch('spectra_app.main_window.FilePicker.getOpenFileNames', return_value=([str(path)], '')), \
                 patch.object(XYImportDialog, 'exec', review):
-            action.trigger()
+            quick.click_item(w, 'projectActions')
+            self.assertEqual(quick.item(w, 'projectCommand_import_options').property('text'), action.text())
+            quick.click_item(w, 'projectCommand_import_options')
             wait_jobs(w)
         sheet = next(iter(w.workspace.sheets.values()))
         self.assertEqual((sheet.kind, sheet.x_column, sheet.y_columns), ('xy', 2, [0]))
         self.assertEqual(seen, [True])
         other = self.file('cancel.csv')
         before = (list(w.workspace.sheets), list(w.workspace.workbooks), w.graph_documents.keys())
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileNames', return_value=([str(other)], '')), \
-                patch.object(XYImportDialog, 'exec', return_value=QDialog.Rejected):
+        with patch('spectra_app.main_window.FilePicker.getOpenFileNames', return_value=([str(other)], '')), \
+                patch.object(XYImportDialog, 'exec', return_value=XYImportDialog.Rejected):
             action.trigger()
             wait_jobs(w)
         self.assertEqual((list(w.workspace.sheets), list(w.workspace.workbooks), w.graph_documents.keys()), before)
@@ -205,17 +201,17 @@ class AutomaticImportTests(unittest.TestCase):
         target = create_comparison(w.workspace, 'Target')
         page = w.open_xy_comparison(target.comparison_id)
         def review(dialog):
-            self.assertEqual(dialog.comparison_combo.currentData(), target.comparison_id)
+            self.assertEqual(dialog.comparison_id, target.comparison_id)
             self.assertEqual(dialog.mappings, [(0, [1, 2])])
             dialog.mappings = [(0, [2])]
             dialog.compare = True
-            return QDialog.Accepted
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileNames', return_value=([str(path)], '')), \
+            return XYImportDialog.Accepted
+        with patch('spectra_app.main_window.FilePicker.getOpenFileNames', return_value=([str(path)], '')), \
                 patch.object(XYImportDialog, 'exec', review):
             page.importDataRequested.emit()
             wait_jobs(w)
         self.assertEqual([c.y_column for c in target.curves.values()], [2])
-        self.assertEqual(w.graph_documents._active_key, ('xy', target.comparison_id, ''))
+        self.assertEqual(w.graph_documents.registry.active_key, ('xy', target.comparison_id, ''))
 
     def test_automatic_reimport_preserves_custom_mapping_identity_and_owner(self):
         path = self.file()
@@ -245,9 +241,9 @@ class AutomaticImportTests(unittest.TestCase):
             w._import_data_files([good, bad])
             wait_jobs(w)
         self.assertEqual(len(w.workspace.sheets), 1)
-        self.assertIn('1', w.statusBar().currentMessage())
-        self.assertIn('failed', w.statusBar().currentMessage().lower())
-        self.assertIn(str(bad), w.dat_import_status_label.text())
+        self.assertIn('1', w.statusText)
+        self.assertIn('failed', w.statusText.lower())
+        self.assertIn(str(bad), w.source_navigation.importStatus)
         self.assertIn(str(bad), self.errors[-1])
 
     def test_stale_workspace_close_and_cancel_delivery_do_not_publish(self):

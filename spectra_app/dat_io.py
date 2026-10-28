@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 import re
 from typing import Iterable
@@ -39,6 +40,12 @@ _AXIS_LABELS = {
 _SEP_RE = re.compile(r"[\t, ]+")
 _HEADER_SEP_RE = re.compile(r"[\t,]+")
 _TOKEN_SEP_RE = re.compile(r"[^a-z0-9]+")
+_GATE_CONDITION_RE = re.compile(
+    r"(?P<first_coefficient>\d+(?:\.\d+)?|\.\d+)?(?P<first>TG|BG)"
+    r"(?:\s*(?P<operator>[+-])\s*(?P<second_coefficient>\d+(?:\.\d+)?|\.\d+)?"
+    r"(?P<second>TG|BG))?"
+    r"\s*=\s*(?P<value>[+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*V?", re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -348,6 +355,48 @@ def load_dat_cube(path: str | Path, *, x_axis_override: str | None = None) -> Da
     return _cube_from_dat_layout(p, _read_dat_layout(p), x_axis_override=x_axis_override)
 
 
+def _filename_gate_label(path: Path) -> str | None:
+    """Apply the filename gate-condition convention only for one distinct constraint."""
+    def gate_term(coefficient: Decimal, name: str) -> str:
+        if coefficient == 1:
+            return name
+        text = format(coefficient, 'f')
+        return (text.rstrip('0').rstrip('.') if '.' in text else text) + name
+
+    conditions: dict[tuple[str, Decimal, Decimal, Decimal], str] = {}
+    for token in re.split(r"[$~_]+", path.stem.replace("\u2212", "-")):
+        if not re.search(r"(?:TG|BG)\b", token, re.IGNORECASE):
+            continue
+        match = _GATE_CONDITION_RE.fullmatch(token.strip())
+        if match is None:
+            return None
+        first = match['first'].upper()
+        second = match['second'].upper() if match['second'] else None
+        first_coefficient = Decimal(match['first_coefficient'] or '1')
+        second_coefficient = Decimal(match['second_coefficient'] or '1')
+        if first_coefficient <= 0 or second_coefficient <= 0:
+            return None
+        value = Decimal(match['value'])
+        if second is None:
+            key = first, first_coefficient, Decimal(0), value
+            label = "Bg (V)" if first == "TG" else "Tg (V)"
+        elif first == second:
+            return None
+        else:
+            tg_coefficient, bg_coefficient = (
+                (first_coefficient, second_coefficient) if first == 'TG'
+                else (second_coefficient, first_coefficient)
+            )
+            difference = match['operator'] == '-'
+            if difference and first == 'BG':
+                value = value.copy_negate()
+            key = 'difference' if difference else 'sum', tg_coefficient, bg_coefficient, value
+            operator = '+' if difference else '\u2212'
+            label = f"{gate_term(tg_coefficient, 'Tg')}{operator}{gate_term(bg_coefficient, 'Bg')} (V)"
+        conditions[key] = label
+    return next(iter(conditions.values())) if len(conditions) == 1 else None
+
+
 def _cube_from_dat_layout(path: str | Path, layout, *, x_axis_override: str | None = None) -> DataCube:
     """Interpret one operation's raw layout after the effective override is known."""
     p = Path(path)
@@ -371,6 +420,10 @@ def _cube_from_dat_layout(path: str | Path, layout, *, x_axis_override: str | No
         raise ValueError(f"X-axis contains invalid values in {p.name}")
     if not np.all(np.isfinite(gate)):
         raise ValueError(f"Gate axis contains invalid values in {p.name}")
+
+    # Filename conditions name the sweep; stored Gate coordinates stay unchanged.
+    if gate_label == "Gate":
+        gate_label = _filename_gate_label(p) or gate_label
 
     x_info = interpret_x_axis(
         x_original,

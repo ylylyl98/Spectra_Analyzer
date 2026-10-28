@@ -3,37 +3,33 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import threading
 import time
-import unittest
 from unittest.mock import patch
 import numpy as np
-from PySide6.QtCore import QThread, QTimer
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QThread, QTimer
 
 from spectra_app import background_jobs
-from spectra_app.main_window import MainWindow
-from tests.settings_helpers import isolate_settings
-
-
-APP = QApplication.instance() or QApplication([])
+from tests import dat_properties_quick_helpers as dp
+from tests import analysis_quick_helpers as aq
+from tests.quick_migration_case import QuickMigrationCase
 
 
 def wait_until(predicate, timeout=5):
     deadline = time.monotonic() + timeout
     while not predicate() and time.monotonic() < deadline:
-        APP.processEvents()
+        QCoreApplication.processEvents()
         time.sleep(0.005)
     assert predicate(), "Background job did not finish"
 
 
-class BackgroundJobsTests(unittest.TestCase):
+class BackgroundJobsTests(QuickMigrationCase):
     def test_work_is_off_thread_but_result_and_progress_are_on_gui_thread(self):
         jobs = background_jobs.BackgroundJobs()
         seen = []
         def work(context):
             context.report("Working")
-            return QThread.currentThread() == APP.thread()
-        jobs.start(work, lambda value: seen.append((value, QThread.currentThread() == APP.thread())),
-                   on_progress=lambda value: seen.append((value, QThread.currentThread() == APP.thread())))
+            return QThread.currentThread() == QCoreApplication.instance().thread()
+        jobs.start(work, lambda value: seen.append((value, QThread.currentThread() == QCoreApplication.instance().thread())),
+                   on_progress=lambda value: seen.append((value, QThread.currentThread() == QCoreApplication.instance().thread())))
         wait_until(lambda: not jobs.busy)
         self.assertEqual(seen, [("Working", True), (False, True)])
 
@@ -70,12 +66,12 @@ class BackgroundJobsTests(unittest.TestCase):
         self.assertEqual(seen, ["timer"])
 
 
-class BackgroundIOTests(unittest.TestCase):
+class BackgroundIOTests(QuickMigrationCase):
     def setUp(self):
-        self.directory = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
+        super().setUp()
+        self.directory = self.folder
+        self.window = self.controller
+        self.errors = self.quick_errors
         self.path = self.directory / "sample.dat"
         self.path.write_text("Energy(eV) 0 1\n1.0 1 2\n1.1 2 3\n1.2 3 4\n", encoding="utf-8")
 
@@ -83,14 +79,13 @@ class BackgroundIOTests(unittest.TestCase):
         if hasattr(self.window, "_background_jobs"):
             self.window._background_jobs.cancel()
             wait_until(lambda: not self.window._background_jobs.busy)
-        self.window.close()
 
     def test_async_load_keeps_timer_running_and_matches_direct_data(self):
         self.assertTrue(hasattr(self.window, "_load_dat_file_async"))
         original = background_jobs.load_dat_cube
         threads = []
         def slow_load(*args, **kwargs):
-            threads.append(QThread.currentThread() == APP.thread())
+            threads.append(QThread.currentThread() == QCoreApplication.instance().thread())
             time.sleep(0.05)
             return original(*args, **kwargs)
         ticks = []
@@ -113,22 +108,22 @@ class BackgroundIOTests(unittest.TestCase):
             started.set()
             release.wait(2)
             return "result"
-        self.window.show()
+        self.host.show()
         self.window._start_background_job(work, seen.append, "Working")
         self.assertTrue(started.wait(1))
         self.window._start_background_job(lambda context: seen.append('pending executed'),
                                           seen.append, "Replacement")
-        self.assertFalse(self.window.close())
-        self.assertTrue(self.window.isVisible())
-        release.set()
-        wait_until(lambda: not self.window.isVisible())
+        with patch.object(self.window, '_confirm_project_discard_async', lambda callback: callback()):
+            self.assertFalse(self.host.window.close())
+            self.assertTrue(self.host.window.isVisible())
+            release.set()
+            wait_until(lambda: not self.host.window.isVisible())
         self.assertFalse(seen)
 
     def test_axis_override_is_background_and_preserves_selected_gate(self):
         self.window._load_dat_file_direct(self.path)
         self.window.current_gate = 1.0
-        self.window.x_axis_override_combo.setCurrentIndex(
-            self.window.x_axis_override_combo.findData("pixel"))
+        dp.set_choice(self.window, 'axis_override', "pixel")
         wait_until(lambda: not self.window._background_jobs.busy)
         self.assertEqual(self.window.current_cube.x_override, "pixel")
         self.assertEqual(self.window.current_gate, 1.0)
@@ -156,11 +151,11 @@ class BackgroundIOTests(unittest.TestCase):
         nested = self.directory / "nested"
         nested.mkdir()
         (nested / "second.dat").write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8")
-        with patch("spectra_app.main_window.QFileDialog.getExistingDirectory", return_value=str(self.directory)):
+        with patch("spectra_app.main_window.FilePicker.getExistingDirectory", return_value=str(self.directory)):
             self.window._on_browse_root()
         wait_until(lambda: not self.window._background_jobs.busy)
-        self.assertEqual(self.window.folder_combo.count(), 2)
-        self.assertEqual(self.window.file_list.item(0).text(), "sample.dat")
+        self.assertEqual(len(self.window.source_navigation.folderRows), 2)
+        self.assertEqual(self.window.source_navigation.fileRows[0]['name'], "sample.dat")
 
     def test_changed_source_during_load_reports_error_without_replacing_cube(self):
         self.window._load_dat_file_direct(self.path)
@@ -178,9 +173,9 @@ class BackgroundIOTests(unittest.TestCase):
 
     def test_async_load_recalls_regional_recipe_and_fixed_count(self):
         self.window._load_dat_file_direct(self.path)
-        self.window.color_scale_combo.setCurrentIndex(self.window.color_scale_combo.findData("3"))
-        self.window.region_boundary_spins[0].setValue(1.05)
-        self.window.region_boundary_spins[1].setValue(1.15)
+        dp.set_choice(self.window, 'color_scale', "3")
+        dp.setup_number(self.window, 'edge0', 1.05)
+        dp.setup_number(self.window, 'edge1', 1.15)
         self.window._save_current_plot_state()
         self.window._load_dat_file_async(self.path)
         wait_until(lambda: not self.window._background_jobs.busy)
@@ -207,16 +202,15 @@ class BackgroundIOTests(unittest.TestCase):
             release.wait(2)
             return original(*args, **kwargs)
         with patch.object(background_jobs, "load_dat_cube", blocked):
-            self.window.x_axis_override_combo.setCurrentIndex(
-                self.window.x_axis_override_combo.findData("pixel"))
+            dp.set_choice(self.window, 'axis_override', "pixel")
             self.assertTrue(started.wait(1))
             self.window._cancel_background_job()
-            self.assertIn("Cancelling", self.window.statusBar().currentMessage())
-            self.assertEqual(self.window.x_axis_override_combo.currentData(), old_cube.x_override)
+            self.assertIn("Cancelling", self.window.statusText)
+            self.assertEqual(self.window.dat_properties._axis_override, old_cube.x_override)
             release.set()
             wait_until(lambda: not self.window._background_jobs.busy)
         self.assertIs(self.window.current_cube, old_cube)
-        self.assertEqual(self.window.statusBar().currentMessage(), "Operation cancelled.")
+        self.assertEqual(self.window.statusText, "Operation cancelled.")
 
     def test_edits_during_import_are_saved_before_switching_to_new_source(self):
         self.path.write_text("Energy(eV) 0 1\n" + "\n".join(
@@ -224,9 +218,8 @@ class BackgroundIOTests(unittest.TestCase):
         other = self.directory / "other.dat"
         other.write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8")
         self.window._load_dat_file_direct(self.path)
-        self.window.fix_annotations_chk.setChecked(False)
-        self.window.processing_mode_combo.setCurrentIndex(
-            self.window.processing_mode_combo.findData("energy_second_derivative"))
+        dp.set_flag(self.window, 'fix_annotations', False)
+        self.window.processing.setMode("energy_second_derivative")
         self.window._on_generate_heatmap()
         wait_until(lambda: not self.window._background_jobs.busy)
         outgoing = self.window.current_cube
@@ -240,12 +233,12 @@ class BackgroundIOTests(unittest.TestCase):
             self.window._import_data_files([other])
             self.assertTrue(started.wait(1))
             self.assertTrue(self.window._dat_import_pending)
-            self.assertFalse(self.window.generate_heatmap_btn.isEnabled())
+            self.assertFalse(self.window.processing.applyEnabled)
             # Production import pauses processing; even a queued command cannot
             # supersede the import and lose the source being prepared.
             self.window._on_generate_heatmap()
             self.assertIs(self.window.current_cube, outgoing)
-            self.window.plot_title_edit.setText("Edited while loading")
+            self.window.dat_properties.setLabel('plot_title', "Edited while loading", self.window.dat_properties.ownerToken)
             self.window._heat_ax.set_xlim(1.15, 1.95)
             release.set()
             wait_until(lambda: not self.window._background_jobs.busy)
@@ -256,13 +249,13 @@ class BackgroundIOTests(unittest.TestCase):
         self.window.activate_dataset(imported.dataset_id)
         self.assertEqual(self.window.current_dat_path, other)
         self.window._load_dat_file_direct(self.path)
-        self.assertEqual(self.window.plot_title_edit.text(), "Edited while loading")
+        self.assertEqual(dp.state(self.window)['plot_title'], "Edited while loading")
         self.assertEqual(self.window._processing_mode, "energy_second_derivative")
         self.assertEqual(self.window._heat_ax.get_xlim(), (1.15, 1.95))
 
     def test_same_file_reload_keeps_edits_made_after_recipe_was_read(self):
         self.window._load_dat_file_direct(self.path)
-        self.window.plot_title_edit.setText("Before loading")
+        self.window.dat_properties.setLabel('plot_title', "Before loading", self.window.dat_properties.ownerToken)
         original = background_jobs.load_dat_cube
         started, release = threading.Event(), threading.Event()
         def blocked(*args, **kwargs):
@@ -272,10 +265,10 @@ class BackgroundIOTests(unittest.TestCase):
         with patch.object(background_jobs, "load_dat_cube", blocked):
             self.window._load_dat_file_async(self.path)
             self.assertTrue(started.wait(1))
-            self.window.plot_title_edit.setText("Latest title")
+            self.window.dat_properties.setLabel('plot_title', "Latest title", self.window.dat_properties.ownerToken)
             release.set()
             wait_until(lambda: not self.window._background_jobs.busy)
-        self.assertEqual(self.window.plot_title_edit.text(), "Latest title")
+        self.assertEqual(dp.state(self.window)['plot_title'], "Latest title")
         self.assertEqual(self.window._heat_ax.get_title(), "Latest title")
 
     def _seed_workbench(self, scale=1.):
@@ -290,7 +283,7 @@ class BackgroundIOTests(unittest.TestCase):
         self.window._open_analysis(('heatmap', (session.dataset_id, session.active_graph_id)))
         doc = self.window._workbench_document()
         gate = self.window._current_gate_index()
-        self.window.workbench_model.setCurrentText('Gaussian')
+        aq.set_choice(self.window, 'model', 'Gaussian')
         doc.set_seeds(gate, [AnalysisSeed(1.35, kind='peak', manual=True)])
         self.window._workbench_refresh()
         return doc, gate
@@ -332,7 +325,7 @@ class BackgroundIOTests(unittest.TestCase):
                     self.window._open_analysis(('heatmap', (session.dataset_id, session.active_graph_id)))
                     doc = self.window._workbench_document()
                     gate = self.window._current_gate_index()
-                    self.window.workbench_model.setCurrentText('Gaussian')
+                    aq.set_choice(self.window, 'model', 'Gaussian')
                     # This shoulder lies at the median signal height, so its
                     # local height alone is an unusably small amplitude seed.
                     doc.set_seeds(gate, [AnalysisSeed(1.75, kind=kind, manual=True)])

@@ -1,4 +1,4 @@
-"""Display-only legend names; retained curve labels remain full provenance."""
+"""Display-only curve names; retained curve labels remain full provenance."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -16,6 +16,15 @@ def comparison_legend_labels(workspace, curves):
     Only exact generated names are recognized. The unsuffixed form also matches
     defaults created before another file with the same basename was imported.
     """
+    return _comparison_labels(workspace, curves, quantity_first=False)
+
+
+def comparison_curve_list_labels(workspace, curves):
+    """Keep quantity and source identity visible before a narrow row elides."""
+    return _comparison_labels(workspace, curves, quantity_first=True)
+
+
+def _comparison_labels(workspace, curves, *, quantity_first):
     owners = {sheet_id: book for book in workspace.workbooks.values() for sheet_id in book.sheet_ids}
     sheets = {curve.sheet_id: workspace.sheets[curve.sheet_id] for curve in curves}
     columns = {identity: sheet_columns(workspace, sheet) for identity, sheet in sheets.items()}
@@ -32,6 +41,9 @@ def comparison_legend_labels(workspace, curves):
         sources[identity] = source
         source_names[source] = _short_source(name)
         source_sheets[source].add(identity)
+
+    list_source_names = dict(source_names)
+    source_numbers = {source: index for index, source in enumerate(sorted(source_names), 1)}
 
     # Reserve literal names before generating qualifiers, including names that
     # already look qualified. Compare after shortening and without case.
@@ -87,9 +99,20 @@ def comparison_legend_labels(workspace, curves):
                     x_label += f' [col {curve.x_column + 1}]'
                 label += f' vs {x_label}'
             source = sources[curve.sheet_id]
-            if different_contexts or len(source_sheets[source]) > 1:
-                label = f'{contexts[curve.sheet_id]}: {label}'
-            if len(source_names) > 1:
-                label = f'{source_names[source]}: {label}'
+            show_context = different_contexts or len(source_sheets[source]) > 1
+            if quantity_first:
+                qualifiers = []
+                if len(source_names) > 1:
+                    qualifiers.append(f'[{source_numbers[source]}]')
+                if show_context:
+                    qualifiers.append(contexts[curve.sheet_id])
+                if len(source_names) > 1:
+                    qualifiers.append(list_source_names[source])
+                label = ' · '.join([label, *qualifiers])
+            else:
+                if show_context:
+                    label = f'{contexts[curve.sheet_id]}: {label}'
+                if len(source_names) > 1:
+                    label = f'{source_names[source]}: {label}'
         result[curve.curve_id] = label, automatic
     return result

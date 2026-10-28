@@ -3,30 +3,40 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import unittest
 from unittest.mock import patch
 import numpy as np
-from PySide6.QtCore import Qt, QPoint, QTimer, QEvent, QItemSelection, QItemSelectionModel
-from PySide6.QtWidgets import QApplication, QDialog, QMenu
-from PySide6.QtTest import QTest
-from PySide6.QtGui import QContextMenuEvent
-from spectra_app.main_window import MainWindow
-from tests.settings_helpers import isolate_settings
+from PySide6.QtCore import Qt, QItemSelection, QItemSelectionModel
+from PySide6.QtGui import QGuiApplication
+from spectra_app.xy_import_dialog import XYImportDialog
+from tests.quick_migration_case import QuickMigrationCase
+from tests import formal_quick_helpers as quick
 from tests.background_helpers import wait_jobs
 
-APP = QApplication.instance() or QApplication([])
+from tests.xy_helpers import set_xy_draft, xy_value
+from tests.workbook_quick_helpers import (click_header, context_action, focus_table,
+    item, selection_ranges, table_key)
+
+def set_inactive_xy_fixture_draft(page, field, value):
+    # Canonical fixture setup for the original programmatic inactive editor.
+    # Native input remains guarded and never changes the selected document.
+    owner = page.parent()
+    key = ('xy', page.comparison_id, '')
+    assert owner.graph_documents.registry.active_key != key
+    assert owner.workspace.comparisons[page.comparison_id] is page.comparison
+    bridge = page.inspector_bridge
+    if value == bridge.canonical_values()[field]:
+        bridge._drafts.pop(field, None)
+    else:
+        bridge._drafts[field] = value
+    bridge.changed.emit()
+    page._draft_changed()
+    assert bridge.values_map()[field] == value
 
 
-class ImportCompareTests(unittest.TestCase):
+class ImportCompareTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
-        self.addCleanup(self.dispose)
-
-    def dispose(self):
-        self.window.close()
-        self.window.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+        super().setUp()
+        self.window = self.controller
+        self.errors = self.quick_errors
+        self.addCleanup(lambda: self.assertFalse(self.errors))
 
     def files(self, texts):
         paths = []
@@ -42,29 +52,29 @@ class ImportCompareTests(unittest.TestCase):
         dialog = XYImportDialog(tables, self.window.workspace.workbooks, mappings=mappings, reused=reused)
         # These cases exercise intentional batch grouping; per-file default has
         # its own actual-dialog acceptance test in test_workbook_organization.
-        dialog.destination_combo.setCurrentIndex(dialog.destination_combo.findData(None))
+        dialog.bridge.setDestinationIndex(1)
         self.addCleanup(dialog.deleteLater)
         return dialog
 
     def configure(self, dialog, row, x, ys):
-        dialog.file_list.setCurrentRow(row)
-        dialog.x_combo.setCurrentIndex(x)
-        for index in range(dialog.y_list.count()):
-            dialog.y_list.item(index).setCheckState(Qt.Checked if index in ys else Qt.Unchecked)
+        dialog.bridge.selectSource(row)
+        dialog.bridge.setX(x)
+        for index in range(dialog.tables[row].data.shape[1]):
+            dialog.bridge.setY(index, index in ys)
 
     def commit(self, dialog, compare=True):
         return self.window.import_xy_files([], tables=dialog.tables, mappings=dialog.mappings,
-            compare=compare, workbook_id=dialog.destination_combo.currentData(),
-            workbook_name=dialog.name_edit.text(), grouping='single')
+            compare=compare, workbook_id=dialog.destination,
+            workbook_name=dialog.workbook_name, grouping='single')
 
     def test_ten_matching_files_configure_once_and_plot_original_arrays(self):
         paths = self.files(['time,signal\n2,20\n1,10\n'] * 10)
         dialog = self.dialog(paths)
         self.configure(dialog, 0, 1, [0])
-        dialog.apply_btn.click()
-        self.assertIn('9', dialog.feedback.text())
+        dialog.bridge.applyMatching()
+        self.assertIn('9', dialog.bridge.feedback)
         book = self.commit(dialog)
-        graph = self.window.graph_documents.page_for(self.window.graph_documents._active_key)
+        graph = self.window.graph_documents.document_for(self.window.graph_documents.registry.active_key)
         self.assertEqual(len(book.sheet_ids), 10)
         self.assertEqual(len(graph.axes.lines), 10)
         for line in graph.axes.lines:
@@ -77,29 +87,30 @@ class ImportCompareTests(unittest.TestCase):
         for row, x, ys in ((0, 1, [0, 2]), (1, 0, [1]), (2, 2, [0])):
             self.configure(dialog, row, x, ys)
         book = self.commit(dialog)
-        graph = self.window.graph_documents.page_for(self.window.graph_documents._active_key)
+        graph = self.window.graph_documents.document_for(self.window.graph_documents.registry.active_key)
         for line, x, y in zip(graph.axes.lines, ([2,1], [2,1], [4,8,12], [.5]), ([10,20], [30,40], [50,60,70], [9])):
             np.testing.assert_array_equal(line.get_xdata(), x)
             np.testing.assert_array_equal(line.get_ydata(), y)
         self.assertEqual(len(graph.axes.lines), 4)
         saved = self.window.save_project(self.folder / 'mapped.spectra')
-        self.assertTrue(self.window.open_project(saved))
+        with patch('spectra_app.main_window.prompt_message', side_effect=AssertionError('Clean saved project unexpectedly requested discard')):
+            self.assertTrue(self.window.open_project(saved))
         self.assertEqual([(self.window.workspace.sheets[s].x_column, self.window.workspace.sheets[s].y_columns)
                           for s in book.sheet_ids], [(1,[0,2]), (0,[1]), (2,[0])])
-        graph = self.window.graph_documents.page_for(self.window.graph_documents._active_key)
+        graph = self.window.graph_documents.document_for(self.window.graph_documents.registry.active_key)
         self.assertEqual(len(graph.axes.lines), 4)
 
     def test_mapping_reuse_matches_names_and_skips_ambiguous_and_headerless_mismatch(self):
         paths = self.files(['t,a,b\n1,2,3\n', 'b,t,a\n3,1,2\n', 't,a,a\n1,2,3\n', 't,c,b\n1,2,3\n'])
         dialog = self.dialog(paths)
         self.configure(dialog, 0, 0, [1,2])
-        dialog.apply_btn.click()
+        dialog.bridge.applyMatching()
         self.assertEqual(dialog.mappings, [(0,[1,2]), (1,[2,0]), (0,[1,2]), (0,[1,2])])
-        self.assertIn('skipped', dialog.feedback.text().lower())
+        self.assertIn('skipped', dialog.bridge.feedback.lower())
         paths = self.files(['1,2,3\n', '4,5,6\n', '7,8\n', 'Column 1,Column 2,Column 3\n1,2,3\n'])
         dialog = self.dialog(paths)
         self.configure(dialog, 0, 2, [0])
-        dialog.apply_btn.click()
+        dialog.bridge.applyMatching()
         self.assertEqual(dialog.mappings, [(2,[0]), (2,[0]), (0,[1]), (0,[1,2])])
 
     def test_invalid_batch_and_mapping_are_atomic_and_name_source(self):
@@ -117,15 +128,15 @@ class ImportCompareTests(unittest.TestCase):
         paths = self.files(['x,y\n1,2\n'])
         from spectra_app.xy_import_dialog import XYImportDialog
         self.window._refresh_project_modified()
-        dirty = self.window.isWindowModified()
+        dirty = self.window.projectModified
         def cancel(dialog):
             dialog.reject()
-            return QDialog.Rejected
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileNames', return_value=(paths, '')), patch.object(XYImportDialog, 'exec', cancel):
+            return XYImportDialog.Rejected
+        with patch('spectra_app.main_window.FilePicker.getOpenFileNames', return_value=(paths, '')), patch.object(XYImportDialog, 'exec', cancel):
             self.window._on_import_xy()
             wait_jobs(self.window)
         self.window._refresh_project_modified()
-        self.assertEqual(self.window.isWindowModified(), dirty)
+        self.assertEqual(self.window.projectModified, dirty)
         self.assertFalse(self.window.workspace.sheets)
         self.assertFalse(self.window.graph_documents.keys())
 
@@ -136,7 +147,7 @@ class ImportCompareTests(unittest.TestCase):
         dialog = self.dialog(paths)
         self.assertEqual(dialog.tables[0].column_names, ['x','y'])
         np.testing.assert_array_equal(dialog.tables[0].data, [[1,2]])
-        self.assertIn('retained', dialog.preview_info.text().lower())
+        self.assertIn('retained', dialog.bridge.previewInfo.lower())
         with self.assertRaises(ValueError):
             self.window.import_xy_files(paths, mappings=[(0,[2])], compare=True)
         self.assertEqual(len(self.window.workspace.workbooks), 1)
@@ -146,88 +157,84 @@ class ImportCompareTests(unittest.TestCase):
     def test_header_events_mapping_and_cell_copy_do_not_reset_selection(self):
         book = self.window.import_xy_files(self.files(['x,a,b,c\n1,2,3,4\n2,5,6,7\n']))
         page = self.window.open_workbook(book.workbook_id).sheet_pages[book.sheet_ids[0]]
-        self.window.show()
-        self.window.graph_documents.tabbed_view()
-        APP.processEvents()
-        header = page.table.horizontalHeader()
+        self.host.show()
+        self.window.graph_documents.setMode('tabbed')
+        quick.pump()
         def click(column, modifiers=Qt.NoModifier):
-            QTest.mouseClick(header.viewport(), Qt.LeftButton, modifiers, QPoint(header.sectionViewportPosition(column)+20, 10))
+            click_header(page, column, modifiers)
         click(1)
         click(3, Qt.ControlModifier)
         self.assertEqual(self.window.workspace.sheets[page.sheet_id].y_columns, [1,3])
-        self.assertEqual([i.column() for i in page.table.selectionModel().selectedColumns()], [1,3])
+        self.assertEqual([i.column() for i in page.selection_model.selectedColumns()], [1,3])
         click(1)
         click(3, Qt.ShiftModifier)
         self.assertEqual(self.window.workspace.sheets[page.sheet_id].y_columns, [1,2,3])
         selection = QItemSelection(page.model.index(0,0), page.model.index(0,2))
-        page.table.selectionModel().select(selection, QItemSelectionModel.ClearAndSelect)
+        page.selection_model.select(selection, QItemSelectionModel.ClearAndSelect)
         page.copy_selection()
-        self.assertEqual(APP.clipboard().text(), '1\t2\t3')
+        self.assertEqual(QGuiApplication.clipboard().text(), '1\t2\t3')
         self.assertEqual(self.window.workspace.sheets[page.sheet_id].y_columns, [1,2,3])
         self.assertIn('A(X)', page.model.headerData(0, Qt.Horizontal))
         self.assertIn('B(Y)', page.model.headerData(1, Qt.Horizontal))
-        page.table.setCurrentIndex(page.model.index(0,2))
-        page.table.setFocus()
-        QTest.keyClick(page.table, Qt.Key_Space, Qt.ControlModifier)
+        page.setCurrentCell(0, 2)
+        table_key(page, Qt.Key_Space, Qt.ControlModifier)
         self.assertEqual(self.window.workspace.sheets[page.sheet_id].y_columns, [2])
-        point = QPoint(header.sectionViewportPosition(2)+20, 10)
-        def choose_x():
-            menu = APP.activePopupWidget()
-            self.assertIsInstance(menu, QMenu)
-            QTest.mouseClick(menu, Qt.LeftButton, Qt.NoModifier, menu.actionGeometry(menu.actions()[0]).center())
-        QTimer.singleShot(0, choose_x)
-        APP.sendEvent(header.viewport(), QContextMenuEvent(QContextMenuEvent.Mouse, point, header.viewport().mapToGlobal(point)))
+        context_action(page, 2, 'SetX')
         self.assertEqual(self.window.workspace.sheets[page.sheet_id].x_column, 2)
         self.assertEqual(self.window.workspace.sheets[page.sheet_id].y_columns, [])
-        self.assertFalse(page.new_comparison_btn.isEnabled())
+        self.assertFalse(page.plotEnabled)
         self.assertIn('C(X)', page.model.headerData(2, Qt.Horizontal))
 
     def test_add_preserves_workbook_selection_focus_and_closed_target(self):
         book = self.window.import_xy_files(self.files(['x,y,z\n' + '\n'.join(f'{i},{i*2},{i*3}' for i in range(150))]), mappings=[(0, [1])])
         workbook = self.window.open_workbook(book.workbook_id)
         page = workbook.sheet_pages[book.sheet_ids[0]]
-        page.new_comparison_btn.click()
+        page.request_plot('line')
         comparison = next(iter(self.window.workspace.comparisons.values()))
         graph = self.window.open_xy_comparison(comparison.comparison_id)
         self.window.open_workbook(book.workbook_id)
-        self.window.show()
-        self.window.graph_documents.tabbed_view()
-        APP.processEvents()
-        page.table.selectColumn(1)
-        page.table.verticalScrollBar().setValue(50)
-        page.table.setFocus()
-        APP.processEvents()
-        graph.name_edit.setText('Pending name')
-        graph.color_edit.setText('#123456')
-        before = [(i.row(),i.column()) for i in page.table.selectionModel().selectedIndexes()]
-        scroll = page.table.verticalScrollBar().value()
+        self.host.show()
+        self.window.graph_documents.setMode('tabbed')
+        quick.pump()
+        page.selectColumn(1)
+        item(workbook, 'sheetCells').setProperty('contentY', 50)
+        focus_table(page)
+        set_inactive_xy_fixture_draft(graph, 'name', 'Pending name')
+        set_inactive_xy_fixture_draft(graph, 'color', '#123456')
+        before = selection_ranges(page)
+        scroll = page.scroll_y
         # This focus/closed-target case deliberately creates duplicate copies.
         # Default additions now skip them; exercise the explicit repeat choice.
-        self.window.workbook_commands.add_again_action.trigger()
-        self.assertEqual(self.window.graph_documents._active_key, ('workbook',book.workbook_id,''))
-        self.assertIs(APP.focusWidget(), page.table)
-        self.assertEqual(page.table.verticalScrollBar().value(), scroll)
-        self.assertEqual([(i.row(),i.column()) for i in page.table.selectionModel().selectedIndexes()], before)
+        self.window.workbook_commands.repeat()
+        self.assertEqual(self.window.graph_documents.registry.active_key, ('workbook',book.workbook_id,''))
+        self.assertIs(self.host.window.activeFocusItem(), item(workbook, 'sheetCells'))
+        self.assertTrue(item(workbook, 'sheetCells').hasActiveFocus())
+        self.assertEqual(page.scroll_y, scroll)
+        self.assertEqual(selection_ranges(page), before)
         self.assertEqual(comparison.name, 'Pending name')
         self.assertEqual(next(iter(comparison.curves.values())).color, '#123456')
         self.assertEqual(len(graph.axes.lines), 2)
         self.window.graph_documents.close_document(('xy', comparison.comparison_id, ''))
-        self.window.workbook_commands.add_again_action.trigger()
-        self.assertIsNone(self.window.graph_documents.window_for(('xy', comparison.comparison_id, '')))
+        self.window.workbook_commands.repeat()
+        self.assertNotIn(('xy', comparison.comparison_id, ''), self.window.graph_documents.registry.open_keys())
+        self.assertIsNone(self.window.graph_documents.content_item(('xy', comparison.comparison_id, '')))
         self.assertEqual(len(comparison.curves), 3)
         self.assertFalse(self.errors)
 
     def test_invalid_pending_target_editor_blocks_append_before_mutation(self):
         book = self.window.import_xy_files(self.files(['x,y\n1,2\n']))
         page = self.window.open_workbook(book.workbook_id).sheet_pages[book.sheet_ids[0]]
-        page.new_comparison_btn.click()
+        page.request_plot('line')
         comparison = next(iter(self.window.workspace.comparisons.values()))
         graph = self.window.open_xy_comparison(comparison.comparison_id)
         self.window.open_workbook(book.workbook_id)
-        graph.color_edit.setText('invalid')
-        page.add_comparison_btn.click()
+        set_inactive_xy_fixture_draft(graph, 'color', 'invalid')
+        self.window.workbook_commands.append()
         self.assertEqual(len(comparison.curves), 1)
-        self.assertEqual(graph.color_edit.text(), 'invalid')
+        self.assertEqual(xy_value(graph, 'color'), 'invalid')
         self.assertTrue(self.errors)
-        self.assertEqual(self.window.graph_documents._active_key, ('workbook', book.workbook_id, ''))
-        graph.color_edit.setText('#123456')
+        self.assertEqual(len(self.errors), 1)
+        self.assertIn('color', self.errors[0].lower())
+        self.errors.clear()
+        self.assertEqual(self.window.graph_documents.registry.active_key, ('workbook', book.workbook_id, ''))
+        set_inactive_xy_fixture_draft(graph, 'color', '#123456')

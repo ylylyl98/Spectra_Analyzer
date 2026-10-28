@@ -1,24 +1,26 @@
+from tests import ordinary_analysis_quick_helpers as oa
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from dataclasses import replace
 import threading
 import time
-import unittest
 from unittest.mock import patch
 import numpy as np
 from PySide6.QtCore import QTimer
 from PySide6.QtTest import QTest
-from tests.settings_helpers import isolate_settings
-from tests.test_workflow import _window, _fit_result
+from tests import dat_properties_quick_helpers as dp
+from tests import test_workflow as workflow
+from tests.scientific_fixtures import workflow_fit_result as _fit_result
+from tests.quick_migration_case import QuickMigrationCase
 
 
 from tests.background_helpers import wait_jobs
 
 
-class BackgroundAnalysisTests(unittest.TestCase):
+class BackgroundAnalysisTests(QuickMigrationCase):
     def setUp(self):
-        isolate_settings(self)
-        self.window = _window(np.ones((3, 101)))
+        super().setUp()
+        self.window = workflow.WorkflowTests.make_window(self, np.ones((3, 101)))
         w = self.window
         w.peak_indices = np.array([50])
         w._peak_gate_idx = 0
@@ -28,7 +30,6 @@ class BackgroundAnalysisTests(unittest.TestCase):
     def tearDown(self):
         self.release.set()
         wait_jobs(self.window)
-        self.window.close()
 
     def test_single_fit_runs_off_thread_and_keeps_navigation(self):
         w = self.window
@@ -140,6 +141,7 @@ class BackgroundAnalysisTests(unittest.TestCase):
         w = self.window
         threads = []
         progress = []
+        w.statusChanged.connect(progress.append)
         def detect(*args, **kwargs):
             threads.append(threading.get_ident())
             if len(threads) == 1:
@@ -147,7 +149,7 @@ class BackgroundAnalysisTests(unittest.TestCase):
             if len(threads) == 2:
                 return np.array([], dtype=int), np.array([], dtype=bool)
             return np.array([20]), np.array([False])
-        with patch('spectra_app.main_window.find_peak_indices', side_effect=detect), patch.object(w.statusBar(), 'showMessage', side_effect=lambda message: progress.append(message)):
+        with patch('spectra_app.main_window.find_peak_indices', side_effect=detect):
             w._on_batch_find_peaks_all_gates()
             np.testing.assert_array_equal(w.batch_peak_map[0], [50])
             wait_jobs(w)
@@ -198,11 +200,11 @@ class BackgroundAnalysisTests(unittest.TestCase):
             started.set()
             self.release.wait(5)
             return _fit_result(10)
-        original_maxfev = w.maxfev_spin.value()
+        original_maxfev = oa.value(w, 'maxfev')
         with patch('spectra_app.main_window.fit_multi_peak', side_effect=solver):
             w._on_batch_fit_all_gates()
             self.assertTrue(started.wait(2))
-            w.maxfev_spin.setValue(original_maxfev + 1)
+            oa.set_number(w, 'maxfev', original_maxfev + 1)
             self.release.set()
             wait_jobs(w)
         self.assertEqual(captured, [original_maxfev])
@@ -228,15 +230,15 @@ class BackgroundAnalysisTests(unittest.TestCase):
                     if change == 'clear':
                         w._on_clear_fit()
                     elif change == 'fit_range':
-                        w.fit_xmin_spin.setValue(w.fit_xmin_spin.value()+.1)
+                        oa.set_number(w, 'fit_xmin', oa.value(w, 'fit_xmin')+.1)
                     elif change == 'search_range':
-                        w.xmin_spin.setValue(w.xmin_spin.value()+.1)
+                        dp.setup_number(w, 'xmin', w.dat_properties.number('xmin')+.1)
                     elif change == 'fit_full':
                         w._on_set_fit_full_range()
                     elif change == 'use_view':
                         w._on_use_current_x_range()
                     elif change == 'toolbar_range':
-                        w._heat_ax.set_xlim(w.xmin_spin.value()+.1, w.xmax_spin.value())
+                        w._heat_ax.set_xlim(w.dat_properties.number('xmin')+.1, w.dat_properties.number('xmax'))
                     else:
                         w._on_clear_peaks()
                     self.release.set()
@@ -255,8 +257,8 @@ class BackgroundAnalysisTests(unittest.TestCase):
         w._start_background_job(work, applied.append, 'Folder discovery')
         self.assertTrue(started.wait(1))
         with patch.object(w, '_analysis_job_key', side_effect=AssertionError('unnecessary seed hashing')):
-            w.maxfev_spin.setValue(w.maxfev_spin.value()+1)
-            w.plot_title_edit.setText('new title')
+            oa.set_number(w, 'maxfev', oa.value(w, 'maxfev')+1)
+            w.dat_properties.setLabel('plot_title', 'new title', w.dat_properties.ownerToken)
             w._set_current_gate_from_index(1, update_plot=True)
             w._on_clear_fit()
         self.release.set()
@@ -300,7 +302,7 @@ class BackgroundAnalysisTests(unittest.TestCase):
             self.assertTrue(started.wait(2))
             # An explicitly changed request still supersedes the running fit;
             # repeated clicks with identical inputs are now ignored by the UI.
-            w.lw_min_spin.setValue(12)
+            oa.set_number(w, 'linewidth_min', 12)
             w._on_fit()
             self.release.set()
             wait_jobs(w)

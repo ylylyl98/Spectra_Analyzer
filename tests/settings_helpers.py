@@ -33,10 +33,10 @@ def isolate_settings(test_case, *, project_dialogs=False) -> Path:
     settings_patch.start()
     test_case.addCleanup(settings_patch.stop)
     if not project_dialogs:
-        discard_patch = patch('spectra_app.main_window.MainWindow._confirm_project_discard', new=lambda self: True)
+        discard_patch = patch('spectra_app.main_window.ApplicationController._confirm_project_discard', new=lambda self: True)
         discard_patch.start()
         test_case.addCleanup(discard_patch.stop)
-        async_discard_patch = patch('spectra_app.main_window.MainWindow._confirm_project_discard_async',
+        async_discard_patch = patch('spectra_app.main_window.ApplicationController._confirm_project_discard_async',
             new=lambda self, continuation: continuation())
         async_discard_patch.start()
         test_case.addCleanup(async_discard_patch.stop)

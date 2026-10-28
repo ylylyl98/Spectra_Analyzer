@@ -1,4 +1,6 @@
 """Named graph targets cross the real Qt selector, snapshot and export boundaries."""
+from tests import dat_properties_quick_helpers as dat
+from tests import ordinary_analysis_quick_helpers as oa
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
@@ -10,122 +12,131 @@ from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QListWidget, QTreeWidget
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtQuick import QQuickView
 
 from spectra_app.dataset_state import graph_export_stem
-from spectra_app.main_window import MainWindow
 from spectra_app.plot_dialogs import ApplyFormatDialog, BatchExportDialog
 from spectra_app.plot_presentation import NormSpec, PlotAnnotation
 from spectra_app.plot_templates import capture_format
-from tests.settings_helpers import isolate_settings
-from tests.test_plot_templates import dataset
+from tests import quick_migration_case as migration
+from tests.quick_application_helpers import pump
 
 
-APP = QApplication.instance() or QApplication([])
-
-
-def close_window(window):
-    window.close()
-    window.deleteLater()
-    APP.sendPostedEvents(None, QEvent.DeferredDelete)
-    APP.processEvents()
-
-
-class GraphBatchDialogTests(unittest.TestCase):
+class GraphBatchDialogTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.a, self.b = dataset('a'), dataset('b')
-        self.a.source_path = self.folder / 'left' / 'same.dat'
-        self.b.source_path = self.folder / 'right' / 'same.dat'
-        self.detail = self.a.create_graph('Detail <α & β>')
-        self.a.activate_graph('default')
-        self.other = self.b.create_graph('Second view')
-        self.dialog = BatchExportDialog((self.a, self.b), 'a')
+        super().setUp()
+        self.w = self.controller
+        sessions = []
+        for side in ('left', 'right'):
+            folder = self.folder / side
+            folder.mkdir()
+            source = folder / 'same.dat'
+            source.write_text('Energy(eV) 0 1 2\n' + '\n'.join(
+                f'{1+i/10} {i+1} {2*i+2} {3*i+3}' for i in range(13)), encoding='utf-8')
+            self.w._load_dat_file_direct(source)
+            self.w.open_graph_document()
+            pump()
+            sessions.append(self.w.workspace.active)
+        self.a, self.b = sessions
+        self.w.open_graph_document(self.a.dataset_id)
+        self.detail = self.w.create_graph('Detail <α & β>')
+        self.w.open_graph_document(self.a.dataset_id, 'default')
+        self.w.open_graph_document(self.b.dataset_id)
+        self.other = self.w.create_graph('Second view')
+        self.dialog = BatchExportDialog((self.a, self.b), self.a.dataset_id, self.w)
         self.addCleanup(self.dialog.deleteLater)
+
+    def tearDown(self):
+        self.assertEqual(self.quick_errors, [], 'Unexpected production Quick error')
 
     def test_tree_current_only_default_parent_partial_and_graph_all_clear(self):
         dialog = self.dialog
-        self.assertIsInstance(dialog.targets, QTreeWidget)
-        self.assertEqual(dialog.selected_graph_targets(), [('a', 'default')])
-        a, b = (dialog.targets.topLevelItem(i) for i in range(2))
-        self.assertNotEqual(a.text(0), b.text(0))
-        self.assertIn('left', a.text(0))
-        self.assertIn('right', b.text(0))
-        self.assertEqual(a.toolTip(0), str(self.a.source_path.resolve()))
-        self.assertEqual(a.child(1).text(0), self.detail.name)
-        self.assertEqual(a.checkState(0), Qt.PartiallyChecked)
-        self.assertEqual(b.checkState(0), Qt.Unchecked)
-        a.setCheckState(0, Qt.Checked)
-        self.assertEqual(dialog.selected_graph_targets(), [('a', 'default'), ('a', self.detail.graph_id)])
-        a.child(0).setCheckState(0, Qt.Unchecked)
-        self.assertEqual(a.checkState(0), Qt.PartiallyChecked)
-        dialog.select_all_btn.click()
+        self.assertIsInstance(dialog.window(), QQuickView)
+        self.assertEqual(dialog.selected_graph_targets(), [(self.a.dataset_id, 'default')])
+        a, b = dialog.bridge.groups
+        self.assertNotEqual(a.label, b.label)
+        self.assertIn('left', a.label)
+        self.assertIn('right', b.label)
+        self.assertEqual(a.tooltip, str(self.a.source_path.resolve()))
+        self.assertEqual(a.children[1].label, self.detail.name)
+        self.assertEqual(a.checkState, Qt.PartiallyChecked.value)
+        self.assertEqual(b.checkState, Qt.Unchecked.value)
+        a.setChecked(True)
+        self.assertEqual(dialog.selected_graph_targets(), [(self.a.dataset_id, 'default'), (self.a.dataset_id, self.detail.graph_id)])
+        a.children[0].setChecked(False)
+        self.assertEqual(a.checkState, Qt.PartiallyChecked.value)
+        dialog.bridge.selectAll(True)
         self.assertEqual(dialog.selected_graph_targets(), [
-            ('a', 'default'), ('a', self.detail.graph_id), ('b', 'default'), ('b', self.other.graph_id)])
-        self.assertEqual(b.checkState(0), Qt.Checked)
-        dialog.clear_btn.click()
+            (self.a.dataset_id, 'default'), (self.a.dataset_id, self.detail.graph_id), (self.b.dataset_id, 'default'), (self.b.dataset_id, self.other.graph_id)])
+        self.assertEqual(b.checkState, Qt.Checked.value)
+        dialog.bridge.selectAll(False)
         self.assertEqual(dialog.selected_graph_targets(), [])
-        self.assertFalse(dialog.buttons.button(QDialogButtonBox.Ok).isEnabled())
-        self.assertEqual(a.checkState(0), Qt.Unchecked)
+        self.assertFalse(dialog.bridge.canAccept)
+        self.assertEqual(a.checkState, Qt.Unchecked.value)
 
     def test_folder_and_empty_selection_block_acceptance_without_creating_folders(self):
         dialog = self.dialog
-        dialog.common_folder.setChecked(True)
-        button = dialog.buttons.button(QDialogButtonBox.Ok)
-        self.assertFalse(button.isEnabled())
+        dialog.bridge.setCommonFolder(True)
+        self.assertFalse(dialog.bridge.canAccept)
         dialog.accept()
-        self.assertEqual(dialog.result(), QDialog.Rejected)
+        self.assertEqual(dialog.result(), dialog.Rejected)
         missing = self.folder / 'missing'
-        dialog.folder_edit.setText(str(missing))
-        self.assertFalse(button.isEnabled())
+        dialog.set_destination_folder(missing)
+        self.assertFalse(dialog.bridge.canAccept)
         self.assertFalse(missing.exists())
-        dialog.folder_edit.setText(str(self.folder))
-        self.assertTrue(button.isEnabled())
-        dialog.clear_btn.click()
+        dialog.set_destination_folder(self.folder)
+        self.assertTrue(dialog.bridge.canAccept)
+        dialog.bridge.selectAll(False)
         dialog.accept()
-        self.assertEqual(dialog.result(), QDialog.Rejected)
-        dialog.targets.topLevelItem(1).child(1).setCheckState(0, Qt.Checked)
-        self.assertEqual(dialog.selected_graph_targets(), [('b', self.other.graph_id)])
+        self.assertEqual(dialog.result(), dialog.Rejected)
+        dialog.bridge.groups[1].children[1].setChecked(True)
+        self.assertEqual(dialog.selected_graph_targets(), [(self.b.dataset_id, self.other.graph_id)])
         self.assertEqual(dialog.destination(), str(self.folder))
         dialog.accept()
-        self.assertEqual(dialog.result(), QDialog.Accepted)
+        self.assertEqual(dialog.result(), dialog.Accepted)
 
     def test_format_dialog_keeps_dataset_based_selection(self):
         template = capture_format(self.a, 'Paper')
-        dialog = ApplyFormatDialog((self.a, self.b), 'b', template)
+        dialog = ApplyFormatDialog((self.a, self.b), self.b.dataset_id, template, self.w)
         self.addCleanup(dialog.deleteLater)
-        self.assertIsInstance(dialog.targets, QListWidget)
-        self.assertEqual(dialog.selected_ids(), ['b'])
-        self.assertEqual(dialog.targets.count(), 2)
-        dialog.select_all_btn.click()
-        self.assertEqual(dialog.selected_ids(), ['a', 'b'])
+        self.assertIsInstance(dialog.window(), QQuickView)
+        self.assertEqual(dialog.selected_ids(), [self.b.dataset_id])
+        self.assertEqual(len(dialog.bridge.targets), 2)
+        dialog.bridge.selectAll(True)
+        self.assertEqual(dialog.selected_ids(), [self.a.dataset_id, self.b.dataset_id])
 
 
-class GraphBatchExportTests(unittest.TestCase):
+class GraphBatchExportTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
+        super().setUp()
         self.path = self.folder / 'sample.dat'
         self.path.write_text('# Signal: PL\nEnergy(eV) 0 1 2\n' + '\n'.join(
             f'{1+i/10} {i+1} {2*i+2} {3*i+3}' for i in range(13)), encoding='utf-8')
-        self.w = MainWindow()
-        self.addCleanup(close_window, self.w)
+        self.w = self.controller
         self.w._load_dat_file_direct(self.path)
         self.w.open_graph_document()
+        pump()
         self.session = self.w.workspace.active
         self.w.set_plot_presentation(replace(self.session.presentation, heatmap_dpi=80,
             width_in=5., height_in=5., aspect_locked=False, frame_width_in=None, frame_height_in=None))
-        self.w.plot_title_edit.setText('Overview title')
+        self.w.dat_properties.setLabel('plot_title', 'Overview title', self.w.dat_properties.ownerToken)
         self.w._finish_graph_editors(capture_science=False)
         self.detail = self.w.create_graph('Detail <α & β>')
-        self.w.xmin_spin.setValue(1.5)
-        self.w.xmin_lock.setChecked(True)
-        self.w.cmap_combo.setCurrentText('magma')
-        self.w.plot_title_edit.setText('Detail title')
+        self.w.open_graph_document()
+        pump()
+        dat.setup_number(self.w, 'xmin', 1.5)
+        dat.set_flag(self.w, 'xmin_lock', True)
+        dat.set_choice(self.w, 'colormap', 'magma')
+        self.w.dat_properties.setLabel('plot_title', 'Detail title', self.w.dat_properties.ownerToken)
         self.w.set_plot_presentation(replace(self.session.presentation, text_pt=15,
             annotations=(PlotAnnotation('detail-note', text='Detail note'),)))
         self.w._finish_graph_editors(capture_science=False)
-        self.w.activate_graph('default')
+        self.w.open_graph_document(graph_id='default')
+        pump()
+
+    def tearDown(self):
+        self.assertEqual(self.quick_errors, [], 'Unexpected production Quick error')
 
     def finish_batch(self):
         self.w._plot_batch_timer.stop()
@@ -144,10 +155,10 @@ class GraphBatchExportTests(unittest.TestCase):
         science = (session.current_cube, session.pending, session.applied, session.analysis_controls,
                    session.batch_peak_map, session.csv_seeds_map, session.fit_result)
         values = session.current_cube.z.copy()
-        w.processing_window_spin.lineEdit().setText('25')
-        w.fit_xmin_spin.lineEdit().setText('1.4')
-        controls = (w.xmin_spin.text(), w.cmap_combo.currentText(), w.graph_combo.currentData(),
-                    w.processing_window_spin.text(), w.fit_xmin_spin.text(), w.plot_title_edit.text())
+        w.processing.setWindowDraft('25')
+        oa.draft(w, 'fit_xmin', '1.4')
+        controls = (dat.state(w)['xmin'], next(entry['label'] for entry in dat.state(w)['colormaps'] if entry['value'] == dat.state(w)['colormap']), w.source_navigation.activeGraphId,
+                    w.processing.windowDraft, oa.text(w, 'fit_xmin'), dat.state(w)['plot_title'])
         active_view, active_page = deepcopy(session.view), session.presentation
         expected_detail = deepcopy(self.detail.view)
         detail_page = self.detail.presentation
@@ -168,13 +179,13 @@ class GraphBatchExportTests(unittest.TestCase):
         self.assertEqual(w._data_generation, epoch)
         self.assertEqual(session.view, active_view)
         self.assertEqual(session.presentation, active_page)
-        self.assertEqual((w.xmin_spin.text(), w.cmap_combo.currentText(), w.graph_combo.currentData(),
-                          w.processing_window_spin.text(), w.fit_xmin_spin.text(), w.plot_title_edit.text()), controls)
+        self.assertEqual((dat.state(w)['xmin'], next(entry['label'] for entry in dat.state(w)['colormaps'] if entry['value'] == dat.state(w)['colormap']), w.source_navigation.activeGraphId,
+                          w.processing.windowDraft, oa.text(w, 'fit_xmin'), dat.state(w)['plot_title']), controls)
         for expected, actual in zip(science, (session.current_cube, session.pending, session.applied,
                 session.analysis_controls, session.batch_peak_map, session.csv_seeds_map, session.fit_result)):
             self.assertIs(actual, expected)
         np.testing.assert_array_equal(session.current_cube.z, values)
-        self.assertEqual(w.plot_page.batch_progress.maximum(), 2)
+        self.assertEqual(w.plot_page.formal.state['batch']['maximum'], 2)
         for result, graph_id, name, view, presentation in zip(w.plot_batch_summary.results,
                 ['default', self.detail.graph_id], ['Graph 1', 'Detail <α & β>'],
                 [active_view, expected_detail], [active_page, detail_page]):
@@ -204,12 +215,12 @@ class GraphBatchExportTests(unittest.TestCase):
         w, session = self.w, self.session
         pending, analysis = deepcopy(session.pending), deepcopy(session.analysis_controls)
         width = session.presentation.width_in
-        w.plot_page.width_spin.lineEdit().setText(f'{width + .5:.8f}')
-        w.xmin_lock.setChecked(True)
-        w.xmin_spin.lineEdit().setText('1.3')
-        w.plot_title_edit.setText('Pending title')
-        w.processing_window_spin.lineEdit().setText('25')
-        w.fit_xmin_spin.lineEdit().setText('1.4')
+        w.plot_page.formal.setDraft('width_in', f'{width + .5:.8f}')
+        dat.set_flag(w, 'xmin_lock', True)
+        w.dat_properties.draftNumber('xmin', '1.3', w.dat_properties.ownerToken)
+        w.dat_properties.setLabel('plot_title', 'Pending title', w.dat_properties.ownerToken)
+        w.processing.setWindowDraft('25')
+        oa.draft(w, 'fit_xmin', '1.4')
         w.start_plot_batch(graph_targets=[(session.dataset_id, 'default')], formats=('svg',))
         job = w._plot_batch._jobs[0]
         self.assertAlmostEqual(job.presentation.width_in, width + .5)
@@ -217,15 +228,15 @@ class GraphBatchExportTests(unittest.TestCase):
         self.assertEqual(job.snapshot.title, 'Pending title')
         self.assertEqual(session.pending, pending)
         self.assertEqual(session.analysis_controls, analysis)
-        self.assertEqual(w.processing_window_spin.lineEdit().text(), '25')
-        self.assertEqual(w.fit_xmin_spin.lineEdit().text(), '1.4')
+        self.assertEqual(w.processing.windowDraft, '25')
+        self.assertEqual(oa.text(w, 'fit_xmin'), '1.4')
         self.finish_batch()
         self.assertTrue(w.plot_batch_summary.success, w.plot_batch_report)
 
     def test_invalid_current_draft_fails_only_owning_pair_and_other_graph_remains_valid(self):
         w, session = self.w, self.session
         before = deepcopy(self.detail.view)
-        w.plot_page.width_spin.lineEdit().setText('invalid')
+        w.plot_page.formal.setDraft('width_in', 'invalid')
         w.start_plot_batch(graph_targets=self.targets(), formats=('svg',))
         self.finish_batch()
         results = w.plot_batch_summary.results
@@ -233,7 +244,7 @@ class GraphBatchExportTests(unittest.TestCase):
         self.assertEqual(results[0].error_stage, 'prepare')
         self.assertIn('editor', results[0].error)
         self.assertEqual(self.detail.view, before)
-        self.assertEqual(w.plot_page.width_spin.lineEdit().text(), 'invalid')
+        self.assertEqual(w.plot_page.formal.state['fields']['width_in'], 'invalid')
         self.assertEqual(session.active_graph_id, 'default')
         # Choosing only another graph of this DAT must not inherit that editor failure.
         w.start_plot_batch(graph_targets=[(session.dataset_id, self.detail.graph_id)], formats=('svg',))
@@ -259,7 +270,7 @@ class GraphBatchExportTests(unittest.TestCase):
         self.assertTrue(results[2].success, w.plot_batch_report)
         self.assertEqual(w.plot_batch_summary.failed, 2)
         self.assertIn('sidecar', w.plot_batch_report.lower())
-        self.assertIn('1 settings warning', w.plot_page.batch_status.text())
+        self.assertIn('1 settings warning', w.plot_page.formal.state['batch']['status'])
         self.assertEqual(sidecar.read_bytes(), before_sidecar)
         self.assertEqual(session.active_graph_id, 'default')
 
@@ -289,16 +300,18 @@ class GraphBatchExportTests(unittest.TestCase):
         other_path = self.folder / 'other.dat'
         other_path.write_bytes(self.path.read_bytes())
         w._load_dat_file_direct(other_path)
+        w.open_graph_document()
+        pump()
         other = w.workspace.active
-        w.plot_page.width_spin.lineEdit().setText('invalid')
-        active_controls = (w.xmin_spin.text(), w.plot_title_edit.text(), w.cmap_combo.currentText())
+        w.plot_page.formal.setDraft('width_in', 'invalid')
+        active_controls = (dat.state(w)['xmin'], dat.state(w)['plot_title'], next(entry['label'] for entry in dat.state(w)['colormaps'] if entry['value'] == dat.state(w)['colormap']))
         w.start_plot_batch(graph_targets=self.targets(), formats=('svg',))
         self.finish_batch()
         self.assertTrue(w.plot_batch_summary.success, w.plot_batch_report)
         self.assertIs(w.workspace.active, other)
         self.assertEqual(session.active_graph_id, 'default')
-        self.assertEqual(w.plot_page.width_spin.lineEdit().text(), 'invalid')
-        self.assertEqual((w.xmin_spin.text(), w.plot_title_edit.text(), w.cmap_combo.currentText()), active_controls)
+        self.assertEqual(w.plot_page.formal.state['fields']['width_in'], 'invalid')
+        self.assertEqual((dat.state(w)['xmin'], dat.state(w)['plot_title'], next(entry['label'] for entry in dat.state(w)['colormaps'] if entry['value'] == dat.state(w)['colormap'])), active_controls)
 
     def test_project_owned_graphs_use_project_folder_and_never_write_sidecars(self):
         w, session = self.w, self.session
@@ -334,8 +347,8 @@ class GraphBatchExportTests(unittest.TestCase):
             dialog = BatchExportDialog(sessions, active_id, parent)
             dialogs.append(dialog)
             def accept_selected():
-                dialog.select_all_btn.click()
-                dialog.formats_combo.setCurrentIndex(1)
+                dialog.bridge.selectAll(True)
+                dialog.bridge.setFormatIndex(1)
                 dialog.accept()
             QTimer.singleShot(0, accept_selected)
             return dialog

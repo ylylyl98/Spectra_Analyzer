@@ -1,10 +1,12 @@
 """Observable numerical reuse and cancellable GUI work contracts."""
+from tests import dat_properties_quick_helpers as dp
+from tests import ordinary_analysis_quick_helpers as oa
+from tests.quick_helpers import set_processing_window
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from dataclasses import replace
 import threading
 import time
-import unittest
 from unittest.mock import patch
 
 import numpy as np
@@ -13,15 +15,16 @@ from PySide6.QtTest import QTest
 from spectra_app import main_window, fitting
 from spectra_app.processing import energy_second_derivative
 from tests.background_helpers import wait_jobs
-from tests.settings_helpers import isolate_settings
-from tests.test_workflow import _window, _fit_result
+from tests import test_workflow as workflow
+from tests.scientific_fixtures import workflow_fit_result as _fit_result
+from tests.quick_migration_case import QuickMigrationCase
 
 
-class ComputePerformanceTests(unittest.TestCase):
+class ComputePerformanceTests(QuickMigrationCase):
     def setUp(self):
-        isolate_settings(self)
+        super().setUp()
         x = np.linspace(0., 20., 101)
-        self.w = _window(np.vstack([np.sin(x), x*x, x*x*x]))
+        self.w = workflow.WorkflowTests.make_window(self, np.vstack([np.sin(x), x*x, x*x*x]))
         self.w.current_cube = replace(self.w.current_cube, photon_energy=x.copy())
         self.w._base_cube = self.w.current_cube
         self.w._show_error = lambda message: self.errors.append(message)
@@ -31,31 +34,53 @@ class ComputePerformanceTests(unittest.TestCase):
     def tearDown(self):
         self.release.set()
         wait_jobs(self.w)
-        self.w.close()
 
     def request(self):
-        self.w.processing_mode_combo.setCurrentIndex(1)
+        self.w.processing.setMode('energy_second_derivative')
         self.w._on_generate_heatmap()
 
     def test_identical_applied_recipe_keeps_cube_results_and_skips_compute_plot(self):
         w = self.w
         self.request()
         wait_jobs(w)
+        # Historical name retained: enabled explicit Apply now creates another
+        # result graph while reusing cached immutable numerical buffers.
+        session = w.workspace.active
+        source = session.active_graph
         cube = w.current_cube
+        self.assertIsNotNone(w._open_analysis(('heatmap', (session.dataset_id, source.graph_id))))
+        analysis = session.active_graph
+        science = analysis.analysis.science
+        bound_cube = science.current_cube
+        np.testing.assert_array_equal(bound_cube.z, cube.z)
         old = _fit_result(4)
         w.fit_result, w._fit_gate_idx = old, 0
         w.batch_fit_result_map = {0: old}
         w.peak_indices, w._peak_gate_idx = np.array([20]), 0
+        w.open_graph_document(session.dataset_id, source.graph_id)
+        self.assertTrue(w.processing.applyEnabled)
+        previous_results = set(session.processing_results)
         with patch.object(main_window, 'energy_second_derivative', wraps=energy_second_derivative) as compute, \
              patch.object(w, '_plot_cube', wraps=w._plot_cube) as plot:
             w._on_generate_heatmap()
             wait_jobs(w)
             self.assertEqual(compute.call_count, 0)
-            self.assertEqual(plot.call_count, 0)
-        self.assertIs(w.current_cube, cube)
-        self.assertIs(w.fit_result, old)
-        self.assertIs(w.batch_fit_result_map[0], old)
-        np.testing.assert_equal(w.peak_indices, [20])
+            self.assertEqual(plot.call_count, 1)
+        result_graph = session.active_graph
+        self.assertIsNot(result_graph, source)
+        self.assertNotEqual(result_graph.result_id, source.result_id)
+        self.assertEqual(set(session.processing_results) - previous_results, {result_graph.result_id})
+        self.assertIs(session.processing_results[source.result_id].cube, cube)
+        self.assertIs(session.processing_results[result_graph.result_id].cube, w.current_cube)
+        self.assertIsNot(w.current_cube, cube)
+        self.assertIs(w.current_cube.z, cube.z)
+        np.testing.assert_array_equal(w.current_cube.z, cube.z)
+        self.assertEqual(w.current_cube.source_path, cube.source_path)
+        self.assertIs(science.current_cube, bound_cube)
+        np.testing.assert_array_equal(science.current_cube.z, cube.z)
+        self.assertIs(science.fit_result, old)
+        self.assertIs(science.batch_fit_result_map[0], old)
+        np.testing.assert_equal(science.peak_indices, [20])
 
     def test_processing_runs_off_thread_deduplicates_pending_and_keeps_latest_view(self):
         w = self.w
@@ -80,9 +105,9 @@ class ComputePerformanceTests(unittest.TestCase):
             self.assertTrue(ticks)
             self.assertNotEqual(threads[0], threading.get_ident())
             w._set_current_gate_from_index(2, update_plot=True)
-            w.xmin_spin.setValue(3.)
-            w.maxfev_spin.setValue(w.maxfev_spin.value()+1)
-            w.plot_title_edit.setText('Latest title')
+            dp.setup_number(w, 'xmin', 3.)
+            oa.set_number(w, 'maxfev', oa.value(w, 'maxfev')+1)
+            w.dat_properties.setLabel('plot_title', 'Latest title', w.dat_properties.ownerToken)
             self.release.set()
             wait_jobs(w)
             self.assertEqual(derivative.call_count, 1)
@@ -93,7 +118,7 @@ class ComputePerformanceTests(unittest.TestCase):
         self.assertEqual(w._heat_ax.get_title(), 'Latest title')
         np.testing.assert_allclose(w.current_cube.z, energy_second_derivative(original.photon_energy, original.z))
 
-    def test_original_or_recipe_edit_cancels_pending_and_keeps_previous_results(self):
+    def test_backend_recipe_change_or_cancel_retires_pending_and_keeps_previous_results(self):
         w = self.w
         for change in ('original', 'recipe', 'cancel', 'data'):
             with self.subTest(change=change):
@@ -110,10 +135,16 @@ class ComputePerformanceTests(unittest.TestCase):
                     self.request()
                     self.assertTrue(started.wait(1))
                     self.assertTrue(w._background_jobs.busy)
+                    # The Quick editor is deliberately disabled during a job.
+                    # Backend owner changes still invalidate stale completion.
                     if change == 'original':
-                        w.processing_mode_combo.setCurrentIndex(0)
+                        owner = w.processing.owner()
+                        owner.pending = replace(owner.pending, mode='original')
+                        w.processing.syncFromOwner()
                     elif change == 'recipe':
-                        w.processing_window_spin.setValue(w.processing_window_spin.value()+2)
+                        owner = w.processing.owner()
+                        owner.pending = replace(owner.pending, window_length=owner.pending.window_length + 2)
+                        w.processing.syncFromOwner()
                     elif change == 'cancel':
                         w._cancel_background_job()
                     else:
@@ -138,7 +169,7 @@ class ComputePerformanceTests(unittest.TestCase):
 
     def test_dataset_switch_is_guarded_and_cancel_rejects_processing_result_and_error(self):
         w = self.w
-        folder = isolate_settings(self).parent
+        folder = self.folder
         ids = []
         for name in ('a', 'b'):
             path = folder / (name + '.dat')
@@ -175,7 +206,7 @@ class ComputePerformanceTests(unittest.TestCase):
                 self.assertIs(w.fit_result, old)
         self.assertEqual(self.errors, [])
 
-    def test_changed_recipe_supersedes_pending_derivative(self):
+    def test_cancel_then_changed_recipe_replaces_pending_derivative(self):
         w = self.w
         started, calls = threading.Event(), []
         def compute(*args, **kwargs):
@@ -187,9 +218,11 @@ class ComputePerformanceTests(unittest.TestCase):
         with patch.object(main_window, 'energy_second_derivative', side_effect=compute):
             self.request()
             self.assertTrue(started.wait(1))
-            w.processing_window_spin.setValue(9)
-            w._on_generate_heatmap()
+            w._cancel_background_job()
             self.release.set()
+            wait_jobs(w)
+            set_processing_window(w.processing, 9)
+            w._on_generate_heatmap()
             wait_jobs(w)
         self.assertEqual(calls, [21, 9])
         self.assertEqual(w._processing_window_length, 9)
@@ -208,9 +241,11 @@ class ComputePerformanceTests(unittest.TestCase):
         with patch.object(main_window, 'energy_second_derivative', side_effect=compute):
             self.request()
             self.assertTrue(started.wait(1))
-            w._on_x_axis_override_changed()  # No source path: the attempt cancels and returns.
-            w._on_generate_heatmap()
+            w.current_dat_path = None  # Preserve the no-source cancellation boundary.
+            w._on_x_axis_override_changed()
             self.release.set()
+            wait_jobs(w)
+            w._on_generate_heatmap()
             wait_jobs(w)
         self.assertEqual(len(calls), 2)
         self.assertEqual(w._processing_mode, 'energy_second_derivative')
@@ -227,9 +262,9 @@ class ComputePerformanceTests(unittest.TestCase):
         np.testing.assert_allclose(w.current_cube.z, energy_second_derivative(
             w._base_cube.photon_energy, w._base_cube.z))
 
-    def test_reloaded_processed_session_keeps_provenance_for_identical_generate(self):
+    def test_reloaded_processed_session_retains_previous_run_on_identical_generate(self):
         w = self.w
-        folder = isolate_settings(self).parent
+        folder = self.folder
         path = folder / 'reload.dat'
         path.write_text('Energy(eV) 0 1\n' + '\n'.join(
             f'{x} {x*x} {x*x*x}' for x in np.linspace(1., 4., 21)))
@@ -249,14 +284,16 @@ class ComputePerformanceTests(unittest.TestCase):
             w._on_generate_heatmap()
             wait_jobs(w)
         self.assertEqual(compute.call_count, 0)
-        self.assertEqual(plot.call_count, 0)
-        self.assertIs(w.current_cube, cube)
-        self.assertIs(w.fit_result, old)
-        np.testing.assert_equal(w.peak_indices, [4])
+        self.assertEqual(plot.call_count, 1)
+        self.assertIsNot(w.current_cube, cube)
+        self.assertTrue(any(result.cube is cube for result in w.workspace.active.processing_results.values()))
+        np.testing.assert_array_equal(w.current_cube.z, cube.z)
+        self.assertIsNone(w.fit_result)
+        self.assertEqual(w.peak_indices.size, 0)
 
     def test_restored_processed_source_replacement_recomputes_before_first_generate(self):
         w = self.w
-        folder = isolate_settings(self).parent
+        folder = self.folder
         path = folder / 'restored.dat'
         path.write_text('Energy(eV) 0 1\n' + '\n'.join(
             f'{x} {x*x} {x*x*x}' for x in np.linspace(1., 4., 21)))
@@ -264,7 +301,9 @@ class ComputePerformanceTests(unittest.TestCase):
         self.request()
         wait_jobs(w)
         w._save_current_plot_state()
-        restored = main_window.MainWindow()
+        from tests.quick_application_helpers import application
+        restored_host, _, _ = self.enterContext(application())
+        restored = restored_host.controller
         restored._show_error = self.fail
         try:
             restored._load_dat_file_direct(path)
@@ -278,12 +317,11 @@ class ComputePerformanceTests(unittest.TestCase):
                 restored._base_cube.photon_energy, restored._base_cube.z))
         finally:
             wait_jobs(restored)
-            restored.close()
 
     def test_detection_derivative_reused_by_overlay_and_refresh_until_inputs_change(self):
         w = self.w
-        w._d2_radio.setChecked(True)
-        w.d2_sg_win_spin.setValue(11)
+        oa.set_value(w, 'derivative_detection', True)
+        oa.set_number(w, 'd2_window', 11)
         x, y = w.current_cube.energy, w.current_cube.z[0]
         with patch.object(main_window, 'savgol_filter', wraps=main_window.savgol_filter) as overlay, \
              patch.object(fitting, 'savgol_filter', wraps=fitting.savgol_filter) as detect:
@@ -295,13 +333,13 @@ class ComputePerformanceTests(unittest.TestCase):
             self.assertEqual(overlay.call_count, 0)
             xr, actual = w._current_second_derivative_trace(x, y)
             expected = fitting.find_peaks_second_derivative(
-                xr, y[w._peak_search_mask(x)], sg_window=w.d2_sg_win_spin.value(),
-                sg_polyorder=w.d2_sg_poly_spin.value())[2]
+                xr, y[w._peak_search_mask(x)], sg_window=oa.value(w, 'd2_window'),
+                sg_polyorder=oa.value(w, 'd2_polyorder'))[2]
             np.testing.assert_allclose(actual, expected)
-            w.d2_sg_win_spin.setValue(13)
+            oa.set_number(w, 'd2_window', 13)
             w._current_second_derivative_trace(x, y)
             self.assertEqual(overlay.call_count, 1)
-            w.xmin_spin.setValue(2.)
+            dp.setup_number(w, 'xmin', 2.)
             w._current_second_derivative_trace(x, y)
             self.assertEqual(overlay.call_count, 2)
             w._set_current_gate_from_index(1, update_plot=True)

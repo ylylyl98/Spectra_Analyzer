@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import numpy as np
 from matplotlib.backend_bases import MouseEvent
-from PySide6.QtCore import Qt, QModelIndex, QItemSelectionModel, QPoint, QPointF, QEvent
-from PySide6.QtGui import QColor, QDropEvent
+from PySide6.QtCore import Qt, QPoint, QPointF, QEvent, QObject
+from PySide6.QtGui import QColor, QAccessible
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -18,7 +18,58 @@ from spectra_app.workbook_state import create_workbook, register_xy_sheet, creat
 from spectra_app.xy_plot_page import XYPlotPage, draw_comparison
 from matplotlib.figure import Figure
 
+from tests.xy_helpers import set_xy_draft, xy_value, select_xy_rows, xy_field, click_xy_item
+from tests.test_curve_prompt_integration import run_quick_prompt
+
 APP = QApplication.instance() or QApplication([])
+
+
+def quick_curve_list(page):
+    return page.curves_panel.rootObject().findChild(QObject, 'xyCurveList')
+
+
+def quick_curve_row(page, row):
+    view = quick_curve_list(page)
+    view.setProperty('contentY', min(row * 42., max(0., view.property('contentHeight') - view.height())))
+    APP.processEvents()
+    pending = list(view.childItems())
+    while pending:
+        item = pending.pop()
+        if item.property('rowId') == list(page.comparison.curves)[row]:
+            return item
+        pending.extend(item.childItems())
+    raise AssertionError(f'No rendered QML curve row {row}')
+
+
+def click_curve_row(page, row, modifier=Qt.NoModifier):
+    item = quick_curve_row(page, row)
+    point = item.mapToScene(QPointF(item.width() * .6, item.height() / 2))
+    QTest.mouseClick(page.curves_panel, Qt.LeftButton, modifier, QPoint(round(point.x()), round(point.y())))
+    if modifier & Qt.ControlModifier:
+        QTest.keyRelease(page.curves_panel, Qt.Key_Control)
+    if modifier & Qt.ShiftModifier:
+        QTest.keyRelease(page.curves_panel, Qt.Key_Shift)
+    APP.processEvents()
+
+
+def curve_role(page, row, name):
+    model = page.inspector_bridge.curves
+    role = next(key for key, value in model.roleNames().items() if bytes(value).decode() == name)
+    return model.data(model.index(row), role)
+
+
+def click_quick_control(panel, object_name):
+    item = panel.rootObject().findChild(QObject, object_name)
+    assert item is not None, object_name
+    parent = item.parentItem()
+    while parent is not None:
+        if parent.metaObject().indexOfProperty('contentY') >= 0:
+            point = item.mapToItem(parent, QPointF(0, 0))
+            parent.setProperty('contentY', max(0., min(parent.property('contentY') + point.y(),
+                               parent.property('contentHeight') - parent.height())))
+        parent = parent.parentItem()
+    APP.processEvents()
+    click_xy_item(panel, item)
 
 
 class CurveManagerTests(unittest.TestCase):
@@ -47,32 +98,17 @@ class CurveManagerTests(unittest.TestCase):
         APP.processEvents()
 
     def selected_ids(self):
-        return {item.data(Qt.UserRole) for item in self.page.curve_list.selectedItems()}
+        return self.page._selected_ids()
 
     def select(self, rows, current=None):
-        widget = self.page.curve_list
-        widget.clearSelection()
-        for row in rows:
-            widget.item(row).setSelected(True)
-        widget.setCurrentItem(widget.item(rows[0] if current is None else current), QItemSelectionModel.NoUpdate)
+        return select_xy_rows(self.page, rows, current=current)
 
     def click_row(self, row, modifier=Qt.NoModifier):
-        widget = self.page.curve_list
-        widget.scrollToItem(widget.item(row))
-        APP.processEvents()
-        rect = widget.visualItemRect(widget.item(row))
-        QTest.mouseClick(widget.viewport(), Qt.LeftButton, modifier, QPoint(rect.center().x(), rect.center().y()))
-        # QTest's synthetic mouse modifiers remain in Qt's global input state
-        # until released, unlike a completed physical Ctrl/Shift gesture.
-        if modifier & Qt.ControlModifier:
-            QTest.keyRelease(widget, Qt.Key_Control)
-        if modifier & Qt.ShiftModifier:
-            QTest.keyRelease(widget, Qt.Key_Shift)
+        click_curve_row(self.page, row, modifier)
 
     def drop(self, rows, destination):
-        widget = self.page.curve_list
-        mime = widget.model().mimeData([widget.model().index(row, 0) for row in rows])
-        return widget.model().dropMimeData(mime, Qt.MoveAction, destination, 0, QModelIndex())
+        # QML row gestures pass selected identities to the document's move command.
+        return self.page.controller._move_curves({list(self.page.comparison.curves)[row] for row in rows}, destination)
 
     def plot_click(self, curve_index, *, button=1, key=None):
         self.page.canvas.draw()
@@ -82,55 +118,68 @@ class CurveManagerTests(unittest.TestCase):
         event = MouseEvent('button_press_event', self.page.canvas, x, y, button=button, key=key)
         self.page.canvas.callbacks.process('button_press_event', event)
 
-    def test_rows_show_provenance_and_native_ctrl_shift_selection_survives_refresh(self):
-        item = self.page.curve_list.item(0)
-        for text in ('Measurement 1', 'Experiment A', 'Original', 'Time (s)', 'Signal', 'raw'):
-            self.assertIn(text, item.text())
-        self.assertIn(str(self.sheet.source_path), item.toolTip())
-        self.assertFalse(item.icon().isNull())
+    def test_rows_show_provenance_and_quick_ctrl_shift_selection_survives_refresh(self):
+        self.assertEqual(curve_role(self.page, 0, 'caption'), 'Measurement 1')
+        accessible = QAccessible.queryAccessibleInterface(quick_curve_row(self.page, 0))
+        self.assertIn('Measurement 1', accessible.text(QAccessible.Name))
+        for text in ('Experiment A', 'Original', 'Time (s)', 'Signal', 'raw'):
+            self.assertIn(text, curve_role(self.page, 0, 'sourceDescription'))
+            self.assertIn(text, accessible.text(QAccessible.Description))
+        self.assertIn(str(self.sheet.source_path), curve_role(self.page, 0, 'sourceDescription'))
+        self.assertTrue(QColor(curve_role(self.page, 0, 'curveColor')).isValid())
         self.click_row(0)
         self.click_row(2, Qt.ControlModifier)
         self.assertEqual(self.selected_ids(), {self.curves[0].curve_id, self.curves[2].curve_id})
         self.click_row(4, Qt.ShiftModifier)
         expected = self.selected_ids()
         self.assertTrue({self.curves[i].curve_id for i in (2, 3, 4)} <= expected)
-        scrollbar = self.page.curve_list.verticalScrollBar()
-        scroll = scrollbar.value()
+        view = quick_curve_list(self.page)
+        scroll = view.property('contentY')
         self.page.refresh()
         self.assertEqual(self.selected_ids(), expected)
-        self.assertEqual(self.page.curve_list.currentItem().data(Qt.UserRole), self.curves[4].curve_id)
-        self.assertEqual(scrollbar.value(), scroll)
+        self.assertEqual(self.page._active_curve_id, self.curves[4].curve_id)
+        self.assertEqual(view.property('contentY'), scroll)
 
     def test_batch_color_width_and_visibility_preserve_unrelated_fields_and_cancel(self):
         self.select([0, 2])
         before = [(c.label, c.y_offset, c.sheet_id, c.mode) for c in self.curves]
         colors = [c.color for c in self.curves]
         data = self.sheet.data.tobytes()
-        with patch('spectra_app.xy_plot_page.QColorDialog.getColor', return_value=QColor()):
-            self.page.batch_color_btn.click()
+        history = self.page._edit_history.undo_stack
+        run_quick_prompt(self.page, lambda: self.page.inspector_bridge.action('batchColor'),
+                         text='#9944aa', accept=False, expected_initial=colors[0])
         self.assertEqual([c.color for c in self.curves], colors)
-        with patch('spectra_app.xy_plot_page.QColorDialog.getColor', return_value=QColor('#9944aa')):
-            self.page.batch_color_btn.click()
-        with patch('spectra_app.xy_plot_page.QInputDialog.getDouble', return_value=(4.25, False)):
-            self.page.batch_width_btn.click()
+        self.assertEqual(len(history), 0)
+        run_quick_prompt(self.page, lambda: self.page.inspector_bridge.action('batchColor'), text='#9944aa')
+        self.assertEqual(len(history), 1)
+        self.assertTrue(history[-1].appearance_only)
+        run_quick_prompt(self.page, lambda: self.page.inspector_bridge.action('batchWidth'),
+                         mode='float', text='4.25', accept=False)
         self.assertTrue(all(c.width == 1.5 for c in self.curves))
-        with patch('spectra_app.xy_plot_page.QInputDialog.getDouble', return_value=(4.25, True)):
-            self.page.batch_width_btn.click()
+        self.assertEqual(len(history), 1)
+        run_quick_prompt(self.page, lambda: self.page.inspector_bridge.action('batchWidth'),
+                         mode='float', text='4.25')
+        self.assertEqual(len(history), 2)
+        self.assertTrue(history[-1].appearance_only)
+        run_quick_prompt(self.page, lambda: self.page.inspector_bridge.action('batchWidth'),
+                         mode='float', text='4.25')
+        self.assertEqual(len(history), 2)
+        self.assertEqual(self.selected_ids(), {self.curves[i].curve_id for i in (0, 2)})
         for i, curve in enumerate(self.curves):
             self.assertEqual(curve.color, '#9944aa' if i in (0, 2) else colors[i])
             self.assertEqual(curve.width, 4.25 if i in (0, 2) else 1.5)
-        self.page.hide_selected_action.trigger()
+        self.page.inspector_bridge.visibilityCommand('hide')
         self.assertEqual([c.visible for c in self.curves], [False, True, False, True, True, True, True, True])
-        self.page.show_selected_action.trigger()
+        self.page.inspector_bridge.visibilityCommand('show')
         self.assertTrue(all(c.visible for c in self.curves))
-        self.page.only_selected_action.trigger()
+        self.page.inspector_bridge.visibilityCommand('only')
         self.assertEqual([c.visible for c in self.curves], [True, False, True, False, False, False, False, False])
-        self.page.show_all_action.trigger()
+        self.page.inspector_bridge.visibilityCommand('all')
         self.assertTrue(all(c.visible for c in self.curves))
         self.assertEqual(before, [(c.label, c.y_offset, c.sheet_id, c.mode) for c in self.curves])
         self.assertEqual(data, self.sheet.data.tobytes())
 
-    def test_native_model_mime_drop_moves_block_and_roundtrips_plot_stack_order(self):
+    def test_quick_move_command_moves_block_and_roundtrips_plot_stack_order(self):
         self.graph.stack_step = 10.
         self.curves[1].visible = False
         self.page.refresh()
@@ -142,7 +191,7 @@ class CurveManagerTests(unittest.TestCase):
         self.assertEqual(list(self.graph.curves), ids)
         self.assertNotEqual(before, workspace_digest(self.workspace))
         self.assertEqual(self.selected_ids(), {self.curves[i].curve_id for i in (0, 2)})
-        self.assertEqual(self.page.curve_list.currentItem().data(Qt.UserRole), self.curves[2].curve_id)
+        self.assertEqual(self.page._active_curve_id, self.curves[2].curve_id)
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'curves.spectra'
             write_project(path, self.workspace)
@@ -155,74 +204,76 @@ class CurveManagerTests(unittest.TestCase):
         self.assertEqual(list(self.page.axes.get_legend_handles_labels()[1]), [self.curves[i].label for i in order if i != 1])
         np.testing.assert_array_equal(self.page.axes.lines[0].get_ydata(), self.sheet.data[:, 1] + 19.)
 
-    def test_external_or_other_graph_mime_rejected(self):
+    def test_other_graph_curves_are_not_mutated_by_local_reorder(self):
         graph = create_comparison(self.workspace, 'Other')
         add_curve(self.workspace, graph.comparison_id, self.sheet.sheet_id, 0, 1)
         other = XYPlotPage(self.workspace, graph.comparison_id)
+        self.addCleanup(other.dispose)
         self.addCleanup(other.deleteLater)
-        mime = other.curve_list.model().mimeData([other.curve_list.model().index(0, 0)])
-        before = list(self.graph.curves)
-        self.assertFalse(self.page.curve_list.model().dropMimeData(mime, Qt.MoveAction, 0, 0, QModelIndex()))
-        self.assertEqual(list(self.graph.curves), before)
-
-    def test_drop_event_uses_same_list_mime_without_source_deletion(self):
-        widget = self.page.curve_list
+        foreign_order = list(graph.curves)
+        foreign_values = [(c.label, c.color, c.width, c.visible) for c in graph.curves.values()]
         self.select([0, 2], current=2)
-        mime = widget.model().mimeData([widget.model().index(row, 0) for row in (0, 2)])
+        self.page.inspector_bridge.moveTo(5)
+        self.assertEqual(list(graph.curves), foreign_order)
+        self.assertEqual([(c.label, c.color, c.width, c.visible) for c in graph.curves.values()], foreign_values)
+        self.assertEqual(list(self.graph.curves), [self.curves[i].curve_id for i in (1, 3, 4, 0, 2, 5, 6, 7)])
 
-        class SameListDrop(QDropEvent):
-            def source(self):
-                return widget
-
-        # Real Qt drop event and MIME; only the OS-owned source accessor is
-        # supplied because offscreen Qt cannot conduct a Windows drag session.
-        event = SameListDrop(QPointF(widget.visualItemRect(widget.item(3)).topLeft()),
-                            Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier)
-        widget.dropEvent(event)
-        self.assertTrue(event.isAccepted())
+    def test_quick_row_drag_moves_selection_without_source_deletion(self):
+        self.select([0, 2], current=2)
+        row = quick_curve_row(self.page, 2)
+        start = row.mapToScene(QPointF(row.width() * .6, 12))
+        finish = start + QPointF(0, 21)
+        # Shift retains the selected block when the row takes pointer focus.
+        QTest.mousePress(self.page.curves_panel, Qt.LeftButton, Qt.ShiftModifier,
+                         QPoint(round(start.x()), round(start.y())))
+        QTest.mouseMove(self.page.curves_panel, QPoint(round(finish.x()), round(finish.y())))
+        QTest.mouseRelease(self.page.curves_panel, Qt.LeftButton, Qt.ShiftModifier,
+                           QPoint(round(finish.x()), round(finish.y())))
+        QTest.keyRelease(self.page.curves_panel, Qt.Key_Shift)
+        APP.processEvents()
         self.assertEqual(list(self.graph.curves), [self.curves[i].curve_id for i in (1, 0, 2, 3, 4, 5, 6, 7)])
-        self.assertEqual(widget.count(), 8)
+        self.assertEqual(self.page.inspector_bridge.curves.rowCount(), 8)
         self.assertEqual(self.selected_ids(), {self.curves[i].curve_id for i in (0, 2)})
 
     def test_move_buttons_preserve_multiselection_and_removal_has_coherent_default(self):
         self.select([1, 2])
-        self.page.move_up_btn.click()
+        self.page.inspector_bridge.moveSelected(-1)
         self.assertEqual(list(self.graph.curves), [self.curves[i].curve_id for i in (1, 2, 0, 3, 4, 5, 6, 7)])
-        self.page.move_down_btn.click()
+        self.page.inspector_bridge.moveSelected(1)
         self.assertEqual(list(self.graph.curves), [c.curve_id for c in self.curves])
         self.assertEqual(self.selected_ids(), {self.curves[i].curve_id for i in (1, 2)})
-        self.page.remove_btn.click()
+        self.page.inspector_bridge.action('remove')
         self.assertNotIn(self.curves[1].curve_id, self.graph.curves)
-        self.assertEqual(self.page.label_edit.text(), self.curves[2].label)
+        self.assertEqual(xy_value(self.page, 'label'), self.curves[2].label)
         self.assertTrue(self.selected_ids())
         while self.graph.curves:
-            self.page.remove_btn.click()
-        self.assertEqual(self.page.curve_list.count(), 0)
-        self.assertFalse(self.page.batch_color_btn.isEnabled())
-        self.assertFalse(self.page.batch_width_btn.isEnabled())
-        self.assertFalse(self.page.label_edit.isEnabled())
+            self.page.inspector_bridge.action('remove')
+        self.assertEqual(self.page.inspector_bridge.curves.rowCount(), 0)
+        self.assertEqual(self.page.inspector_bridge.selectedCount, 0)
+        self.assertFalse(self.page.inspector_bridge.hasCurrent)
+        self.assertFalse(xy_field(self.page, 'label')[1].isEnabled())
 
     def test_pending_edit_is_owned_by_previous_curve_on_switch(self):
         first, second = self.curves[:2]
-        self.page.label_edit.setText('Pending label')
-        self.page.y_offset_edit.setText('7.25')
-        self.page.width_spin.lineEdit().setText('3.125')
-        self.page.curve_list.setCurrentRow(1)
+        set_xy_draft(self.page, 'label', 'Pending label')
+        set_xy_draft(self.page, 'y_offset', '7.25')
+        set_xy_draft(self.page, 'width', '3.125')
+        select_xy_rows(self.page, [1])
         self.assertEqual((first.label, first.y_offset, first.width), ('Pending label', 7.25, 3.125))
         self.assertEqual((second.label, second.y_offset, second.width), ('Measurement 2', 3., 1.5))
-        self.assertEqual(self.page.label_edit.text(), second.label)
+        self.assertEqual(xy_value(self.page, 'label'), second.label)
 
     def test_refresh_retains_valid_and_invalid_drafts_and_single_edits_are_not_batch(self):
         self.select([0, 2])
-        self.page.label_edit.setText('Pending current label')
+        set_xy_draft(self.page, 'label', 'Pending current label')
         self.page.refresh()
-        self.assertEqual(self.page.label_edit.text(), 'Pending current label')
+        self.assertEqual(xy_value(self.page, 'label'), 'Pending current label')
         self.assertEqual(self.curves[0].label, 'Measurement 1')
-        self.page.color_edit.setText('bad')
+        set_xy_draft(self.page, 'color', 'bad')
         self.page.refresh()
-        self.assertEqual(self.page.color_edit.text(), 'bad')
-        self.assertEqual(self.page.label_edit.text(), 'Pending current label')
-        self.page.color_edit.setText('#112233')
+        self.assertEqual(xy_value(self.page, 'color'), 'bad')
+        self.assertEqual(xy_value(self.page, 'label'), 'Pending current label')
+        set_xy_draft(self.page, 'color', '#112233')
         self.page.finish_editor()
         self.assertEqual((self.curves[0].label, self.curves[0].color), ('Pending current label', '#112233'))
         self.assertEqual(self.curves[2].label, 'Measurement 3')
@@ -232,20 +283,24 @@ class CurveManagerTests(unittest.TestCase):
         self.select([0, 2])
         ids = self.selected_ids()
         before = workspace_digest(self.workspace)
-        self.page.color_edit.setText('invalid')
-        self.page.curve_list.setCurrentRow(1)
-        self.assertEqual(self.page.curve_list.currentRow(), 0)
-        self.page.hide_selected_action.trigger()
-        with patch('spectra_app.xy_plot_page.QColorDialog.getColor') as dialog:
-            self.page.batch_color_btn.click()
+        set_xy_draft(self.page, 'color', 'invalid')
+        select_xy_rows(self.page, [1])
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 0)
+        self.page.inspector_bridge.visibilityCommand('hide')
+        with patch('spectra_app.xy_plot_controller.prompt_color') as dialog, \
+                patch('spectra_app.xy_plot_controller.prompt_float') as width_dialog:
+            self.page.inspector_bridge.action('batchColor')
+            self.page.inspector_bridge.action('color')
+            self.page.inspector_bridge.action('batchWidth')
             dialog.assert_not_called()
+            width_dialog.assert_not_called()
         self.assertFalse(self.drop([0, 2], 5))
-        self.page.curve_list.item(1).setCheckState(Qt.Unchecked)
-        self.assertEqual(self.page.curve_list.item(1).checkState(), Qt.Checked)
+        self.page.inspector_bridge.setVisibility(self.curves[1].curve_id, False)
+        self.assertTrue(curve_role(self.page, 1, 'shown'))
         self.plot_click(3)
-        self.assertEqual(self.page.curve_list.currentRow(), 0)
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 0)
         self.assertEqual(self.selected_ids(), ids)
-        self.assertEqual(self.page.color_edit.text(), 'invalid')
+        self.assertEqual(xy_value(self.page, 'color'), 'invalid')
         self.assertEqual(workspace_digest(self.workspace), before)
         with self.assertRaises(ValueError):
             self.page.finish_editor()
@@ -254,21 +309,21 @@ class CurveManagerTests(unittest.TestCase):
         self.curves[1].y_offset = self.curves[0].y_offset
         self.graph.normalization = 'minmax'
         self.page.refresh()
-        self.page.curve_list.setCurrentRow(7)
+        select_xy_rows(self.page, [7])
         self.plot_click(1)
-        self.assertEqual(self.page.curve_list.currentRow(), 0)
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 0)
         x, y = self.page.axes.transData.transform((.5, 20.))
         event = MouseEvent('button_press_event', self.page.canvas, x, y, button=1)
         self.page.canvas.callbacks.process('button_press_event', event)
-        self.assertEqual(self.page.curve_list.currentRow(), 0)
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 0)
 
     def test_width_draft_survives_refresh_then_external_precise_width_can_reload(self):
-        self.page.width_spin.lineEdit().setText('invalid')
+        set_xy_draft(self.page, 'width', 'invalid')
         self.page.refresh()
-        self.assertEqual(self.page.width_spin.lineEdit().text(), 'invalid')
+        self.assertEqual(xy_value(self.page, 'width'), 'invalid')
         with self.assertRaises(ValueError):
             self.page.finish_editor()
-        self.page.width_spin.lineEdit().setText('2.5')
+        set_xy_draft(self.page, 'width', '2.5')
         self.page.finish_editor()
         self.curves[0].width = .123456789012345
         self.page.refresh()
@@ -277,24 +332,32 @@ class CurveManagerTests(unittest.TestCase):
 
     def test_canvas_selects_and_scrolls_without_style_mutation_and_ignores_navigation(self):
         before = workspace_digest(self.workspace)
-        outer = self.page.inspector.verticalScrollBar()
-        outer.setValue(outer.maximum())
+        view = quick_curve_list(self.page)
+        outer = view.parentItem()
+        while outer is not None and outer.metaObject().indexOfProperty('contentY') < 0:
+            outer = outer.parentItem()
+        self.assertIsNotNone(outer)
+        outer.setProperty('contentY', max(0., outer.property('contentHeight') - outer.height()))
+        view.setProperty('contentY', 0.)
         self.plot_click(7)
-        self.assertEqual(outer.value(), 0)
-        self.assertEqual(self.page.curve_list.currentRow(), 7)
-        self.assertTrue(self.page.curve_list.viewport().rect().intersects(
-            self.page.curve_list.visualItemRect(self.page.curve_list.item(7))))
+        APP.processEvents()
+        self.assertEqual(outer.property('contentY'), 0.)
+        self.assertGreater(view.property('contentY'), 0.)
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 7)
+        row = next(item for item in view.property('contentItem').childItems() if item.property('rowId') == self.curves[7].curve_id)
+        self.assertLessEqual(row.y() - view.property('contentY'), view.height())
+        self.assertGreaterEqual(row.y() - view.property('contentY') + row.height(), 0)
         self.plot_click(2, key='control')
         self.assertEqual(self.selected_ids(), {self.curves[i].curve_id for i in (2, 7)})
         self.plot_click(0, button=3)
-        self.assertEqual(self.page.curve_list.currentRow(), 2)
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 2)
         self.page.toolbar.pan()
         self.plot_click(1)
-        self.assertEqual(self.page.curve_list.currentRow(), 2)
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 2)
         self.page.toolbar.pan()
         self.page.toolbar.zoom()
         self.plot_click(1)
-        self.assertEqual(self.page.curve_list.currentRow(), 2)
+        self.assertEqual(list(self.page.comparison.curves).index(self.page._active_curve_id), 2)
         self.page.toolbar.zoom()
         self.assertEqual(workspace_digest(self.workspace), before)
 

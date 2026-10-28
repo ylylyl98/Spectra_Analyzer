@@ -95,6 +95,26 @@ class PlotTemplateTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             reloaded.load('missing')
 
+    def test_legacy_custom_font_load_apply_and_save_use_arial(self):
+        legacy = templates.capture_format(self.source(), 'Legacy').to_dict()
+        legacy['style']['font_family'] = 'DejaVu Serif'
+        raw = json.dumps({'version': 1, 'templates': [legacy]})
+        self.settings.setValue(templates.FORMAT_TEMPLATES_KEY, raw)
+        store = templates.FormatTemplateStore(self.settings)
+        template = store.load('Legacy')
+        self.assertEqual(template.style.font_family, 'Arial')
+        self.assertEqual(self.settings.value(templates.FORMAT_TEMPLATES_KEY), raw)
+        target = dataset()
+        science, bounds = target.current_cube.z.copy(), deepcopy(target.view.bounds)
+        templates.apply_format(target, template)
+        self.assertEqual(target.presentation.font_family, 'Arial')
+        self.assertEqual((target.presentation.numeric_pt, target.presentation.text_pt), (11., 14.))
+        np.testing.assert_array_equal(target.current_cube.z, science)
+        self.assertEqual(target.view.bounds, bounds)
+        store.save(template)
+        saved = json.loads(self.settings.value(templates.FORMAT_TEMPLATES_KEY))
+        self.assertEqual(saved['templates'][0]['style']['font_family'], 'Arial')
+
     def test_old_v1_formats_migrate_only_new_optional_geometry_fields(self):
         old = templates.capture_format(self.source(), 'Old Paper').to_dict()
         for name in ('frame_width_in', 'frame_height_in'):

@@ -10,6 +10,9 @@ from spectra_app.peak_candidates import candidate_filter_preset
 from spectra_app.workbook_state import create_workbook, register_xy_sheet, create_comparison, add_curve
 from spectra_app.xy_analysis import AnalysisSettings, capture_input, XYAnalysisProgress, collect_candidates, fit_seeds
 
+from tests.xy_analysis_quick_helpers import analysis_command, choose_analysis, set_analysis_draft, run_seed_dialog, type_seed_field, click_quick, choose_seed_kind
+from tests.xy_helpers import select_xy_rows
+
 
 class XYProgressStateTests(unittest.TestCase):
     def setUp(self):
@@ -87,21 +90,21 @@ class XYProgressStateTests(unittest.TestCase):
 
 
 import tests.test_xy_analysis_workflow as workflow_fixture
+from tests.quick_migration_case import QuickMigrationCase
 from tests.settings_helpers import wait_for_background_jobs
 
 
-class XYProgressWorkflowTests(unittest.TestCase):
+class XYProgressWorkflowTests(QuickMigrationCase):
     setUp = workflow_fixture.XYAnalysisWorkflowTests.setUp
     dispose = workflow_fixture.XYAnalysisWorkflowTests.dispose
     analyze = workflow_fixture.XYAnalysisWorkflowTests.analyze
     fit = workflow_fixture.XYAnalysisWorkflowTests.fit
 
     def test_project_reopen_restores_progress_without_export(self):
-        self.page.curve_list.clearSelection()
-        self.page.curve_list.item(1).setSelected(True)
+        select_xy_rows(self.page, [1])
         self.analyze()
-        self.panel.find_btn.click(); wait_for_background_jobs(self.w)
-        self.panel.fit_btn.click(); wait_for_background_jobs(self.w)
+        analysis_command(self.panel, 'find'); wait_for_background_jobs(self.w)
+        analysis_command(self.panel, 'fit'); wait_for_background_jobs(self.w)
         original = self.panel.fit_result.y_fit.copy()
         selected = self.panel.captured.curve_id
         ids = set(self.w.workspace.workbooks)
@@ -111,27 +114,27 @@ class XYProgressWorkflowTests(unittest.TestCase):
         self.w.save_project(target)
         self.assertTrue(self.w.open_project(target))
         self.w.open_xy_comparison(comparison_id)
-        page = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
-        page.analysis_panel.resume_analysis()
-        self.assertIsNotNone(page.analysis_panel.fit_result)
+        page = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
+        page.analysis_controller.resume_analysis()
+        self.assertIsNotNone(page.analysis_controller.fit_result)
         self.assertEqual(page._selected_ids(), {selected})
-        np.testing.assert_allclose(page.analysis_panel.fit_result.y_fit, original)
+        np.testing.assert_allclose(page.analysis_controller.fit_result.y_fit, original)
         self.assertEqual(set(self.w.workspace.workbooks), ids)
-        self.assertIn('Restored', page.analysis_panel.status.text())
+        self.assertIn('Restored', page.analysis_controller.bridge.state['status'])
 
     def test_filter_refits_only_retire_fit_and_seed_edits_persist(self):
         self.fit()
         candidates = list(self.panel.progress.candidate_pool)
-        self.panel.model_combo.setCurrentText('Voigt')
+        choose_analysis(self.panel, 'model', 'Voigt')
         self.assertIsNone(self.panel.fit_result)
         self.assertEqual(self.panel.progress.candidate_pool, candidates)
-        self.assertTrue(self.panel.save_btn.isEnabled())
+        self.assertTrue(self.panel.bridge.state['saveEnabled'])
         seed = self.panel.progress.seeds[0]
         self.panel.set_seeds([replace(seed, position=.713, manual=True, fixed_center=True)])
-        self.panel.preset_combo.setCurrentText('Strict')
-        self.panel.preset_combo.setCurrentText('Loose')
+        choose_analysis(self.panel, 'preset', 'Strict')
+        choose_analysis(self.panel, 'preset', 'Loose')
         self.assertEqual(self.panel.progress.accepted_seeds()[0].position, .713)
-        self.panel.fit_btn.click(); wait_for_background_jobs(self.w)
+        analysis_command(self.panel, 'fit'); wait_for_background_jobs(self.w)
         self.assertAlmostEqual(self.panel.fit_result.centers[0], .713, places=10)
         payload = self.page.comparison.analysis_state
         self.assertEqual(payload['seeds'][0]['position'], .713)
@@ -141,45 +144,39 @@ class XYProgressWorkflowTests(unittest.TestCase):
         self.page.comparison.analysis_state = {'version': 1, 'fit': 'invalid'}
         self.panel.resume_analysis()
         self.assertIsNone(self.panel.fit_result)
-        self.assertIn('could not be restored', self.panel.status.text())
+        self.assertIn('could not be restored', self.panel.bridge.state['status'])
 
     def test_seed_dialog_kind_edit_survives_refilter_and_preserves_exact_markers(self):
-        from PySide6.QtCore import QTimer, Qt
-        from PySide6.QtWidgets import QApplication, QTableWidget, QDialogButtonBox
         self.fit()
-        failures = []
         original_seeds = list(self.panel.progress.seeds)
         original_fit = self.panel.fit_result
-        def confirm():
-            dialog = QApplication.activeModalWidget()
-            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
-        QTimer.singleShot(0, confirm)
-        self.panel.seeds_btn.click()
+        def confirm(dialog):
+            self.assertEqual(dialog.bridge.resultModel, 'Gaussian')
+            self.assertAlmostEqual(float(dialog.bridge.results[0]['center']), .7, places=5)
+            self.assertAlmostEqual(float(dialog.bridge.results[0]['height']), 5., places=5)
+            self.assertAlmostEqual(float(dialog.bridge.results[0]['width']), .6, places=5)
+            self.assertEqual(dialog.bridge.results[0]['gamma'], '')
+            click_quick(dialog, 'xy-seed-accept')
+        run_seed_dialog(self.panel, confirm)
         self.assertEqual(self.panel.progress.seeds, original_seeds)
         self.assertIs(self.panel.fit_result, original_fit)
-        def edit():
-            dialog = QApplication.activeModalWidget()
-            try:
-                table = dialog.findChild(QTableWidget, 'xy-seed-table')
-                table.item(0, 1).setText('.713')
-                table.item(0, 2).setText('dip')
-                dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
-            except Exception as exc:
-                failures.append(str(exc))
-                dialog.reject()
-            if dialog.isVisible():
-                failures.append('Seed dialog rejected valid manual edit')
-                dialog.reject()
-        QTimer.singleShot(0, edit)
-        self.panel.seeds_btn.click()
-        self.assertEqual(failures, [])
-        self.panel.preset_combo.setCurrentText('Strict')
-        self.panel.preset_combo.setCurrentText('Loose')
+        def edit(dialog):
+            identity = original_seeds[0].seed_id
+            type_seed_field(dialog, identity, 'position', '.713')
+            choose_seed_kind(dialog, identity, 'dip')
+            click_quick(dialog, 'xy-seed-accept')
+            self.assertFalse(dialog.window().isVisible(), 'Seed dialog rejected valid manual edit')
+        run_seed_dialog(self.panel, edit)
+        choose_analysis(self.panel, 'preset', 'Strict')
+        choose_analysis(self.panel, 'preset', 'Loose')
         accepted = self.panel.progress.accepted_seeds()
         self.assertEqual([(seed.position, seed.kind) for seed in accepted], [(.713, 'dip')])
+        self.assertEqual(accepted[0].seed_id, original_seeds[0].seed_id)
+        excluded = next(seed for seed in self.panel.progress.seeds if not seed.enabled)
+        self.assertNotEqual(excluded.seed_id, original_seeds[0].seed_id)
         line = next(line for line in self.page.axes.lines if line.get_gid() == 'xy-analysis-peaks')
         np.testing.assert_array_equal(line.get_xdata(), [.713])
-        self.panel.create_graph_btn.click()
+        analysis_command(self.panel, 'graph')
         markers = next(sheet for sheet in self.w.workspace.sheets.values() if sheet.name == 'Peak curves')
         rows = np.isfinite(markers.data[:, 3])
         np.testing.assert_array_equal(markers.data[rows, 0], [.713])
@@ -187,13 +184,13 @@ class XYProgressWorkflowTests(unittest.TestCase):
     def test_invalid_filter_draft_cannot_drop_pool_or_start_job(self):
         self.fit()
         pool = list(self.panel.progress.candidate_pool)
-        self.panel.candidate_width_min_spin.setValue(2)
-        self.panel.candidate_width_max_spin.setValue(1)
-        self.assertFalse(self.panel.find_btn.isEnabled())
-        self.assertFalse(self.panel.fit_btn.isEnabled())
+        self.assertTrue(set_analysis_draft(self.panel, 'candidateWidthMin', '2'))
+        self.assertTrue(set_analysis_draft(self.panel, 'candidateWidthMax', '1'))
+        self.assertFalse(self.panel.bridge.state['findEnabled'])
+        self.assertFalse(self.panel.bridge.state['fitEnabled'])
         self.panel.start('find')
         self.assertFalse(self.w._background_jobs.busy)
-        self.panel.candidate_width_max_spin.setValue(0)
+        self.assertTrue(set_analysis_draft(self.panel, 'candidateWidthMax', '0', commit=True))
         self.assertEqual(self.panel.progress.candidate_pool, pool)
 
 

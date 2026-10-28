@@ -12,8 +12,9 @@ from .workbook_state import resolve_curve
 
 
 GRAPH_FIELDS = ('name', 'plot_title', 'x_label', 'y_label', 'legend_visible',
-                'normalization', 'stack_step', 'x_range_mode', 'x_range')
-CURVE_FIELDS = ('label', 'visible', 'color', 'width', 'y_offset', 'style')
+                'normalization', 'stack_step', 'x_range_mode', 'x_range', 'presentation')
+CURVE_FIELDS = ('label', 'visible', 'color', 'width', 'y_offset', 'style',
+                'marker_shape', 'marker_size', 'marker_fill', 'marker_edge_color', 'marker_edge_width')
 
 
 def capture_edit_state(comparison):

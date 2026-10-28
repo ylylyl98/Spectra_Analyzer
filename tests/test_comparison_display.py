@@ -10,24 +10,35 @@ from unittest.mock import patch
 
 import numpy as np
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, QEvent
-from PySide6.QtWidgets import QApplication
+from tests.quick_migration_case import QuickMigrationCase
+from tests import formal_quick_helpers as formal
 
 from spectra_app.dataset_state import Workspace
 from spectra_app.project_io import (ProjectFormatError, read_project, runtime_workspace_stamp,
                                    workspace_digest, write_project)
 from spectra_app.workbook_state import (add_curve, create_comparison, create_workbook,
                                        ensure_dataset_sheet, register_xy_sheet, resolve_curve)
-from spectra_app.xy_plot_page import XYPlotPage, draw_comparison
+from spectra_app.xy_plot_controller import XYPlotController, draw_comparison
 from tests.test_project_io import archive_members, overwrite_archive
 
-APP = QApplication.instance() or QApplication([])
+from tests.xy_helpers import set_xy_draft, xy_value, select_xy_rows, xy_field
 
 
-def samples():
-    workspace = Workspace()
+def mount_comparison(case):
+    case.controller.open_xy_comparison(case.graph.comparison_id)
+    documents = case.controller.graph_documents
+    case.page = documents.document_for(documents.registry.active_key)
+    case.assertIsInstance(case.page, XYPlotController)
+    case.host.window.resize(1040, 850)
+    formal.pump(100)
+    case.assertTrue(case.page.presentation_eligible())
+
+
+def samples(workspace=None):
+    workspace = workspace if workspace is not None else Workspace()
     book = create_workbook(workspace)
     comparison = create_comparison(workspace, 'Three measurements')
+    comparison.presentation = None  # These display fixtures exercise the v8 metadata contract.
     curves = []
     for name, values in (
             ('A', [[4, 4], [0, 10000], [2, -2], [3, 3], [2, 2]]),
@@ -35,12 +46,16 @@ def samples():
             ('C', [[2, 20], [4, 40], [3, 30]])):
         sheet = register_xy_sheet(workspace, book.workbook_id, name, np.array(values), ['X', 'Y'])
         curves.append(add_curve(workspace, comparison.comparison_id, sheet.sheet_id, 0, 1, label=name))
+    for curve in curves:
+        curve.marker_shape, curve.marker_size = 'o', 4.  # Legacy symbol encoding.
     return workspace, comparison, curves
 
 
-class ComparisonDisplayRenderingTests(unittest.TestCase):
+class ComparisonDisplayRenderingTests(QuickMigrationCase):
     def setUp(self):
-        self.workspace, self.graph, self.curves = samples()
+        super().setUp()
+        self.addCleanup(lambda: self.assertEqual(self.quick_errors, []))
+        self.workspace, self.graph, self.curves = samples(self.controller.workspace)
 
     def draw(self):
         return draw_comparison(Figure(), self.workspace, self.graph)
@@ -88,24 +103,24 @@ class ComparisonDisplayRenderingTests(unittest.TestCase):
             sheet = register_xy_sheet(self.workspace, book.workbook_id, name, np.array(values), ['X', 'Y'])
             add_curve(self.workspace, self.graph.comparison_id, sheet.sheet_id, 0, 1, label=name)
         self.graph.normalization = 'minmax'
-        page = XYPlotPage(self.workspace, self.graph.comparison_id)
-        self.addCleanup(page.deleteLater)
+        mount_comparison(self)
+        page = self.page
         self.assertEqual(len(page.axes.lines), 2)
         np.testing.assert_equal(page.axes.lines[0].get_ydata(), [0, 0])
         np.testing.assert_equal(page.axes.lines[1].get_ydata(), [0, 0])
-        self.assertIn('Missing', page.display_status.text())
-        self.assertIn('constant', page.display_status.text().lower())
+        self.assertIn('Missing', page.inspector_bridge.displayStatus)
+        self.assertIn('constant', page.inspector_bridge.displayStatus.lower())
         self.graph.x_range_mode, self.graph.x_range = 'manual', (10, 20)
         page.refresh()
         self.assertFalse(page.axes.lines)
-        self.assertIn('no samples', page.display_status.text().lower())
+        self.assertIn('no samples', page.inspector_bridge.displayStatus.lower())
         self.graph.x_range_mode = 'common'
         sheet = register_xy_sheet(self.workspace, book.workbook_id, 'Distant',
                                  np.array([[5, 1], [6, 2]]), ['X', 'Y'])
         distant = add_curve(self.workspace, self.graph.comparison_id, sheet.sheet_id, 0, 1, label='Distant')
         page.refresh()
         self.assertFalse(page.axes.lines)
-        self.assertIn('no common', page.display_status.text().lower())
+        self.assertIn('no common', page.inspector_bridge.displayStatus.lower())
         distant.visible = False
         page.refresh()
         self.assertEqual(page.axes.get_xlim(), (0, 1))
@@ -158,11 +173,11 @@ class ComparisonDisplayRenderingTests(unittest.TestCase):
             sheet = register_xy_sheet(self.workspace, book.workbook_id, name, np.array(values), ['X', 'Y'])
             add_curve(self.workspace, self.graph.comparison_id, sheet.sheet_id, 0, 1, label=name)
         self.graph.x_range_mode = 'common'
-        page = XYPlotPage(self.workspace, self.graph.comparison_id)
-        self.addCleanup(page.deleteLater)
+        mount_comparison(self)
+        page = self.page
         self.assertEqual(page.axes.get_xlim(), (4, 6))
         self.assertEqual(len(page.axes.lines), 1)
-        self.assertIn('Sparse: no samples', page.display_status.text())
+        self.assertIn('Sparse: no samples', page.inspector_bridge.displayStatus)
 
 
 class ComparisonDisplayPersistenceTests(unittest.TestCase):
@@ -256,109 +271,112 @@ class ComparisonDisplayPersistenceTests(unittest.TestCase):
                     setattr(obj, attr, previous)
 
 
-class ComparisonDisplayEditorTests(unittest.TestCase):
+class ComparisonDisplayEditorTests(QuickMigrationCase):
     def setUp(self):
-        self.workspace, self.graph, self.curves = samples()
-        self.page = XYPlotPage(self.workspace, self.graph.comparison_id)
-        self.addCleanup(self.page.deleteLater)
+        super().setUp()
+        self.addCleanup(lambda: self.assertEqual(self.quick_errors, []))
+        self.workspace, self.graph, self.curves = samples(self.controller.workspace)
+        mount_comparison(self)
 
-    def choose(self, combo, value):
-        combo.setCurrentIndex(combo.findData(value))
+    def choose(self, field, value):
+        if field == 'x_range_mode':
+            self.page.inspector_bridge.setRangeMode(value)
+        else:
+            set_xy_draft(self.page, field, value, commit=True)
 
-    def edit(self, edit, value):
-        edit.setText(value)
-        edit.editingFinished.emit()
+    def edit(self, field, value):
+        set_xy_draft(self.page, field, value, commit=True)
 
     def test_ui_modes_precision_selection_styles_and_reset(self):
         page = self.page
-        self.choose(page.normalization_combo, 'maxabs')
-        self.choose(page.x_range_combo, 'common')
-        self.edit(page.stack_step_edit, '1.2345678901234567e-1')
-        self.edit(page.y_offset_edit, '-.9876543210987654')
-        page.curve_list.setCurrentRow(1)
-        self.edit(page.y_offset_edit, '2')
-        page.color_edit.setText('#334455')
-        page.color_edit.editingFinished.emit()
-        page.curve_list.setCurrentRow(0)
+        self.choose('normalization', 'maxabs')
+        self.choose('x_range_mode', 'common')
+        self.edit('stack_step', '1.2345678901234567e-1')
+        self.edit('y_offset', '-.9876543210987654')
+        select_xy_rows(page, [1])
+        self.edit('y_offset', '2')
+        set_xy_draft(page, 'color', '#334455')
+        page.inspector_bridge.commitField('color')
+        select_xy_rows(page, [0])
         page.finish_editor()
         self.assertEqual(self.curves[0].y_offset, -.9876543210987654)
         self.assertEqual(self.curves[1].y_offset, 2)
         self.assertEqual(self.graph.stack_step, .12345678901234567)
         self.assertFalse(page.has_pending_project_edits())
-        self.choose(page.x_range_combo, 'manual')
-        self.assertTrue(page.x_min_edit.isEnabled())
+        self.choose('x_range_mode', 'manual')
+        self.assertTrue(xy_field(page, 'x_min')[1].isVisible())
         self.assertEqual(self.graph.x_range, (2, 4))
-        self.edit(page.x_min_edit, '2.5e0')
+        self.edit('x_min', '2.5e0')
         self.assertEqual(self.graph.x_range, (2.5, 4))
         self.curves[2].visible = False
         base = [(c.label, c.color, c.width, c.visible) for c in self.curves]
-        page.reset_display_btn.click()
+        page.inspector_bridge.action('reset')
         self.assertEqual((self.graph.normalization, self.graph.x_range_mode, self.graph.stack_step, self.graph.x_range),
                          ('none', 'all', 0, None))
         self.assertTrue(all(c.y_offset == 0 for c in self.curves))
         self.assertEqual(base, [(c.label, c.color, c.width, c.visible) for c in self.curves])
-        self.assertFalse(page.x_min_edit.isEnabled())
+        self.assertFalse(xy_field(page, 'x_min')[1].isVisible())
 
     def test_invalid_display_drafts_block_commit_selection_and_preserve_other_drafts(self):
         page = self.page
-        self.choose(page.x_range_combo, 'manual')
+        self.choose('x_range_mode', 'manual')
         saved = self.graph.x_range
-        self.edit(page.x_min_edit, '9')
+        self.edit('x_min', '9')
         self.assertEqual(self.graph.x_range, saved)
-        self.assertIn('less than', page.display_status.text())
+        self.assertIn('less than', page.inspector_bridge.error or page.inspector_bridge.message)
         self.assertTrue(page.has_pending_project_edits())
         with self.assertRaisesRegex(ValueError, 'less than'):
             page.finish_editor()
-        page.curve_list.setCurrentRow(1)
-        self.assertEqual(page.curve_list.currentRow(), 0)
-        self.assertEqual(page.x_min_edit.text(), '9')
-        self.edit(page.x_min_edit, '1')
-        page.name_edit.setText('Pending name')
-        page.color_edit.setText('invalid')
-        self.choose(page.normalization_combo, 'minmax')
-        self.assertEqual(page.color_edit.text(), 'invalid')
-        self.assertEqual(page.name_edit.text(), 'Pending name')
-        self.edit(page.color_edit, '#334455')
+        select_xy_rows(page, [1])
+        self.assertEqual(list(page.comparison.curves).index(page._active_curve_id), 0)
+        self.assertEqual(xy_value(page, 'x_min'), '9')
+        self.edit('x_min', '1')
+        set_xy_draft(page, 'name', 'Pending name')
+        set_xy_draft(page, 'color', 'invalid')
+        self.choose('normalization', 'minmax')
+        self.assertEqual(xy_value(page, 'color'), 'invalid')
+        self.assertEqual(xy_value(page, 'name'), 'Pending name')
+        self.edit('color', '#334455')
         page.finish_editor()
         self.assertEqual(self.graph.name, 'Pending name')
         self.assertEqual(self.graph.normalization, 'minmax')
         for text in ('nan', 'inf', '-inf', '', 'oops'):
-            self.edit(page.stack_step_edit, text)
+            self.edit('stack_step', text)
             with self.assertRaises(ValueError):
                 page.validate_editor()
-        self.edit(page.stack_step_edit, '0')
-        self.assertNotIn('finite number', page.display_status.text())
-        self.edit(page.y_offset_edit, 'nan')
-        self.assertIn('finite number', page.display_status.text())
-        self.edit(page.y_offset_edit, '0')
-        self.assertNotIn('finite number', page.display_status.text())
+        self.edit('stack_step', '0')
+        self.assertNotIn('finite number', page.inspector_bridge.error or page.inspector_bridge.message)
+        self.edit('y_offset', 'nan')
+        self.assertIn('finite number', page.inspector_bridge.error or page.inspector_bridge.message)
+        self.edit('y_offset', '0')
+        self.assertNotIn('finite number', page.inspector_bridge.error or page.inspector_bridge.message)
 
     def test_manual_seed_uses_configured_samples_and_reset_keeps_unrelated_invalid_draft(self):
         page = self.page
         page.axes.set_xlim(2.2, 2.3)
-        self.choose(page.x_range_combo, 'manual')
+        self.choose('x_range_mode', 'manual')
         self.assertEqual(self.graph.x_range, (0, 5))
-        page.color_edit.setText('invalid color draft')
-        page.name_edit.setText('Pending graph name')
-        page.stack_step_edit.setText('not a number')
-        page.reset_display_btn.click()
-        self.assertEqual(page.color_edit.text(), 'invalid color draft')
-        self.assertEqual(page.name_edit.text(), 'Pending graph name')
-        self.assertEqual(page.stack_step_edit.text(), '0.0')
+        set_xy_draft(page, 'color', 'invalid color draft')
+        set_xy_draft(page, 'name', 'Pending graph name')
+        set_xy_draft(page, 'stack_step', 'not a number')
+        page.inspector_bridge.action('reset')
+        self.assertEqual(xy_value(page, 'color'), 'invalid color draft')
+        self.assertEqual(xy_value(page, 'name'), 'Pending graph name')
+        self.assertEqual(xy_value(page, 'stack_step'), '0.0')
         self.assertTrue(page.has_pending_project_edits())
 
     def test_png_svg_clipboard_use_transformed_renderer_and_configured_limits(self):
         page = self.page
-        self.choose(page.normalization_combo, 'maxabs')
-        self.choose(page.x_range_combo, 'common')
-        self.edit(page.stack_step_edit, '2')
+        self.choose('normalization', 'maxabs')
+        self.choose('x_range_mode', 'common')
+        self.edit('stack_step', '2')
         rendered = []
         original = draw_comparison
         def record(*args):
             axes = original(*args)
             rendered.append((axes.get_xlim(), [line.get_ydata().copy() for line in axes.lines], axes.get_ylabel()))
             return axes
-        with tempfile.TemporaryDirectory() as directory, patch('spectra_app.xy_plot_page.draw_comparison', side_effect=record):
+        with tempfile.TemporaryDirectory() as directory, patch('spectra_app.xy_plot_controller.draw_comparison', side_effect=record):
             for extension in ('png', 'svg'):
                 page.export(Path(directory) / ('display.' + extension))
             self.assertIn(b'<svg', page.svg_bytes())
@@ -369,22 +387,12 @@ class ComparisonDisplayEditorTests(unittest.TestCase):
             self.assertIn('offset', label.lower())
 
 
-class ComparisonDisplayLifecycleTests(unittest.TestCase):
+class ComparisonDisplayLifecycleTests(QuickMigrationCase):
     def setUp(self):
-        from spectra_app.main_window import MainWindow
-        from tests.settings_helpers import isolate_settings
-        self.folder = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
-        self.addCleanup(self.dispose)
-
-    def dispose(self):
-        self.window._confirm_project_discard = lambda: True
-        self.window.close()
-        self.window.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+        super().setUp()
+        self.window = self.controller
+        self.errors = self.quick_errors
+        self.addCleanup(lambda: self.assertEqual(self.errors, []))
 
     def test_actual_ui_live_dat_add_close_reopen_and_source_free_project(self):
         w = self.window
@@ -397,28 +405,31 @@ class ComparisonDisplayLifecycleTests(unittest.TestCase):
         raw = add_curve(w.workspace, graph.comparison_id, sheet.sheet_id, 0, 1)
         processed = add_curve(w.workspace, graph.comparison_id, sheet.sheet_id, 0, 1, mode='processed')
         page = w.open_xy_comparison(graph.comparison_id)
-        page.normalization_combo.setCurrentIndex(page.normalization_combo.findData('minmax'))
-        page.x_range_combo.setCurrentIndex(page.x_range_combo.findData('common'))
-        page.stack_step_edit.setText('2')
-        page.stack_step_edit.editingFinished.emit()
-        page.curve_list.setCurrentRow(1)
-        page.y_offset_edit.setText('.25')
-        page.y_offset_edit.editingFinished.emit()
+        set_xy_draft(page, 'normalization', 'minmax', commit=True)
+        page.inspector_bridge.setRangeMode('common')
+        set_xy_draft(page, 'stack_step', '2')
+        page.inspector_bridge.commitField('stack_step')
+        select_xy_rows(page, [1])
+        set_xy_draft(page, 'y_offset', '.25')
+        page.inspector_bridge.commitField('y_offset')
         base_bytes = session.base_cube.z.tobytes()
         updated = replace(session.current_cube, z=session.current_cube.z ** 2)
         current_bytes = updated.z.tobytes()
-        page.stack_step_edit.setText('bad draft')
+        set_xy_draft(page, 'stack_step', 'bad draft')
         w._replace_current_data(updated, mode='energy_second_derivative', smooth=False, window_length=5)
-        self.assertEqual(page.stack_step_edit.text(), 'bad draft')
+        self.assertEqual(xy_value(page, 'stack_step'), 'bad draft')
         np.testing.assert_allclose(page.axes.lines[1].get_ydata(), [2.25, 2.25 + 1/3, 3.25])
         self.assertEqual(session.base_cube.z.tobytes(), base_bytes)
         self.assertEqual(session.current_cube.z.tobytes(), current_bytes)
         with self.assertRaises(ValueError):
             w.save_project(self.folder / 'invalid.spectra')
+        # Processing publishes a heatmap graph; activate the drafted XY owner
+        # before testing its document-navigation guard.
+        self.assertIs(w.open_xy_comparison(graph.comparison_id), page)
         with self.assertRaises(ValueError):
             w.open_workbook(w._sheet_owner(sheet.sheet_id).workbook_id)
         self.assertFalse(w.graph_documents.close_document())
-        page.stack_step_edit.setText('2')
+        set_xy_draft(page, 'stack_step', '2')
         page.finish_editor()
         # Use the real batch append boundary; display settings and insertion ordinal survive.
         w.compare_sheets({sheet.sheet_id: (0, [2], 'raw')}, graph.comparison_id)
@@ -430,7 +441,8 @@ class ComparisonDisplayLifecycleTests(unittest.TestCase):
         self.assertEqual(processed.y_offset, .25)
         saved = w.save_project(self.folder / 'display.spectra')
         path.unlink()
-        self.assertTrue(w.open_project(saved))
+        with patch('spectra_app.main_window.prompt_message', side_effect=AssertionError('Clean saved project unexpectedly requested discard')):
+            self.assertTrue(w.open_project(saved))
         reopened = w.open_xy_comparison(graph.comparison_id)
         self.assertEqual(reopened.comparison.stack_step, 2)
         np.testing.assert_allclose(reopened.axes.lines[1].get_ydata(), [2.25, 2.25 + 1/3, 3.25])

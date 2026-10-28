@@ -6,45 +6,127 @@ import shutil
 import sys
 import tempfile
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QVBoxLayout
+from PySide6.QtCore import QObject, Property, QEvent, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QFont, QGuiApplication
+from PySide6.QtQuick import QQuickView
 
 from .app_version import APP_VERSION, UPDATE_REPOSITORY
 from .background_jobs import BackgroundJobs
 from .updates import ReleaseClient, launch_installer
 
 
-class UpdateDialog(QDialog):
+class UpdatePresentation(QObject):
+    """Update state and user intent; rendered controls belong only to QML."""
+    stateChanged = Signal()
+    applicationFontChanged = Signal()
+    checkRequested = Signal()
+    downloadRequested = Signal()
+    installRequested = Signal()
+    closeRequested = Signal()
+
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle('Spectra Analyzer Updates')
+        self._status = 'Checking for updates…'
+        self._notes = ''
+        self._busy = False
+        self._release_available = self._installer_verified = False
+        self._source_mode = not bool(getattr(sys, 'frozen', False))
+        QGuiApplication.instance().fontChanged.connect(self.applicationFontChanged)
+
+    applicationFont = Property(QFont, lambda self: QGuiApplication.font(), notify=applicationFontChanged)
+    currentVersion = Property(str, lambda self: APP_VERSION, constant=True)
+    sourceMode = Property(bool, lambda self: self._source_mode, constant=True)
+    statusText = Property(str, lambda self: self._status, notify=stateChanged)
+    releaseNotes = Property(str, lambda self: self._notes, notify=stateChanged)
+    busy = Property(bool, lambda self: self._busy, notify=stateChanged)
+    canCheck = Property(bool, lambda self: not self._busy, notify=stateChanged)
+    canDownload = Property(bool, lambda self: not self._busy and self._release_available
+                           and not self._installer_verified, notify=stateChanged)
+    canInstall = Property(bool, lambda self: not self._busy and self._installer_verified
+                          and not self._source_mode, notify=stateChanged)
+
+    def set_status(self, text):
+        self._status = str(text)
+        self.stateChanged.emit()
+
+    def set_notes(self, text):
+        self._notes = str(text)
+        self.stateChanged.emit()
+
+    def set_actions(self, *, busy, release_available, installer_verified):
+        self._busy = bool(busy)
+        self._release_available = bool(release_available)
+        self._installer_verified = bool(installer_verified)
+        self.stateChanged.emit()
+
+    @Slot()
+    def checkUpdates(self):
+        if self.canCheck:
+            self.checkRequested.emit()
+
+    @Slot()
+    def downloadUpdate(self):
+        if self.canDownload:
+            self.downloadRequested.emit()
+
+    @Slot()
+    def installUpdate(self):
+        if self.canInstall:
+            self.installRequested.emit()
+
+    @Slot()
+    def dismiss(self):
+        self.closeRequested.emit()
+
+
+class UpdateDialog(QQuickView):
+    """Reusable nonmodal window; dismissal never destroys an owned worker."""
+    rejected = Signal()
+
+    def __init__(self, parent):
+        super().__init__()
+        self.setTitle('Spectra Analyzer Updates')
+        self.setResizeMode(QQuickView.SizeRootObjectToView)
+        self.setMinimumSize(QSize(340, 360))
+        self.setModality(Qt.NonModal)
+        self.installEventFilter(self)
+        owner = parent.window() if hasattr(parent, 'window') else parent
+        if owner is not None:
+            if hasattr(owner, 'winId'):
+                owner.winId()
+            handle = owner.windowHandle() if hasattr(owner, 'windowHandle') else owner
+            if handle is not None:
+                self.setTransientParent(handle)
+        self.bridge = UpdatePresentation(self)
+        self.bridge.closeRequested.connect(self.reject)
+        self.setInitialProperties({'bridge': self.bridge})
+        self.setSource(QUrl.fromLocalFile(str(Path(__file__).with_name('qml') / 'UpdateWindow.qml')))
+        if self.status() == QQuickView.Error:
+            errors = '\n'.join(error.toString() for error in self.errors())
+            self.deleteLater()
+            raise RuntimeError('Cannot load update window: ' + errors)
         self.resize(560, 390)
-        layout = QVBoxLayout(self)
-        self.current_version = QLabel(f'Current version: {APP_VERSION}')
-        layout.addWidget(self.current_version)
-        self.status = QLabel('Checking for updates…')
-        self.status.setTextFormat(Qt.PlainText)
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        self.notes = QPlainTextEdit()
-        self.notes.setReadOnly(True)
-        self.notes.setPlaceholderText('Release notes appear here when an update is available.')
-        layout.addWidget(self.notes)
-        if not getattr(sys, 'frozen', False):
-            source_notice = QLabel('You are running from source. Install application updates from the installed Windows app.')
-            source_notice.setWordWrap(True)
-            layout.addWidget(source_notice)
-        buttons = QHBoxLayout()
-        self.check_button = QPushButton('Check again')
-        self.download_button = QPushButton('Download update')
-        self.install_button = QPushButton('Close app and install')
-        self.close_button = QPushButton('Close')
-        for button in (self.check_button, self.download_button, self.install_button, self.close_button):
-            buttons.addWidget(button)
-        layout.addLayout(buttons)
-        self.download_button.setEnabled(False)
-        self.install_button.setEnabled(False)
-        self.close_button.clicked.connect(self.reject)
+
+    def show(self):
+        super().show()
+        self.requestActivate()
+        self.rootObject().forceActiveFocus()
+
+    @Slot()
+    def reject(self):
+        if self.isVisible():
+            self.hide()
+            self.rejected.emit()
+
+    def eventFilter(self, watched, event):
+        if watched is self and event.type() == QEvent.Close:
+            self.reject()
+            event.accept()
+            return True
+        if watched is self and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+            self.reject()
+            return True
+        return False
 
 
 class UpdateController(QObject):
@@ -73,27 +155,25 @@ class UpdateController(QObject):
     def open(self):
         if self.dialog is None:
             self.dialog = UpdateDialog(self.parent())
-            self.dialog.check_button.clicked.connect(self.check)
-            self.dialog.download_button.clicked.connect(self.download)
-            self.dialog.install_button.clicked.connect(self.request_install)
+            self.destroyed.connect(self.dialog.deleteLater)
+            self.dialog.bridge.checkRequested.connect(self.check)
+            self.dialog.bridge.downloadRequested.connect(self.download)
+            self.dialog.bridge.installRequested.connect(self.request_install)
             self.dialog.rejected.connect(self.cancel)
         if self.dialog.isVisible():
             self.dialog.raise_()
-            self.dialog.activateWindow()
+            self.dialog.requestActivate()
             return
         self.dialog.show()
         if not self.busy:
             self.check()
 
     def _status(self, text):
-        self.dialog.status.setText(str(text))
+        self.dialog.bridge.set_status(text)
 
     def _set_busy(self, value):
-        self.dialog.check_button.setEnabled(not value)
-        self.dialog.download_button.setEnabled(not value and self.release is not None and self.installer is None)
-        self.dialog.install_button.setEnabled(not value and self.installer is not None
-                                               and bool(getattr(sys, 'frozen', False)))
-        self.dialog.close_button.setText('Cancel' if value else 'Close')
+        self.dialog.bridge.set_actions(busy=value, release_available=self.release is not None,
+                                       installer_verified=self.installer is not None)
 
     def check(self):
         if self.busy:
@@ -103,7 +183,7 @@ class UpdateController(QObject):
         self._armed = None
         self.release = self.installer = None
         self._cleanup()
-        self.dialog.notes.clear()
+        self.dialog.bridge.set_notes('')
         self._set_busy(True)
         self.jobs.start(lambda context: self.client.check(APP_VERSION, context), self._checked,
                         on_error=self._error, on_progress=self._status)
@@ -114,7 +194,7 @@ class UpdateController(QObject):
             self._status(f'Spectra Analyzer {APP_VERSION} is up to date.')
         else:
             self._status(f'Version {release.version} is available. Download it to review and install.')
-            self.dialog.notes.setPlainText(release.notes)
+            self.dialog.bridge.set_notes(release.notes)
 
     def download(self):
         if self.busy or self.release is None:

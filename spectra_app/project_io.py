@@ -27,7 +27,7 @@ import numpy as np
 
 from .dat_io import AXIS_OVERRIDE_ITEMS, DataCube
 from .dataset_state import (AnalysisControls, BOUND_NAMES, DatasetSession, FixedRecipe,
-                            GraphState, ProcessingState, ViewState, Workspace, validate_graph_source)
+                            GraphState, ProcessingResult, ProcessingState, ViewState, Workspace, validate_graph_source)
 from .fitting import FitResult
 from .plot_presentation import NormSpec, PlotPresentation
 from .title_templates import validate_title_settings
@@ -37,7 +37,7 @@ from .workbook_state import (Comparison, Curve, Sheet, Workbook, decode_document
                              validate_mapping, _validate_sheet_source)
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 MAX_MEMBERS = 65_536
 MAX_MANIFEST_BYTES = 16 * 1024**2
 MAX_MEMBER_BYTES = 1024**3
@@ -99,7 +99,10 @@ _SHEET_FIELDS = _V5_SHEET_FIELDS + ('role', 'fit_gate_idx', 'text_columns', 'sna
 _V4_CURVE_FIELDS = ('curve_id', 'sheet_id', 'x_column', 'y_column', 'mode', 'label', 'visible', 'color', 'width')
 _V4_COMPARISON_FIELDS = ('comparison_id', 'name', 'x_label', 'y_label', 'legend_visible', 'curves')
 _V6_CURVE_FIELDS = _V4_CURVE_FIELDS + ('y_offset',)
-_CURVE_FIELDS = _V6_CURVE_FIELDS + ('style',)
+_V7_CURVE_FIELDS = _V6_CURVE_FIELDS + ('style',)
+_MARKER_FIELDS = ('marker_shape', 'marker_size', 'marker_fill', 'marker_edge_color', 'marker_edge_width')
+_LEGACY_MARKER_VALUES = ('o', 4.0, 'full', 'auto', 1.0)
+_CURVE_FIELDS = _V7_CURVE_FIELDS + _MARKER_FIELDS
 _V6_COMPARISON_FIELDS = _V4_COMPARISON_FIELDS[:-1] + ('normalization', 'stack_step', 'x_range_mode', 'x_range', 'curves')
 _COMPARISON_FIELDS = _V6_COMPARISON_FIELDS[:-1] + ('plot_title', 'curves')
 
@@ -463,18 +466,25 @@ def _encode_session(session, arrays, *, analysis_science=False):
         _fail('Graph collection keys must match graph IDs.')
     if analysis_science and any(graph.analysis is not None for graph in session.graphs.values()):
         _fail('Nested analysis science cannot contain analysis graphs.')
+    if not isinstance(session.processing_results, dict) or any(
+            not isinstance(item, ProcessingResult) or key != item.result_id
+            for key, item in session.processing_results.items()):
+        _fail('Processing result collection keys must match result IDs.')
     same = session.current_cube is session.base_cube
+    current_result = next((key for key, result in session.processing_results.items()
+                           if result.cube is session.current_cube), None)
     result = _fields(session, ('dataset_id', 'kind', 'loaded_fingerprint', 'peak_gate_idx',
                                'fit_gate_idx', 'csv_seeds_path', 'fit_export_rows',
                                'has_batch_fit_results', 'summary', 'initialization_notice'))
     result.update({
         'source_path': str(session.source_path) if session.source_path is not None else None,
         'base_cube': _encode_cube(session.base_cube, arrays), 'current_is_base': same,
-        'current_cube': None if same else _encode_cube(session.current_cube, arrays),
+        'current_cube': None if same or current_result is not None else _encode_cube(session.current_cube, arrays),
         'graphs': [{'graph_id': graph_id, 'name': graph.name, 'view': _encode_view(graph.view),
                     'source_mode': graph.source_mode, 'gate_indices': _plain(graph.gate_indices),
                     'published': graph.published,
                     'presentation': graph.presentation.to_dict(),
+                    **({'result_id': graph.result_id} if graph.result_id is not None else {}),
                     **({'analysis': _encode_analysis(graph.analysis, arrays)} if graph.analysis is not None else {})}
                    for graph_id, graph in session.graphs.items()],
         'active_graph_id': session.active_graph_id,
@@ -497,6 +507,14 @@ def _encode_session(session, arrays, *, analysis_science=False):
         'batch_fit_result_map': [{'gate': _plain(key), 'result': _encode_fit(value, arrays)}
                                  for key, value in sorted(session.batch_fit_result_map.items())],
     })
+    if session.processing_results:
+        if analysis_science:
+            _fail('Bound analysis science cannot own processing results.')
+        result['processing_results'] = [
+            {'result_id': key, 'cube': _encode_cube(item.cube, arrays),
+             'processing': _fields(item.processing, _PROCESSING_FIELDS)}
+            for key, item in session.processing_results.items()]
+        result['current_result_id'] = current_result
     return result
 
 
@@ -678,7 +696,10 @@ def _decode_session(value, arrays, version=SCHEMA_VERSION, *, analysis_science=F
         value['graphs'] = [{'graph_id': 'default', 'name': 'Graph 1',
                             'view': value.pop('view'), 'presentation': value.pop('presentation')}]
         value['active_graph_id'] = 'default'
-    value = _object(value, _SESSION_FIELDS, 'DatasetSession')
+    session_fields = _SESSION_FIELDS
+    if version >= 10 and isinstance(value, dict) and 'processing_results' in value:
+        session_fields += ('processing_results', 'current_result_id')
+    value = _object(value, session_fields, 'DatasetSession')
     graphs, names, analysis_records = {}, set(), {}
     for record in _list(value['graphs'], 'graphs'):
         fields = ('graph_id', 'name', 'view', 'presentation')
@@ -690,6 +711,8 @@ def _decode_session(value, arrays, version=SCHEMA_VERSION, *, analysis_science=F
             if analysis_science:
                 _fail('Nested analysis science cannot contain analysis graphs.')
             fields += ('analysis',)
+        if version >= 10 and isinstance(record, dict) and 'result_id' in record:
+            fields += ('result_id',)
         record = _object(record, fields, 'GraphState')
         graph_id = _string(record['graph_id'], 'graph ID', nonempty=True)
         name = _string(record['name'], 'graph name', nonempty=True)
@@ -700,6 +723,10 @@ def _decode_session(value, arrays, version=SCHEMA_VERSION, *, analysis_science=F
                                       record.get('source_mode', 'processed'), record.get('gate_indices'),
                                       _boolean(record['published'], 'graph publication') if version >= 8 else True)
         names.add(name)
+        if 'result_id' in record:
+            graphs[graph_id].result_id = _string(record['result_id'], 'graph processing result', nonempty=True)
+            if graphs[graph_id].source_mode != 'processed' or 'analysis' in record:
+                _fail('Only an ordinary processed graph can bind a processing result.')
         if 'analysis' in record:
             analysis_records[graph_id] = record['analysis']
     active_graph_id = _string(value['active_graph_id'], 'active graph ID', nonempty=True)
@@ -708,27 +735,48 @@ def _decode_session(value, arrays, version=SCHEMA_VERSION, *, analysis_science=F
     source = Path(_string(value['source_path'], 'dataset source path', nonempty=True))
     dataset_id = _string(value['dataset_id'], 'dataset ID', nonempty=True)
     base = _decode_cube(value['base_cube'], arrays)
+    results = {}
+    for record in _list(value.get('processing_results', []), 'processing results'):
+        record = _object(record, ('result_id', 'cube', 'processing'), 'processing result')
+        identity = _string(record['result_id'], 'processing result ID', nonempty=True)
+        if identity in results or analysis_science:
+            _fail('Processing results require unique IDs and an ordinary dataset owner.')
+        processing = _decode_processing(record['processing'])
+        if processing.mode != 'energy_second_derivative':
+            _fail('Retained processing results require an applied derivative recipe.')
+        results[identity] = ProcessingResult(identity, _decode_cube(record['cube'], arrays), processing)
+    current_result = value.get('current_result_id')
+    if current_result is not None:
+        current_result = _string(current_result, 'current processing result', nonempty=True)
+        if current_result not in results or value['current_cube'] is not None:
+            _fail('Current processing result must reference one retained cube.')
     same = _boolean(value['current_is_base'], 'cube alias')
     if same and value['current_cube'] is not None:
         _fail('Aliased current cube must use the base cube reference.')
-    current = base if same else _decode_cube(value['current_cube'], arrays)
-    for cube in (base, current):
+    if same and current_result is not None:
+        _fail('The base cube cannot alias a processing result.')
+    current = base if same else results[current_result].cube if current_result is not None else _decode_cube(value['current_cube'], arrays)
+    for cube in (base, current, *(result.cube for result in results.values())):
         if _path_key(cube.source_path) != _path_key(source):
             _fail('Cube provenance does not match its dataset owner.')
-    if not same:
+    for current_candidate in (current, *(result.cube for result in results.values())):
+        if current_candidate is base:
+            continue
         for name in _CUBE_ARRAYS:
             if name == 'z':
-                if base.z.shape != current.z.shape:
+                if base.z.shape != current_candidate.z.shape:
                     _fail('Base and current Z shapes disagree.')
                 continue
-            a, b = getattr(base, name), getattr(current, name)
+            a, b = getattr(base, name), getattr(current_candidate, name)
             if (a is None) != (b is None) or a is not None and not np.array_equal(a, b):
                 _fail('Base and current axes disagree.')
         for name in _CUBE_STRINGS + ('x_is_ambiguous', 'x_override'):
-            if getattr(base, name) != getattr(current, name):
+            if getattr(base, name) != getattr(current_candidate, name):
                 _fail('Base and current cube metadata disagree.')
     rows, columns = current.z.shape
     for graph in graphs.values():
+        if graph.result_id is not None and graph.result_id not in results:
+            _fail('Graph references a missing processing result.')
         if graph.graph_id in analysis_records:
             continue  # Validate display scope against this document's bound cube.
         try:
@@ -763,6 +811,11 @@ def _decode_session(value, arrays, version=SCHEMA_VERSION, *, analysis_science=F
         summary=_string(value['summary'], 'summary'),
         initialization_notice=_string(value['initialization_notice'], 'initialization notice'),
         sidecar_writes_enabled=False)
+    session.processing_results = results
+    if session.active_graph.result_id is not None and session.active_graph.result_id != current_result:
+        _fail('Active graph and current processing result disagree.')
+    if current_result is not None and session.applied != results[current_result].processing:
+        _fail('Current processing recipe and retained result disagree.')
     session.peak_kind_lookup = _decode_records(value['peak_kind_lookup'], ('energy', 'peak'),
                                                'peak kinds', ei, lambda item: _boolean(item['peak'], 'peak kind'))
     session.peak_label_lookup = _decode_records(value['peak_label_lookup'], ('gate', 'energy', 'label'),
@@ -812,10 +865,14 @@ def _decode_session(value, arrays, version=SCHEMA_VERSION, *, analysis_science=F
     return session
 
 
-def _encode_workbooks(workspace, arrays):
+def _encode_workbooks(workspace, arrays, version=SCHEMA_VERSION):
     sheets = []
     for sheet in workspace.sheets.values():
         record = _fields(sheet, tuple(name for name in _SHEET_FIELDS if name not in ('source_path', 'data')))
+        if sheet.result_id is not None:
+            record['result_id'] = sheet.result_id
+        if sheet.column_metadata:
+            record['column_metadata'] = {str(key): dict(fields) for key, fields in sheet.column_metadata.items()}
         record['source_path'] = None if sheet.source_path is None else str(sheet.source_path)
         record['data'] = None if sheet.data is None else arrays.add(sheet.data)
         record['text_columns'] = {str(key): values for key, values in sheet.text_columns.items()}
@@ -824,9 +881,12 @@ def _encode_workbooks(workspace, arrays):
         'workbooks': [_fields(book, _WORKBOOK_FIELDS) for book in workspace.workbooks.values()],
         'sheets': sheets,
         'comparisons': [{**_fields(comparison, _COMPARISON_FIELDS[:-1]),
-                         'curves': [_fields(curve, _CURVE_FIELDS) for curve in comparison.curves.values()],
+                         'curves': [_fields(curve, _CURVE_FIELDS if version >= 13 else _V7_CURVE_FIELDS)
+                                    for curve in comparison.curves.values()],
                          **({'analysis_state': _json_progress(comparison.analysis_state)}
-                            if getattr(comparison, 'analysis_state', None) is not None else {})}
+                            if getattr(comparison, 'analysis_state', None) is not None else {}),
+                         **({'presentation': comparison.presentation.to_dict()}
+                            if comparison.presentation is not None else {})}
                         for comparison in workspace.comparisons.values()]}
 
 
@@ -839,7 +899,12 @@ def _decode_workbooks(manifest, workspace, arrays, version):
         workspace.workbooks[key] = Workbook(key, _string(record['name'], 'workbook name', nonempty=True),
             [_string(key, 'Sheet member ID', nonempty=True) for key in _list(record['sheet_ids'], 'Sheet members')])
     for record in _list(manifest['sheets'], 'sheets'):
-        record = _object(record, _SHEET_FIELDS if version >= 6 else _V5_SHEET_FIELDS, 'Sheet')
+        sheet_fields = _SHEET_FIELDS if version >= 6 else _V5_SHEET_FIELDS
+        if version >= 10 and isinstance(record, dict) and 'result_id' in record:
+            sheet_fields += ('result_id',)
+        if version >= 11 and isinstance(record, dict) and 'column_metadata' in record:
+            sheet_fields += ('column_metadata',)
+        record = _object(record, sheet_fields, 'Sheet')
         key = _string(record['sheet_id'], 'Sheet ID', nonempty=True)
         if key in workspace.sheets:
             _fail('Sheet IDs must be unique.')
@@ -857,6 +922,16 @@ def _decode_workbooks(manifest, workspace, arrays, version):
             _enum(record['mode'], ('raw', 'processed'), 'Sheet mode'))
         if version >= 6:
             sheet = workspace.sheets[key]
+            if 'column_metadata' in record:
+                if not isinstance(record['column_metadata'], dict):
+                    _fail('Column metadata must be a mapping.')
+                for column, fields in record['column_metadata'].items():
+                    if (not isinstance(column, str) or not column.isascii() or not column.isdecimal()
+                            or str(int(column)) != column):
+                        _fail('Column metadata keys must be canonical nonnegative indices.')
+                    sheet.column_metadata[int(column)] = fields
+            if 'result_id' in record:
+                sheet.result_id = _string(record['result_id'], 'Sheet processing result', nonempty=True)
             sheet.role = _enum(record['role'], ('original', 'processed', 'fit_parameters', 'fit_curves', 'snapshot'), 'Sheet role')
             sheet.fit_gate_idx = None if record['fit_gate_idx'] is None else _integer(record['fit_gate_idx'], 'Fit Gate index')
             sheet.snapshot_note = _string(record['snapshot_note'], 'Snapshot provenance')
@@ -871,6 +946,8 @@ def _decode_workbooks(manifest, workspace, arrays, version):
                              _V6_COMPARISON_FIELDS if version >= 5 else _V4_COMPARISON_FIELDS)
         if version >= 9 and isinstance(record, dict) and 'analysis_state' in record:
             comparison_fields += ('analysis_state',)
+        if version >= 12 and isinstance(record, dict) and 'presentation' in record:
+            comparison_fields += ('presentation',)
         record = _object(record, comparison_fields, 'Comparison')
         key = _string(record['comparison_id'], 'comparison ID', nonempty=True)
         if key in workspace.comparisons:
@@ -879,6 +956,8 @@ def _decode_workbooks(manifest, workspace, arrays, version):
             _string(record['x_label'], 'X axis label'), _string(record['y_label'], 'Y axis label'),
             _boolean(record['legend_visible'], 'legend visibility'))
         comparison.plot_title = _string(record['plot_title'], 'Plot title') if version >= 7 else comparison.name
+        if 'presentation' in record:
+            comparison.presentation = _decode_presentation(record['presentation'])
         if 'analysis_state' in record:
             if not isinstance(record['analysis_state'], dict):
                 _fail('XY analysis progress requires an object.')
@@ -893,7 +972,7 @@ def _decode_workbooks(manifest, workspace, arrays, version):
                     _fail('X range requires two bounds.')
                 comparison.x_range = tuple(_number(value, 'X range bound') for value in bounds)
         for item in _list(record['curves'], 'curves'):
-            item = _object(item, _CURVE_FIELDS if version >= 7 else
+            item = _object(item, _CURVE_FIELDS if version >= 13 else _V7_CURVE_FIELDS if version >= 7 else
                            _V6_CURVE_FIELDS if version >= 5 else _V4_CURVE_FIELDS, 'Curve')
             curve_id = _string(item['curve_id'], 'curve ID', nonempty=True)
             if curve_id in comparison.curves:
@@ -904,7 +983,13 @@ def _decode_workbooks(manifest, workspace, arrays, version):
                 _boolean(item['visible'], 'curve visibility'), _string(item['color'], 'curve color'),
                 _number(item['width'], 'curve width'),
                 _number(item['y_offset'], 'curve Y offset') if version >= 5 else 0.0,
-                _enum(item['style'], ('line', 'scatter', 'line_symbol'), 'curve style') if version >= 7 else 'line')
+                _enum(item['style'], ('line', 'scatter', 'line_symbol'), 'curve style') if version >= 7 else 'line',
+                *(_LEGACY_MARKER_VALUES if version < 13 else (
+                    _string(item['marker_shape'], 'curve symbol shape'),
+                    _number(item['marker_size'], 'curve symbol size'),
+                    _string(item['marker_fill'], 'curve symbol fill'),
+                    _string(item['marker_edge_color'], 'curve symbol outline'),
+                    _number(item['marker_edge_width'], 'curve symbol outline width'))))
         workspace.comparisons[key] = comparison
     if version < 6:
         members = [key for book in workspace.workbooks.values() for key in book.sheet_ids]
@@ -1053,11 +1138,21 @@ def _snapshot(workspace):
                     'active_dataset_id': workspace.active_dataset_id,
                     'graph_workspace': workspace.graph_workspace,
                     'datasets': [_encode_session(session, arrays) for session in workspace.datasets.values()]}
-        manifest.update(_encode_workbooks(workspace, arrays))
-        # Preserve ordinary v8 output; use v9 only for its additional scientific
-        # records, keeping existing project/sidecar migration contracts stable.
-        if not _needs_analysis_schema(workspace):
+        # Existing projects retain their earlier format until new fields are used.
+        if any(tuple(getattr(curve, name) for name in _MARKER_FIELDS) != _LEGACY_MARKER_VALUES
+               for comparison in workspace.comparisons.values() for curve in comparison.curves.values()):
+            manifest['version'] = 13
+        elif any(comparison.presentation is not None for comparison in workspace.comparisons.values()):
+            manifest['version'] = 12
+        elif any(sheet.column_metadata for sheet in workspace.sheets.values()):
+            manifest['version'] = 11
+        elif any(session.processing_results for session in workspace.datasets.values()):
+            manifest['version'] = 10
+        elif not _needs_analysis_schema(workspace):
             manifest['version'] = 8
+        else:
+            manifest['version'] = 9
+        manifest.update(_encode_workbooks(workspace, arrays, manifest['version']))
         # Apply the same complete validation to saves and loads, before touching disk.
         encoded = _json_bytes(manifest)
         normalized = _decode_workspace(json.loads(encoded), arrays.arrays)
@@ -1067,7 +1162,7 @@ def _snapshot(workspace):
         canonical_arrays = _ArrayWriter(copy_arrays=False)
         manifest['datasets'] = [_encode_session(session, canonical_arrays)
                                 for session in normalized.datasets.values()]
-        manifest.update(_encode_workbooks(normalized, canonical_arrays))
+        manifest.update(_encode_workbooks(normalized, canonical_arrays, manifest['version']))
         manifest['graph_workspace'] = normalized.graph_workspace
         encoded = _json_bytes(manifest)
         if len(encoded) > MAX_MEMBER_BYTES:
@@ -1127,7 +1222,7 @@ def runtime_workspace_stamp(workspace: Workspace, cache: dict) -> str:
     stable = {}
     mutable = set()
     for session in workspace.datasets.values():
-        for cube in (session.base_cube, session.current_cube):
+        for cube in (session.base_cube, session.current_cube, *(result.cube for result in session.processing_results.values())):
             if cube is not None:
                 for name in _CUBE_ARRAYS:
                     array = getattr(cube, name)

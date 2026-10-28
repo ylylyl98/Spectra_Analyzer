@@ -6,32 +6,41 @@ from dataclasses import replace
 import unittest
 
 import numpy as np
-from PySide6.QtWidgets import QApplication
 
-from spectra_app.main_window import MainWindow
 from spectra_app.plot_presentation import ColorbarTicks
-from tests.settings_helpers import isolate_settings
+from tests import dat_properties_quick_helpers as dp
+from tests.formal_quick_helpers import item
+from tests.quick_migration_case import QuickMigrationCase
+from tests.quick_application_helpers import pump
 
 
-APP = QApplication.instance() or QApplication([])
-
-
-class AnalysisPlotStyleTests(unittest.TestCase):
+class AnalysisPlotStyleTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
+        super().setUp()
         self.paths = []
         for name in ('a', 'b'):
             path = self.folder / f'{name}.dat'
             path.write_text('Energy(eV) 0 1 2\n' + '\n'.join(
                 f'{1+i/10} {-i-1} {i+1} {10*(i+1)}' for i in range(12)), encoding='utf-8')
             self.paths.append(path)
-        self.window = MainWindow()
-        self.window._show_error = self.fail
+        self.window = self.controller
         self.window._load_dat_file_direct(self.paths[0])
+        self.window.request_outer_view('analysis')
+        self.window.dat_details_action.setChecked(True)
+        self.window.request_task(2)
+        pump()
 
     def tearDown(self):
-        self.window.close()
-        APP.processEvents()
+        self.assertEqual(self.quick_errors, [])
+
+    def formal_value(self, field, value):
+        bridge = self.window.plot_page.formal
+        source = item(self.window, 'formalProperties')
+        self.assertTrue(source.isVisible())
+        token = bridge.capturePropertiesInput(source)
+        self.assertTrue(token, 'Visible Analysis Properties must own this edit')
+        bridge.setValue(field, value, source, token)
+        self.assertEqual(bridge.state['fields'][field], value)
 
     def assert_frame_ratio(self, expected):
         w = self.window
@@ -91,7 +100,8 @@ class AnalysisPlotStyleTests(unittest.TestCase):
         self.assertTrue(all(artist.get_fontsize() == 13*factor for artist in text))
         self.assertEqual(session.presentation.numeric_pt, 9)
         self.assertEqual(session.presentation.text_pt, 13)
-        self.assertTrue(all(artist.get_fontfamily()[0] == 'DejaVu Serif' for artist in numeric + text))
+        self.assertEqual(session.presentation.font_family, 'Arial')
+        self.assertTrue(all(artist.get_fontfamily()[0] == 'Arial' for artist in numeric + text))
         self.assertEqual(w._heat_ax.xaxis.get_major_ticks()[0]._tickdir, 'out')
         self.assertEqual(len(w._heat_ax.xaxis.get_minorticklocs()), 0)
         # Spectrum clearing/gate navigation must retain the heatmap's interval.
@@ -104,10 +114,10 @@ class AnalysisPlotStyleTests(unittest.TestCase):
                             for spine in w._heat_ax.spines.values()))
         self.assertEqual(w._heat_ax.xaxis.get_major_ticks()[0].tick1line.get_markersize(), 0)
         literal = 'PL manual (a. u.)'
-        w.signal_title_combo.setCurrentText(literal)
-        w.plot_page.colorbar_unit.setChecked(False)
+        w.dat_properties.setLabel('signal_title', literal, w.dat_properties.ownerToken)
+        self.formal_value('bar_show_unit', False)
         self.assertEqual(w._heat_colorbar.ax.get_xlabel(), 'PL manual')
-        self.assertEqual(w.signal_title_combo.currentText(), literal)
+        self.assertEqual(dp.state(w)['signal_title'], literal)
 
     def test_dataset_switch_and_rebuild_restore_each_presentation(self):
         w = self.window
@@ -131,12 +141,12 @@ class AnalysisPlotStyleTests(unittest.TestCase):
         self.assertTrue(all(text.get_fontsize() == 8*factor for text in w._heat_ax.get_xticklabels()))
         w._plot_cube()
         self.assert_frame_ratio(2.)
-        self.assertTrue(all(text.get_fontfamily()[0] == 'DejaVu Serif' for text in w._heat_ax.get_yticklabels()))
+        self.assertTrue(all(text.get_fontfamily()[0] == 'Arial' for text in w._heat_ax.get_yticklabels()))
 
     def test_three_ticks_follow_mapping_and_custom_global_and_regional_settings(self):
         w = self.window
         for mapping in ('linear', 'log', 'symlog', 'zero-centered'):
-            w.mapping_combo.setCurrentIndex(w.mapping_combo.findData(mapping))
+            dp.set_choice(w, 'mapping', mapping)
             w.canvas.draw()
             norm = w._heat_mesh.norm
             expected = (norm.vmin, float(norm.inverse(.5)), norm.vmax)
@@ -146,9 +156,9 @@ class AnalysisPlotStyleTests(unittest.TestCase):
             w.set_plot_presentation(replace(p, colorbar=replace(p.colorbar, ticks={'global': ticks})))
             self.assert_bar_ticks(w._heat_colorbar, expected, ticks.labels)
             w.set_plot_presentation(replace(p, colorbar=replace(p.colorbar, ticks={})))
-        w.mapping_combo.setCurrentIndex(w.mapping_combo.findData('linear'))
+        dp.set_choice(w, 'mapping', 'linear')
         for mode in ('2', '3'):
-            w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData(mode))
+            dp.set_choice(w, 'color_scale', mode)
             custom = {}
             for index, bar in enumerate(w._heat_colorbars):
                 norm = bar.mappable.norm
@@ -162,7 +172,7 @@ class AnalysisPlotStyleTests(unittest.TestCase):
                 self.assert_bar_ticks(bar, ticks.values, ticks.labels)
                 factor = 96*w._analysis_display_scale()*w.canvas.device_pixel_ratio/w.figure.dpi
                 self.assertTrue(all(text.get_fontsize() == p.numeric_pt*factor for text in bar.ax.get_xticklabels()))
-            w.plot_page.colorbar_unit.setChecked(False)
+            self.formal_value('bar_show_unit', False)
             self.assertNotIn('arb. units', w._heat_signal_label.get_text())
             w.set_plot_presentation(replace(w.workspace.active.presentation,
                                            colorbar=replace(w.workspace.active.presentation.colorbar, show_label=False)))
@@ -175,15 +185,16 @@ class AnalysisPlotStyleTests(unittest.TestCase):
         p = w.workspace.active.presentation
         w.set_plot_presentation(replace(p, colorbar=replace(p.colorbar, ticks={'global': custom})))
         self.assert_bar_ticks(w._heat_colorbar, custom.values, custom.labels)
-        w.vmax_spin.setValue(float(norm.inverse(.75)))
+        dp.setup_number(w, 'vmax', float(norm.inverse(.75)))
         w.canvas.draw()
         current = w._heat_mesh.norm
         self.assert_bar_ticks(w._heat_colorbar, (current.vmin, float(current.inverse(.5)), current.vmax))
         self.assertEqual(w.workspace.active.presentation.colorbar.ticks['global'], custom)
         w._render_plot_page()
         self.assertIsNone(w.plot_page.rendered_page)
-        self.assertIn('tick values', w.plot_page.status_label.text())
-        self.assertFalse(w.plot_page.export_svg_btn.isEnabled())
+        self.assertIn('tick values', w.plot_page.status_text)
+        self.assertTrue(item(w, 'formal_status').property('visible'))
+        self.assertFalse(w.plot_page.command_enabled('export_svg'))
         gate = w.current_gate
         w._set_current_gate_from_value(0., update_plot=True)
         self.assertNotEqual(w.current_gate, gate)

@@ -1,4 +1,4 @@
-"""Read-only comparison windows over detached final formal-page bytes."""
+"""Read-only Qt Quick comparison windows over detached formal-page bytes."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -6,47 +6,104 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QRectF, QSignalBlocker, Qt
-from PySide6.QtGui import QPainter
+from PySide6.QtCore import (QByteArray, QEvent, QObject, Property, QRectF, QSize,
+                            Qt, QUrl, Signal, Slot)
+from PySide6.QtGui import QFont, QGuiApplication, QImage, QPainter, QWindow
+from PySide6.QtQuick import QQuickImageProvider, QQuickView
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QLabel,
-                               QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
+from .file_picker import FilePicker
 from .svg_export import RenderedPage, render_svg_image, write_svg, write_svg_png
 from .dataset_state import graph_export_stem
 
 
-class _ReadOnlySvgPreview(QWidget):
-    """Paint a fixed page without the formal editor's annotation interactions."""
+class _SnapshotImageProvider(QQuickImageProvider):
+    """Render the captured vectors at the actual requested device-pixel size."""
 
-    def __init__(self, page: RenderedPage, parent=None):
+    def __init__(self, svg_bytes: bytes):
+        super().__init__(QQuickImageProvider.Image)
+        self._svg_bytes = svg_bytes
+
+    def requestImage(self, image_id, size, requested_size):
+        renderer = QSvgRenderer(QByteArray(self._svg_bytes))
+        target = requested_size if requested_size.isValid() else renderer.defaultSize()
+        target = QSize(max(1, target.width()), max(1, target.height()))
+        image = QImage(target, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.white)
+        painter = QPainter(image)
+        renderer.render(painter, QRectF(0, 0, target.width(), target.height()))
+        painter.end()
+        if size is not None:
+            size.setWidth(target.width())
+            size.setHeight(target.height())
+        return image
+
+
+class ComparisonSnapshotBridge(QObject):
+    """Detached snapshot data and the commands consumed by the QML window."""
+
+    zoomChanged = Signal()
+    statusChanged = Signal()
+    applicationFontChanged = Signal()
+    exportRequested = Signal(str)
+    ZOOM_LEVELS = ('Fit', '100%', '150%', '200%')
+
+    def __init__(self, page: RenderedPage, source_label: str, metadata_json: str,
+                 png_dpi: int, parent=None):
         super().__init__(parent)
-        self._svg_bytes = page.svg_bytes
-        self._renderer = QSvgRenderer(self)
-        # Use the shared helper's offscreen font registration and SVG validation.
-        render_svg_image(page, dpi=72)
-        if not self._renderer.load(QByteArray(self._svg_bytes)):
-            raise ValueError('The captured SVG page could not be previewed.')
-        self.setFocusPolicy(Qt.NoFocus)
-        self.setAccessibleName('Read-only comparison snapshot canvas')
-        self.setToolTip('Captured formal page. Use display zoom to inspect this snapshot.')
+        QGuiApplication.instance().fontChanged.connect(self._application_font_changed)
+        self._page = page
+        self._zoom = 'Fit'
+        self._status = 'Read-only snapshot'
+        _, activation, science, view, presentation = page.owner_token[:5]
+        title = json.loads(metadata_json).get('plot_title', '')
+        self._source_text = (
+            f'Snapshot: {source_label}\n'
+            f'Version: activation {activation} · data {science} · view {view} · format {presentation}'
+            + (f'\nTitle: {title}' if title else ''))
+        width, height = page.figure_size_in
+        self._dimensions_text = (
+            f'Captured page: {width:g} × {height:g} in · '
+            f'PNG: {round(width * png_dpi)} × {round(height * png_dpi)} px @ {png_dpi} DPI')
 
-    @property
-    def svg_bytes(self) -> bytes:
-        return self._svg_bytes
+    sourceText = Property(str, lambda self: self._source_text, constant=True)
+    dimensionsText = Property(str, lambda self: self._dimensions_text, constant=True)
+    pageWidth = Property(float, lambda self: self._page.figure_size_in[0] * 96, constant=True)
+    pageHeight = Property(float, lambda self: self._page.figure_size_in[1] * 96, constant=True)
+    zoomLevels = Property('QStringList', lambda self: list(self.ZOOM_LEVELS), constant=True)
+    zoom = Property(str, lambda self: self._zoom, notify=zoomChanged)
+    statusText = Property(str, lambda self: self._status, notify=statusChanged)
+    applicationFont = Property(QFont, lambda self: QGuiApplication.font(), notify=applicationFontChanged)
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), Qt.white)
-        self._renderer.render(painter, QRectF(self.rect()))
+    @Slot(QFont)
+    def _application_font_changed(self, font):
+        self.applicationFontChanged.emit()
+
+    @Slot(str)
+    def setZoom(self, zoom: str):
+        if zoom not in self.ZOOM_LEVELS:
+            raise ValueError('Unknown comparison preview zoom.')
+        if self._zoom != zoom:
+            self._zoom = zoom
+            self.zoomChanged.emit()
+
+    @Slot(str)
+    def chooseExport(self, extension: str):
+        if extension not in ('svg', 'png'):
+            raise ValueError('Unknown comparison export format.')
+        self.exportRequested.emit(extension)
+
+    def _set_status(self, status: str):
+        if self._status != status:
+            self._status = status
+            self.statusChanged.emit()
 
 
-class PlotComparisonWindow(QWidget):
-    """A nonmodal snapshot with independent display zoom and captured exports.
+class PlotComparisonWindow(QQuickView):
+    """A real nonmodal QML window with captured exports and independent zoom.
 
-    ``metadata`` is the ordinary JSON-serializable source/settings dictionary,
-    saved intact in the PNG's ``SpectraAnalyzer`` text entry. No source session,
-    scientific arrays, or live rendering callbacks are retained by this window.
+    The SVG, dimensions, maps and JSON provenance are detached at construction.
+    The window retains no source session, scientific array or render callback.
     """
 
     def __init__(self, page: RenderedPage, *, source_label: str, metadata: dict,
@@ -63,103 +120,79 @@ class PlotComparisonWindow(QWidget):
             metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError('Snapshot metadata must be a JSON-serializable dictionary.') from exc
-        # RenderedPage is frozen, but its maps (and defensively borrowed byte
-        # buffers/dimension sequences) must not stay linked to the caller.
         captured = deepcopy(page)
         captured = replace(captured, svg_bytes=bytes(captured.svg_bytes),
                            figure_size_in=tuple(captured.figure_size_in),
                            owner_token=tuple(captured.owner_token))
-        super().__init__(parent, Qt.Window)
-        self.setAttribute(Qt.WA_DeleteOnClose)
-        self.setWindowModality(Qt.NonModal)
+        if QGuiApplication.instance() is None:
+            raise ValueError('SVG preview/PNG export requires a running Qt application.')
+        if QGuiApplication.platformName() == 'offscreen':
+            # Windows' offscreen plugin needs export's font registration.
+            render_svg_image(captured, dpi=72)
+        else:
+            # Preserve export's validation without painting the page twice.
+            # Qt will rasterize the SVG at its display resolution below.
+            pixels = tuple(round(value * 72) for value in captured.figure_size_in)
+            if min(pixels) < 1:
+                raise ValueError('PNG dimensions must be at least one pixel.')
+            if not QSvgRenderer(QByteArray(captured.svg_bytes)).isValid():
+                raise ValueError('QtSvg could not read the rendered SVG page.')
+            if QImage(*pixels, QImage.Format_ARGB32).isNull():
+                raise ValueError('Could not allocate the PNG/preview image.')
+        super().__init__()
+        if parent is not None:
+            # QObject ownership does not turn this top-level window into a child
+            # surface. QWidget and QWindow owners both retain native transience.
+            QObject.setParent(self, parent)
+            owner = parent.window() if hasattr(parent, 'window') else parent
+            if not isinstance(owner, QWindow):
+                owner.winId()
+                owner = owner.windowHandle()
+            if owner is not None:
+                self.setTransientParent(owner)
         self._page = captured
         self._source = source_label
         self._metadata_json = metadata_json
         self._png_dpi = png_dpi
         self._output_folder = Path(output_folder) if output_folder is not None else None
-        self._zoom = 'Fit'
-        self.setWindowTitle('Plot comparison — ' + Path(source_label).name)
+        self.bridge = ComparisonSnapshotBridge(captured, source_label, metadata_json, png_dpi, self)
+        self.bridge.exportRequested.connect(self._choose_export)
+        self.setTitle('Plot comparison — ' + Path(source_label).name)
+        self.setModality(Qt.NonModal)
+        self.setResizeMode(QQuickView.SizeRootObjectToView)
+        self.setMinimumSize(QSize(360, 420))
+        self.engine().addImageProvider('comparison-snapshot', _SnapshotImageProvider(captured.svg_bytes))
+        self.setInitialProperties({'bridge': self.bridge})
+        self.setSource(QUrl.fromLocalFile(str(Path(__file__).with_name('qml') / 'ComparisonSnapshot.qml')))
+        if self.status() == QQuickView.Error:
+            errors = '\n'.join(error.toString() for error in self.errors())
+            self.deleteLater()
+            raise RuntimeError('Cannot load comparison snapshot: ' + errors)
         self.resize(900, 650)
 
-        layout = QVBoxLayout(self)
-        self.source_label = QLabel()
-        self.source_label.setTextFormat(Qt.PlainText)
-        self.source_label.setWordWrap(True)
-        self.source_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.source_label.setAccessibleName('Captured source, title and version')
-        _, activation, science, view, presentation = self._page.owner_token[:5]
-        title = json.loads(metadata_json).get('plot_title', '')
-        self.source_label.setText(
-            f'Snapshot: {source_label}\n'
-            f'Version: activation {activation} · data {science} · view {view} · format {presentation}'
-            + (f'\nTitle: {title}' if title else ''))
-        layout.addWidget(self.source_label)
-
-        actions = QHBoxLayout()
-        actions.addWidget(QLabel('Display:'))
-        self.zoom_combo = QComboBox()
-        self.zoom_combo.addItems(['Fit', '100%', '150%', '200%'])
-        self.zoom_combo.setAccessibleName('Comparison display zoom')
-        self.zoom_combo.currentTextChanged.connect(self.set_zoom)
-        actions.addWidget(self.zoom_combo)
-        actions.addStretch()
-        self.export_svg_btn = QPushButton('Export SVG')
-        self.export_png_btn = QPushButton('Export PNG')
-        self.export_svg_btn.clicked.connect(lambda checked=False: self._choose_export('svg'))
-        self.export_png_btn.clicked.connect(lambda checked=False: self._choose_export('png'))
-        actions.addWidget(self.export_svg_btn)
-        actions.addWidget(self.export_png_btn)
-        layout.addLayout(actions)
-
-        width, height = self._page.figure_size_in
-        self.dimensions_label = QLabel(
-            f'Captured page: {width:g} × {height:g} in · '
-            f'PNG: {round(width * png_dpi)} × {round(height * png_dpi)} px @ {png_dpi} DPI')
-        self.dimensions_label.setWordWrap(True)
-        self.dimensions_label.setAccessibleName('Comparison export dimensions')
-        layout.addWidget(self.dimensions_label)
-        self.preview_scroll = QScrollArea()
-        self.preview_scroll.setAlignment(Qt.AlignCenter)
-        self.preview = _ReadOnlySvgPreview(self._page)
-        self.preview_scroll.setWidget(self.preview)
-        layout.addWidget(self.preview_scroll, 1)
-        self.status_label = QLabel('Read-only snapshot')
-        self.status_label.setTextFormat(Qt.PlainText)
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-        self.preview_scroll.viewport().installEventFilter(self)
-        self._resize_preview()
+    @property
+    def svg_bytes(self) -> bytes:
+        """The immutable bytes shown by this capture and written by SVG export."""
+        return self._page.svg_bytes
 
     def set_zoom(self, zoom: str):
-        """Change only this window's display size, never its physical page."""
-        if zoom not in ('Fit', '100%', '150%', '200%'):
-            raise ValueError('Unknown comparison preview zoom.')
-        self._zoom = zoom
-        with QSignalBlocker(self.zoom_combo):
-            self.zoom_combo.setCurrentText(zoom)
-        self._resize_preview()
+        """Change display scale without changing physical page/export geometry."""
+        self.bridge.setZoom(zoom)
 
-    def _resize_preview(self):
-        width, height = (value * 96 for value in self._page.figure_size_in)
-        if self._zoom == 'Fit':
-            viewport = self.preview_scroll.viewport().size()
-            scale = min(max(1, viewport.width() - 12) / width,
-                        max(1, viewport.height() - 12) / height)
-        else:
-            scale = int(self._zoom.rstrip('%')) / 100
-        self.preview.setFixedSize(max(1, round(width * scale)), max(1, round(height * scale)))
-
-    def eventFilter(self, watched, event):
-        if watched is self.preview_scroll.viewport() and event.type() == QEvent.Resize:
-            self._resize_preview()
-        return super().eventFilter(watched, event)
+    def event(self, event):
+        result = super().event(event)
+        if event.type() == QEvent.Close and event.isAccepted():
+            # QWindow has no WA_DeleteOnClose; preserve the snapshot lifetime
+            # contract and MainWindow's destroyed-driven list cleanup explicitly.
+            self.deleteLater()
+        return result
 
     def export_svg(self, path: str | Path) -> Path:
         """Write the exact captured SVG bytes, preserving existing outputs."""
         return write_svg(self._page, path)
 
     def export_png(self, path: str | Path) -> Path:
-        """Rasterize this capture at its creation DPI with detached provenance."""
+        """Rasterize at creation DPI with the detached capture provenance."""
         return write_svg_png(self._page, path, dpi=self._png_dpi, metadata={
             'SpectraAnalyzer': self._metadata_json,
             'Source': self._source,
@@ -167,24 +200,32 @@ class PlotComparisonWindow(QWidget):
             'PageDigest': self._page.digest,
         })
 
-    def _choose_export(self, extension: str):
+    def _default_export_path(self, extension: str) -> Path:
         metadata = json.loads(self._metadata_json)
         source = metadata.get('source_path')
         source = Path(source) if isinstance(source, str) and source else Path(self._source)
         stem = (graph_export_stem(source.stem, metadata['graph_id'], metadata['graph_name'])
                 if 'graph_id' in metadata and 'graph_name' in metadata else source.stem)
-        default = (self._output_folder or source.parent) / (stem + '_comparison.' + extension)
-        path, _ = QFileDialog.getSaveFileName(
+        return (self._output_folder or source.parent) / (stem + '_comparison.' + extension)
+
+    def _select_export_path(self, extension: str, default: Path) -> str:
+        """Select an export with this actual Quick window as modal owner."""
+        path, _ = FilePicker.getSaveFileName(
             self, f'Export comparison {extension.upper()}', str(default),
-            f'{extension.upper()} files (*.{extension})')
+            f'{extension.upper()} files (*.{extension})', default_suffix=extension)
+        return path
+
+    @Slot(str)
+    def _choose_export(self, extension: str):
+        path = self._select_export_path(extension, self._default_export_path(extension))
         if not path:
             return
         try:
             saved = self.export_svg(path) if extension == 'svg' else self.export_png(path)
         except (OSError, ValueError) as exc:
-            self.status_label.setText(f'Failed to export {extension.upper()}: {exc}')
+            self.bridge._set_status(f'Failed to export {extension.upper()}: {exc}')
         else:
-            self.status_label.setText(f'Exported {extension.upper()}: {saved}')
+            self.bridge._set_status(f'Exported {extension.upper()}: {saved}')
 
 
 __all__ = ['PlotComparisonWindow']

@@ -1,4 +1,4 @@
-"""Native quick commands and persisted plot semantics, without source mutation."""
+"""Quick input commands and persisted plot semantics, without source mutation."""
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import copy
@@ -10,11 +10,10 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 import numpy as np
-from PySide6.QtCore import Qt, QPoint, QEvent, QItemSelectionModel
+from PySide6.QtCore import QObject, Qt
+from PySide6.QtGui import QFontMetricsF
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QAbstractButton, QApplication
 
-from spectra_app.main_window import MainWindow
 from spectra_app.plot_snapshot import snapshot_dataset
 from spectra_app.project_io import read_project, write_project, ProjectFormatError
 from spectra_app.plot_state import validate_plot_collection, PlotStateStore
@@ -22,63 +21,103 @@ from spectra_app.dataset_state import initialize_dataset
 from spectra_app.dat_io import load_dat_cube
 from PIL import Image
 from spectra_app.workbook_state import ensure_dataset_sheet
-from tests.settings_helpers import isolate_settings
+from tests.quick_migration_case import QuickMigrationCase
 
-APP = QApplication.instance() or QApplication([])
+from tests.xy_helpers import set_xy_draft, xy_field
+from tests.workbook_quick_helpers import (click_header, click_item, context_action, drag_header,
+    host_for, item, point_in, pump, set_metadata_draft, table_key, header_point, reveal_column)
+
+from tests.xy_canvas_quick_helpers import command as xy_command
+from tests.formal_quick_helpers import input_receiver
 
 
-class QuickPlotTests(unittest.TestCase):
+class QuickPlotTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.w = MainWindow()
-        self.errors = []
-        self.w._show_error = self.errors.append
-        self.w.resize(1500, 920)
-        self.w.show()
-        APP.processEvents()
+        super().setUp()
+        self.w = self.controller
+        self.errors = self.quick_errors
+        self.host.window.resize(1500, 920)
+        pump()
         self.addCleanup(self.dispose)
 
     def dispose(self):
-        self.w.close()
-        self.w.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
         self.assertEqual(self.errors, [])
 
     def xy(self):
         path = self.folder / 'curves.csv'
         path.write_text('x,a,b,c\n0,1,3,7\n1,2,4,8\n2,3,5,9\n')
         book = self.w.import_xy_files([path])
-        page = self.w.open_workbook(book.workbook_id).tabs.currentWidget()
-        APP.processEvents()
+        page = self.w.open_workbook(book.workbook_id).current_sheet
+        pump()
         return book, page
 
     def select(self, page, columns):
-        header = page.table.horizontalHeader()
         for i, column in enumerate(columns):
-            QTest.mouseClick(header.viewport(), Qt.LeftButton,
-                             Qt.ControlModifier if i else Qt.NoModifier,
-                             QPoint(header.sectionViewportPosition(column) + 12, header.height() // 2))
-        APP.processEvents()
+            click_header(page, column, Qt.ControlModifier if i else Qt.NoModifier)
+
+    def context_plot(self, page, style):
+        host = host_for(page)
+        reveal_column(page, 1)
+        QTest.mouseClick(self.host.window, Qt.RightButton, pos=header_point(page, 1))
+        pump()
+        root = self.w.graph_documents.content_item(('workbook', host.workbook_id, ''))
+        menu = root.findChild(QObject, 'sheetContextMenu')
+        self.assertIsNotNone(menu)
+        self.assertTrue(menu.property('opened'))
+        control = item(menu.property('contentItem'), 'sheetContextPlot_' + style)
+        self.assertTrue(control.isVisible())
+        self.assertTrue(control.isEnabled())
+        point = control.mapToScene(control.boundingRect().center()).toPoint()
+        QTest.mouseClick(input_receiver(self.w, control), Qt.LeftButton, pos=point)
+        pump()
+
+    def test_sheet_label_draft_marks_dirty_and_ctrl_s_saves_active_editor(self):
+        book, page = self.xy()
+        path = self.w.save_project(self.folder / 'metadata.spectra')
+        page.editMetadata(1, 'long_name')
+        set_metadata_draft(page, 'Emission')
+        workbook = self.w.graph_documents.document_for(('workbook', book.workbook_id, ''))
+        self.assertTrue(workbook.has_pending_project_edits())
+        self.w._refresh_project_modified()
+        self.assertTrue(self.w.projectModified)
+        QTest.keyClick(self.host.window, Qt.Key_S, Qt.ControlModifier)
+        for _ in range(500):
+            if not self.w._project_io_jobs.busy:
+                break
+            pump(10)
+        self.assertFalse(self.w._project_io_jobs.busy)
+        pump()
+        self.assertEqual(page.editorColumn, -1)
+        restored = read_project(path)
+        self.assertEqual(restored.sheets[page.sheet_id].column_metadata[1]['long_name'], 'Emission')
+        self.assertFalse(self.w.projectModified)
 
     def test_native_header_and_commands_create_distinct_artists_without_row_slicing(self):
         book, page = self.xy()
         source = self.w.workspace.sheets[page.sheet_id].data.copy()
-        self.assertTrue(hasattr(self.w, 'workbook_commands'), 'Workbook needs the shared icon command row')
-        commands = self.w.workbook_commands
-        self.assertFalse(commands.heatmap_btn.isEnabled())
-        self.assertIn('DAT', commands.heatmap_btn.toolTip())
+        self.assertTrue(hasattr(self.w, 'workbook_commands'), 'Workbook needs the shared Quick command row')
+        commands = self.w
+        self.assertFalse(item(commands, 'workbookHeatmap').isEnabled())
+        heatmap_tip = next(child for child in item(commands, 'workbookHeatmap').children()
+                           if child.metaObject().className() == 'QQuickToolTipAttached')
+        self.assertIn('DAT', heatmap_tip.property('text'))
         for style, line, marker in [('line', '-', 'None'), ('scatter', 'None', 'o'), ('line_symbol', '-', 'o')]:
             self.w.open_workbook(book.workbook_id)
             self.select(page, [1, 3])
             self.assertEqual(self.w.workspace.sheets[page.sheet_id].y_columns, [1, 3])
-            self.assertTrue(commands.source_label.isVisible())
-            self.assertGreaterEqual(commands.source_label.width(), commands.source_label.fontMetrics().horizontalAdvance('2 Y'))
+            source_label = item(commands, 'workbookSourceContext')
+            self.assertTrue(source_label.isVisible())
+            self.assertIn('2 Y', source_label.property('text'))
+            self.assertGreaterEqual(source_label.width(),
+                                    QFontMetricsF(source_label.property('font')).horizontalAdvance('2 Y'))
             # Copy-only row selection must not become a plot row slice.
-            page.table.selectRow(1)
-            self.assertFalse(commands.style_buttons[style].icon().isNull())
-            QTest.mouseClick(commands.style_buttons[style], Qt.LeftButton)
-            graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+            page.selectRow(1)
+            control = item(commands, 'workbookPlot_' + style)
+            self.assertTrue(control.isVisible())
+            self.assertEqual(control.property('text'),
+                             {'line': 'Line', 'scatter': 'Scatter', 'line_symbol': 'Line+Symbol'}[style])
+            click_item(commands, 'workbookPlot_' + style)
+            graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
             self.assertEqual(len(graph.axes.lines), 2)
             for artist in graph.axes.lines:
                 self.assertEqual((artist.get_linestyle(), artist.get_marker()), (line, marker))
@@ -93,25 +132,68 @@ class QuickPlotTests(unittest.TestCase):
         session = self.w.workspace.active
         sheet = ensure_dataset_sheet(self.w.workspace, session.dataset_id)
         book = self.w._sheet_owner(sheet.sheet_id)
-        page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).tabs.currentWidget()
-        APP.processEvents()
+        page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).current_sheet
+        pump()
         self.assertEqual(sheet.y_columns, [1, 2, 3, 4])
-        header = page.table.horizontalHeader()
-        start = QPoint(header.sectionViewportPosition(0) + 12, header.height() // 2)
-        end = QPoint(header.sectionViewportPosition(1) + 12, header.height() // 2)
-        QTest.mousePress(header.viewport(), Qt.LeftButton, Qt.NoModifier, start)
-        QTest.mouseMove(header.viewport(), end)
-        QTest.mouseRelease(header.viewport(), Qt.LeftButton, Qt.NoModifier, end)
-        APP.processEvents()
-        self.assertEqual(sorted(i.column() for i in page.table.selectionModel().selectedColumns()), [0, 1])
-        QTest.mouseClick(self.w.workbook_commands.style_buttons['line'], Qt.LeftButton)
-        graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        drag_header(page, 0, 1)
+        self.assertEqual(sorted(i.column() for i in page.selection_model.selectedColumns()), [0, 1])
+        click_item(self.w, 'workbookPlot_line')
+        graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         self.assertEqual([curve.y_column for curve in graph.comparison.curves.values()], [1])
         self.assertEqual(sheet.y_columns, [1])
         self.assertEqual(self.w._current_gate_index(), 0)
         self.assertEqual(len(graph.axes.lines), 1)
         np.testing.assert_array_equal(graph.axes.lines[0].get_xdata(), session.base_cube.energy)
         np.testing.assert_array_equal(graph.axes.lines[0].get_ydata(), session.base_cube.z[0])
+
+    def test_dat_header_gate_requests_are_once_per_change_and_reactivate_after_navigation(self):
+        path = self.folder / 'header-gates.dat'
+        path.write_text('Energy(eV) 0 1 2 3\n' + '\n'.join(
+            f'{1+i/10} {i+1} {i+2} {i+3} {i+4}' for i in range(12)))
+        self.w._load_dat_file_direct(path)
+        session = self.w.workspace.active
+        sheet = ensure_dataset_sheet(self.w.workspace, session.dataset_id)
+        book = self.w._sheet_owner(sheet.sheet_id)
+        page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).current_sheet
+        pump()
+        requests = []
+        page.gateRequested.connect(lambda identity, gate: requests.append((identity, gate)))
+        for column, modifiers in ((2, Qt.NoModifier), (4, Qt.ControlModifier), (3, Qt.ShiftModifier)):
+            with self.subTest(column=column):
+                before = len(requests)
+                click_header(page, column, modifiers)
+                self.assertEqual(requests[before:], [(sheet.sheet_id, column - 1)])
+                self.assertEqual(self.w._current_gate_index(), column - 1)
+        QTest.keyRelease(self.host.window, Qt.Key_Shift)
+        self.w._set_current_gate_from_index(0)
+        self.assertEqual(page.model.gate_column, 1)
+        before = len(requests)
+        self.select(page, [3])  # This is already the table's current column.
+        self.assertEqual(requests[before:], [(sheet.sheet_id, 2)])
+        self.select(page, [3])
+        self.assertEqual(len(requests), before + 1)
+        page.setCurrentCell(0, 4)
+        self.assertEqual(requests[-1], (sheet.sheet_id, 3))
+        self.assertEqual(self.w._current_gate_index(), 3)
+        intended_y = sheet.y_columns.copy()
+        page.selectRow(5)
+        self.assertEqual(sheet.y_columns, intended_y)
+
+        # A cached Sheet from an inactive DAT must still activate its owner.
+        other = self.folder / 'other-header-gates.dat'
+        other.write_text(path.read_text())
+        self.w._load_dat_file_direct(other)
+        self.assertNotEqual(self.w.workspace.active_dataset_id, session.dataset_id)
+        page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).current_sheet
+        self.select(page, [4])
+        self.assertEqual(self.w.workspace.active_dataset_id, session.dataset_id)
+        self.assertEqual(self.w._current_gate_index(), 3)
+        self.assertEqual(sheet.y_columns, [4])
+        click_item(self.w, 'workbookPlot_line')
+        graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
+        self.assertEqual([curve.y_column for curve in graph.comparison.curves.values()], [4])
+        np.testing.assert_array_equal(graph.axes.lines[0].get_xdata(), session.base_cube.energy)
+        np.testing.assert_array_equal(graph.axes.lines[0].get_ydata(), session.base_cube.z[3])
 
     def test_dat_select_all_gestures_replace_subset_for_original_and_processed_heatmaps(self):
         path = self.folder / 'select-all.dat'
@@ -128,28 +210,24 @@ class QuickPlotTests(unittest.TestCase):
             book = self.w._sheet_owner(sheet.sheet_id)
             for gesture, command in [('ctrl_a', 'toolbar'), ('corner', 'context'), ('selectAll', 'toolbar')]:
                 with self.subTest(role=role, gesture=gesture, command=command):
-                    page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).tabs.currentWidget()
+                    page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).current_sheet
                     self.select(page, [1, 2])
                     self.assertEqual(sheet.y_columns, [1, 2])
                     if gesture == 'ctrl_a':
-                        page.table.setFocus()
-                        QTest.keyClick(page.table, Qt.Key_A, Qt.ControlModifier)
+                        table_key(page, Qt.Key_A, Qt.ControlModifier)
                     elif gesture == 'corner':
-                        corner = next(button for button in page.table.findChildren(QAbstractButton)
-                                      if button.metaObject().className() == 'QTableCornerButton')
-                        QTest.mouseClick(corner, Qt.LeftButton)
+                        QTest.mouseClick(self.host.window, Qt.LeftButton, pos=point_in(host_for(page), 'workbookSheetTable', 20, 10))
+                        pump()
                     else:
-                        page.table.selectAll()
-                    APP.processEvents()
+                        page.selectAll()
+                    pump()
                     self.assertEqual(sorted(index.column() for index in
-                        page.table.selectionModel().selectedColumns()), [0, 1, 2, 3, 4])
+                        page.selection_model.selectedColumns()), [0, 1, 2, 3, 4])
                     self.assertEqual(sheet.y_columns, [1, 2, 3, 4])
                     if command == 'toolbar':
-                        QTest.mouseClick(self.w.workbook_commands.heatmap_btn, Qt.LeftButton)
+                        click_item(self.w, 'workbookHeatmap')
                     else:
-                        menu = page.column_menu(1)
-                        next(action for action in menu.actions() if action.text() == 'Heatmap').trigger()
-                        menu.deleteLater()
+                        self.context_plot(page, 'heatmap')
                     graph = session.active_graph
                     self.assertEqual((graph.source_mode, graph.gate_indices), (mode, [0, 1, 2, 3]))
                     snapshot = snapshot_dataset(session)
@@ -161,18 +239,19 @@ class QuickPlotTests(unittest.TestCase):
 
     def test_name_does_not_redraw_and_title_style_export_roundtrip(self):
         book, sheet = self.xy()
-        sheet.new_comparison_btn.click()
-        graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
-        self.assertTrue(hasattr(graph, 'plot_title_edit'), 'Graph name and Plot title need separate fields')
+        sheet.request_plot('line')
+        graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
+        self.assertIsNot(xy_field(graph, 'name')[1], xy_field(graph, 'plot_title')[1],
+                         'Graph name and Plot title need separate fields')
         with patch.object(graph, 'render', wraps=graph.render) as render:
-            graph.name_edit.setText('Tree name')
-            graph.name_edit.editingFinished.emit()
+            set_xy_draft(graph, 'name', 'Tree name')
+            graph.inspector_bridge.commitField('name')
             render.assert_not_called()
-            graph.plot_title_edit.setText('Figure title')
-            graph.plot_title_edit.editingFinished.emit()
+            set_xy_draft(graph, 'plot_title', 'Figure title')
+            graph.inspector_bridge.commitField('plot_title')
             self.assertEqual(render.call_count, 1)
-        graph.curve_list.selectAll()
-        graph.style_buttons['scatter'].click()
+        graph.inspector_bridge.selectAll(True)
+        xy_command(graph, 'style:scatter')
         self.assertTrue(all(c.style == 'scatter' for c in graph.comparison.curves.values()))
         self.assertEqual(len(self.w.workspace.comparisons), 1)
         graph.export(self.folder / 'scatter.svg')
@@ -187,44 +266,42 @@ class QuickPlotTests(unittest.TestCase):
 
     def test_default_mapping_context_action_append_and_duplicate_keep_existing_style(self):
         book, sheet = self.xy()
-        self.w.workbook_commands.style_buttons['scatter'].click()
-        graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        click_item(self.w, 'workbookPlot_scatter')
+        graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         target = graph.comparison
         self.assertEqual(len(target.curves), 3)  # First X, all remaining Ys, no selection required.
         path = self.folder / 'other.csv'
         path.write_text('time,signal\n0.5,30\n1.5,40\n')
         other = self.w.import_xy_files([path])
-        page = self.w.open_workbook(other.workbook_id).tabs.currentWidget()
-        commands = self.w.workbook_commands
-        self.assertEqual(commands.target_combo.currentData(), target.comparison_id)
-        commands.add_btn.click()
+        page = self.w.open_workbook(other.workbook_id).current_sheet
+        commands = self.w
+        self.assertEqual(self.w.workbook_commands.targetId, target.comparison_id)
+        self.w.workbook_commands.append()
         self.assertEqual([c.style for c in target.curves.values()], ['scatter'] * 3 + ['line'])
         np.testing.assert_array_equal(graph.axes.lines[-1].get_xdata(), [.5, 1.5])
-        with patch('spectra_app.main_window.QMessageBox.exec', side_effect=AssertionError('Routine duplicate modal')):
-            commands.add_btn.click()
+        with patch('spectra_app.main_window.prompt_message', side_effect=AssertionError('Routine duplicate modal')):
+            self.w.workbook_commands.append()
         self.assertEqual(len(target.curves), 4)
-        menu = page.column_menu(1)
-        next(action for action in menu.actions() if action.text() == 'Line + Symbol').trigger()
-        new_graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        self.context_plot(page, 'line_symbol')
+        new_graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         self.assertEqual(new_graph.axes.lines[0].get_marker(), 'o')
         self.assertEqual(new_graph.axes.lines[0].get_linestyle(), '-')
-        menu.deleteLater()
 
     def test_scatter_hit_testing_does_not_pick_invisible_segments(self):
         book, page = self.xy()
         self.select(page, [1])
-        self.w.workbook_commands.style_buttons['scatter'].click()
-        graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        click_item(self.w, 'workbookPlot_scatter')
+        graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         graph.canvas.draw()
-        graph.curve_list.clearSelection()
+        graph.inspector_bridge.selectAll(False)
         x, y = graph.axes.transData.transform((.5, 1.5))
         graph._plot_clicked(SimpleNamespace(inaxes=graph.axes, x=x, y=y, button=1, key=None))
-        self.assertEqual(graph.curve_list.selectedItems(), [])
+        self.assertEqual(list(graph._selected_ids()), [])
 
     def test_native_legacy_title_default_and_decoder_validation(self):
         book, sheet = self.xy()
-        sheet.new_comparison_btn.click()
-        graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        sheet.request_plot('line')
+        graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         saved = self.w.save_project(self.folder / 'legacy.spectra')
         with zipfile.ZipFile(saved) as archive:
             members = {name: archive.read(name) for name in archive.namelist()}
@@ -237,8 +314,11 @@ class QuickPlotTests(unittest.TestCase):
         legacy['version'] = 6
         for comparison in legacy['comparisons']:
             comparison.pop('plot_title')
+            comparison.pop('presentation', None)
             for curve in comparison['curves']:
                 curve.pop('style')
+                for name in ('marker_shape', 'marker_size', 'marker_fill', 'marker_edge_color', 'marker_edge_width'):
+                    curve.pop(name)
         install(legacy)
         restored = read_project(saved).comparisons[graph.comparison_id]
         self.assertEqual(restored.plot_title, restored.name)
@@ -270,10 +350,10 @@ class QuickPlotTests(unittest.TestCase):
         for role, mode, expected in [('original', 'raw', raw), ('processed', 'processed', processed)]:
             sheet = ensure_dataset_sheet(self.w.workspace, session.dataset_id, role)
             book = self.w._sheet_owner(sheet.sheet_id)
-            page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).tabs.currentWidget()
+            page = self.w.open_workbook(book.workbook_id, sheet.sheet_id).current_sheet
             self.select(page, [1, 4])
             previous_graph = copy.deepcopy(session.active_graph)
-            self.w.workbook_commands.heatmap_btn.click()
+            click_item(self.w, 'workbookHeatmap')
             graph = session.active_graph
             created.append(graph.graph_id)
             self.assertEqual((graph.source_mode, graph.gate_indices), (mode, [0, 3]))
@@ -336,16 +416,28 @@ class QuickPlotTests(unittest.TestCase):
             invalid['graphs'][-1]['gate_indices'] = value
             with self.assertRaises(ValueError):
                 validate_plot_collection(invalid)
-        legacy = copy.deepcopy(manifest)
+        # Build a pre-result projection before exercising the v6 migration.
+        legacy_workspace = copy.deepcopy(restored)
+        for owner in legacy_workspace.datasets.values():
+            owner.processing_results.clear()
+            for graph in owner.graphs.values():
+                graph.result_id = None
+        for sheet in legacy_workspace.sheets.values():
+            sheet.result_id = None
+        legacy_path = self.folder / 'legacy-subset.spectra'
+        write_project(legacy_path, legacy_workspace)
+        with zipfile.ZipFile(legacy_path) as archive:
+            legacy_members = {name: archive.read(name) for name in archive.namelist()}
+        legacy = json.loads(legacy_members['manifest.json'])
         legacy['version'] = 6
         for record in legacy['datasets'][0]['graphs']:
             record.pop('published')
             record.pop('source_mode')
             record.pop('gate_indices')
-        with zipfile.ZipFile(saved, 'w') as archive:
-            for name, payload in members.items():
+        with zipfile.ZipFile(legacy_path, 'w') as archive:
+            for name, payload in legacy_members.items():
                 archive.writestr(name, json.dumps(legacy).encode() if name == 'manifest.json' else payload)
-        old = read_project(saved).active
+        old = read_project(legacy_path).active
         self.assertEqual((old.active_graph.source_mode, old.active_graph.gate_indices), ('processed', None))
         np.testing.assert_array_equal(snapshot_dataset(old).z, processed)
         legacy_collection = copy.deepcopy(collection)

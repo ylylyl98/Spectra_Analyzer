@@ -4,6 +4,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from dataclasses import replace
 import unittest
+import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -12,14 +13,13 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import LogNorm, Normalize, to_hex
 from matplotlib.figure import Figure
 from matplotlib.lines import TICKUP, TICKDOWN, TICKLEFT, TICKRIGHT
-from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
 
 from spectra_app import svg_export
-from spectra_app.main_window import MainWindow
+from tests.quick_migration_case import QuickMigrationCase
 from spectra_app.plot_presentation import AxisPresentation, HeatmapSnapshot, PlotPresentation
-from tests.settings_helpers import isolate_settings
+from tests import dat_properties_quick_helpers as dat
 
-APP = QApplication.instance() or QApplication([])
 NS = {'s': svg_export.SVG_NS}
 
 
@@ -36,7 +36,7 @@ def rendered_stroke_is_white(canvas, line):
     return np.max(np.min(pixels[row-1:row+2, col-1:col+2, :3], axis=2)) > 200
 
 
-class HeatmapTickContrastTests(unittest.TestCase):
+class HeatmapTickContrastTests(QuickMigrationCase):
     def axes(self):
         figure = Figure(figsize=(4, 3), dpi=144)
         canvas = FigureCanvasAgg(figure)
@@ -170,40 +170,63 @@ class HeatmapTickContrastTests(unittest.TestCase):
                             for t in ax.yaxis._update_ticks()))
 
 
-class LiveTickContrastTests(unittest.TestCase):
+class LiveTickContrastTests(QuickMigrationCase):
     def setUp(self):
-        folder = isolate_settings(self).parent
-        path = folder/'contrast.dat'
+        super().setUp()
+        path = self.folder/'contrast.dat'
         path.write_text('Energy(eV) 0 1 2\n1 0 0 0\n1.5 0 0 0\n2 0 0 0', encoding='utf-8')
-        self.window = MainWindow()
-        self.window._show_error = self.fail
+        self.window = self.controller
         self.window._load_dat_file_direct(path)
         self.window.set_plot_presentation(replace(self.window.workspace.active.presentation,
             axis=AxisPresentation(x_major_count=3, y_major_count=3)))
         # Inspect pixels at a defined display size, independent of an unshown Fit viewport.
         self.window.plot_page.set_zoom('100%')
+        self.window.root_window.resize(1200, 900)
+        self.window.root_window.show()
+        self.window.request_outer_view('analysis')
+        QTest.qWait(180)
 
     def tearDown(self):
-        self.window.close(); APP.processEvents()
+        self.assertFalse(self.quick_errors)
+        super().tearDown()
 
     def settle(self):
-        for _ in range(8):
-            APP.processEvents()
+        # The Agg idle timer and contrast repaint are asynchronous. Require a
+        # quiet published frame instead of sampling halfway through a draw.
+        w = self.window
+        revision = w.dat_canvas.provider.revision
+        quiet_since = time.monotonic()
+        deadline = quiet_since + 3
+        while time.monotonic() < deadline:
+            QTest.qWait(20)
+            current = w.dat_canvas.provider.revision
+            if current != revision:
+                revision, quiet_since = current, time.monotonic()
+            pending = w.canvas._dirty or w.canvas._render_timer.isActive()
+            pending = pending or any(getattr(w, name, None) is not None
+                and getattr(w, name).isActive() for name in
+                ('_tick_contrast_timer', '_view_layout_timer'))
+            if not pending and time.monotonic() - quiet_since >= .25:
+                return
+        self.fail('Live canvas did not settle within three seconds')
 
     def test_palette_only_draw_repaints_live_pixels_and_stops_scheduling(self):
         w = self.window
-        w.cmap_combo.setCurrentText('RdBu_r')
+        dat.set_choice(w, 'colormap', 'RdBu_r')
         w._heat_mesh.set_norm(Normalize(0., 1.))
         w._heat_mesh.set_cmap('gray_r')
-        w._render_plot_page(); w._layout_live_plots(); w.canvas.draw(); self.settle()
+        w._render_plot_page()
+        # Rendering may bind a newly created graph with its own zoom owner.
+        w.plot_page.set_zoom('100%')
+        w._layout_live_plots(); w.canvas.draw(); self.settle()
+        self.assertEqual(w.plot_page.zoom_text, '100%')
         events = []
         cid = w.canvas.mpl_connect('draw_event', lambda event:
                                   events.append(getattr(w, '_laying_out_live_plots', False)))
         try:
-            index = w.cmap_combo.findText('jet')
-            self.assertGreaterEqual(index, 0)
-            self.assertNotEqual(w.cmap_combo.currentIndex(), index)
-            w.cmap_combo.setCurrentIndex(index)
+            self.assertIn('jet', [row['value'] for row in dat.state(w)['colormaps']])
+            self.assertNotEqual(dat.state(w)['colormap'], 'jet')
+            dat.set_choice(w, 'colormap', 'jet')
             # The separate formal-preview debounce also measures live layout.
             # Isolate the retained canvas's palette-only repaint contract.
             w._plot_render_timer.stop()
@@ -216,18 +239,19 @@ class LiveTickContrastTests(unittest.TestCase):
             self.assertEqual(len(events), count, 'Tick contrast must settle without a queued draw loop')
             self.assertFalse(any(events), 'Palette-only contrast must not require live layout')
             self.assertLessEqual(count, 3)
-            self.assertFalse(w.canvas._draw_pending)
+            self.assertFalse(w.canvas._render_timer.isActive())
+            self.assertFalse(w.canvas._dirty)
             self.assertFalse(w._tick_contrast_timer.isActive())
             for zoom in ('100%', '150%', '200%'):
                 w.plot_page.set_zoom(zoom); w.canvas.draw(); self.settle()
                 self.assertTrue(rendered_stroke_is_white(w.canvas, w._heat_ax.xaxis.get_major_ticks()[1].tick1line))
             original = w.canvas.device_pixel_ratio
             try:
-                w.canvas._set_device_pixel_ratio(2.)
+                w.dat_canvas.set_device_pixel_ratio(2.)
                 w._layout_live_plots(); w.canvas.draw(); self.settle()
                 self.assertTrue(rendered_stroke_is_white(w.canvas, w._heat_ax.xaxis.get_major_ticks()[1].tick1line))
             finally:
-                w.canvas._set_device_pixel_ratio(original)
+                w.dat_canvas.set_device_pixel_ratio(original)
         finally:
             w.canvas.mpl_disconnect(cid)
 

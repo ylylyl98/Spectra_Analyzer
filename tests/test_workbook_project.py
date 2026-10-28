@@ -55,7 +55,7 @@ class WorkbookProjectTests(unittest.TestCase):
         np.testing.assert_equal(x, [2, 1])
         np.testing.assert_equal(y, [10, np.nan])
         manifest = json.loads(archive_members(self.path)['manifest.json'])
-        self.assertEqual(manifest['version'], 8)
+        self.assertEqual(manifest['version'], 13)
 
     def test_mixed_roundtrip_retains_live_dat_curves_without_extra_dat_arrays(self):
         workspace = rich_workspace(self.directory)

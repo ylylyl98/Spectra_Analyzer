@@ -1,4 +1,5 @@
 """An analysis owner becomes a graph document only through an explicit plot action."""
+from tests import dat_properties_quick_helpers as dat
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import copy
@@ -9,25 +10,23 @@ from threading import Event
 import unittest
 
 import numpy as np
-from PySide6.QtCore import QEvent, Qt
-from PySide6.QtWidgets import QApplication
 
 from spectra_app.background_jobs import JobContext, LoadRequest
 from spectra_app.data_import import prepare_data_batch
 from spectra_app.dat_io import load_dat_cube
 from spectra_app.dataset_state import (AnalysisControls, DatasetDefaults, DatasetSession, FixedRecipe,
                                       GraphState, ViewState, Workspace, initialize_dataset)
-from spectra_app.main_window import MainWindow
 from spectra_app.plot_dialogs import BatchExportDialog
 from spectra_app.plot_state import PlotStateStore, source_fingerprint, validate_plot_collection
 from spectra_app.project_io import ProjectFormatError, read_project, write_project
 from spectra_app.workbook_state import create_comparison
 from tests.background_helpers import wait_jobs
-from tests.settings_helpers import isolate_settings
+from tests import quick_migration_case as migration
+from tests.quick_application_helpers import pump
+from tests.formal_quick_helpers import ensure_visible, item
+from tests.xy_helpers import set_xy_draft
+from unittest.mock import patch
 from tests.test_project_io import archive_members, overwrite_archive
-
-APP = QApplication.instance() or QApplication([])
-
 
 def matrix(path):
     path.write_text('Energy(eV) -1 1\n' + '\n'.join(
@@ -181,23 +180,28 @@ class GraphPublicationStateTests(unittest.TestCase):
                     write_project(self.project, self.workspace)
 
 
-class GraphPublicationWorkflowTests(unittest.TestCase):
+class GraphPublicationWorkflowTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.w = MainWindow()
-        self.errors = []
+        super().setUp()
+        self.w = self.controller
+        self.errors = self.quick_errors
         self.w._show_error = self.errors.append
-        self.addCleanup(self.dispose)
         self.paths = [self.folder / 'matrix.dat', self.folder / 'curves.csv']
         matrix(self.paths[0])
         self.paths[1].write_text('x,a,b\n0,10,20\n1,20,40\n2,30,60\n')
 
-    def dispose(self):
+    def tearDown(self):
         wait_jobs(self.w)
-        self.w.close()
-        self.w.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+        self.assertEqual(self.quick_errors, [], 'Unexpected production Quick error')
+
+    def clean_reopen(self, path):
+        self.w._refresh_project_modified()
+        self.assertFalse(self.w.projectModified)
+        with patch('spectra_app.main_window.prompt_message',
+                   side_effect=AssertionError('Clean reopen unexpectedly asked to discard')):
+            result = self.w.open_project(path)
+        pump()
+        return result
 
     def entries(self, paths=None):
         entries, errors = prepare_data_batch([LoadRequest(path, None, self.w._available_colormaps())
@@ -207,64 +211,91 @@ class GraphPublicationWorkflowTests(unittest.TestCase):
         return entries
 
     def heatmap_items(self):
-        return [item.data(0, Qt.UserRole) for item in self.w._navigator_items()
-                if item.data(0, Qt.UserRole)[0] == 'heatmap']
+        return [row.key for row in self.w.project.all_rows()
+                if row.key[0] == 'heatmap']
 
     def test_ordinary_mixed_import_opens_first_owner_and_preserves_prior_windows(self):
         previous = create_comparison(self.w.workspace, 'Already open')
         page = self.w.open_xy_comparison(previous.comparison_id)
         prior = ('xy', previous.comparison_id, '')
-        prior_window = self.w.graph_documents._windows[prior]
+        pump()
+        prior_frame = self.w.graph_documents._presentations[prior].frame
         book = self.w.import_data_files(self.entries())
         self.assertEqual(len(self.w.workspace.workbooks), 2)
         self.assertEqual(len(self.w.workspace.datasets), 1)
         self.assertEqual(len(self.w.workspace.sheets), 2)
-        self.assertEqual(set(self.w.graph_documents._windows), {prior, ('workbook', book.workbook_id, '')})
-        self.assertIs(self.w.graph_documents._windows[prior], prior_window)
-        self.assertIs(self.w.graph_documents.page_for(prior), page)
+        self.assertEqual(set(self.w.graph_documents.registry.open_keys()), {prior, ('workbook', book.workbook_id, '')})
+        pump()
+        self.assertIs(self.w.graph_documents._presentations[prior].frame, prior_frame)
+        self.assertIs(self.w.graph_documents.document_for(prior), page)
         self.assertEqual(self.heatmap_items(), [])
         self.assertEqual([len(s.y_columns) for s in self.w.workspace.sheets.values()], [2, 2])
 
     def test_single_and_repeated_import_reuse_workbook_and_keep_implicit_graph_out_of_inventories(self):
         book = self.w.import_data_files(self.entries(self.paths[:1]))
-        self.assertEqual(set(self.w.graph_documents._windows), {('workbook', book.workbook_id, '')})
+        self.assertEqual(set(self.w.graph_documents.registry.open_keys()), {('workbook', book.workbook_id, '')})
         self.assertEqual(self.w.import_data_files(self.entries(self.paths[:1])).workbook_id, book.workbook_id)
         self.assertEqual(len(self.w.workspace.workbooks), 1)
         session = next(iter(self.w.workspace.datasets.values()))
         self.w.activate_dataset(session.dataset_id)
         self.w._select_graph_page(session, show=True)
-        self.w.plot_tabs.setCurrentWidget(self.w.graph_documents)
+        self.w.request_outer_view('workspace')
+        pump()
         self.assertEqual(self.heatmap_items(), [])
-        self.assertEqual(self.w.graph_combo.count(), 0)
-        self.assertNotIn((session.dataset_id, 'default'), self.w.graph_documents._windows)
+        self.assertEqual(len(self.w.source_navigation.graphRows), 0)
+        self.assertNotIn((session.dataset_id, 'default'), self.w.graph_documents.registry.open_keys())
         self.assertTrue(all(len(r['key']) == 3 for r in self.w._graph_workspace_snapshot()['documents']))
-        dialog = BatchExportDialog([session], session.dataset_id)
+        dialog = BatchExportDialog([session], session.dataset_id, self.w)
         self.addCleanup(dialog.deleteLater)
-        dialog.select_all_btn.click()
+        dialog.bridge.selectAll(True)
         self.assertEqual(dialog.selected_graph_targets(), [])
         self.w.start_plot_batch(graph_targets=[(session.dataset_id, 'default')], formats=('svg',))
         self.assertEqual(self.w._plot_batch_basenames, ())
         self.assertIn('unpublished', self.w._plot_batch_entries[0].error)
 
-    def test_processing_save_reload_never_publishes_analysis_graph(self):
+    def test_processing_save_reload_retains_result_without_publishing_source_placeholder(self):
         book = self.w.import_data_files(self.entries(self.paths[:1]))
         session = next(iter(self.w.workspace.datasets.values()))
         original = session.base_cube.z.copy()
+        source_graph_id = session.active_graph_id
         self.w.activate_dataset(session.dataset_id)
-        self.w.processing_mode_combo.setCurrentIndex(self.w.processing_mode_combo.findData('energy_second_derivative'))
-        self.w.processing_smooth_chk.setChecked(False)
+        self.assertTrue(self.w.request_outer_view('analysis'))
+        self.assertFalse(self.w.workbenchActive)
+        self.assertFalse(self.w._auxiliary_active())
+        self.assertEqual(self.w.contextKind, 'dat')
+        self.w.dat_details_action.setChecked(True)
+        self.assertTrue(self.w.request_task(0))
+        pump()
+        processing = ensure_visible(item(self.w, 'processingPanel'))
+        self.assertTrue(processing.isVisible())
+        self.assertTrue(processing.isEnabled())
+        self.w.processing.setMode('energy_second_derivative')
+        self.w.processing.setSmoothing(False)
         self.w._on_generate_heatmap()
         wait_jobs(self.w)
         self.assertEqual(session.applied.mode, 'energy_second_derivative')
         np.testing.assert_array_equal(session.base_cube.z, original)
         self.assertFalse(np.array_equal(session.current_cube.z, original))
+        result_graph = session.active_graph
+        result_id = result_graph.result_id
+        result_values = session.current_cube.z.copy()
+        self.assertIsNotNone(result_id)
+        self.assertNotEqual(result_graph.graph_id, source_graph_id)
+        self.assertFalse(session.graphs[source_graph_id].published)
         self.w.open_workbook(book.workbook_id)
         saved = self.w.save_project(self.folder / 'processed.spectra')
-        self.w.open_project(saved)
+        self.assertTrue(self.clean_reopen(saved))
         restored = self.w.workspace.datasets[session.dataset_id]
-        self.assertFalse(getattr(restored.active_graph, 'published', True))
-        self.assertEqual(set(self.w.graph_documents._windows), {('workbook', book.workbook_id, '')})
-        self.assertEqual(self.heatmap_items(), [])
+        self.assertFalse(restored.graphs[source_graph_id].published)
+        self.assertTrue(restored.active_graph.published)
+        self.assertEqual(restored.active_graph.result_id, result_id)
+        self.assertIsNone(restored.active_graph.analysis)
+        self.assertEqual(set(restored.processing_results), {result_id})
+        np.testing.assert_array_equal(restored.base_cube.z, original)
+        np.testing.assert_array_equal(restored.processing_results[result_id].cube.z, result_values)
+        result_key = (session.dataset_id, result_graph.graph_id)
+        self.assertEqual(set(self.w.graph_documents.registry.open_keys()), {('workbook', book.workbook_id, ''), result_key})
+        self.assertEqual(self.heatmap_items(), [('heatmap', result_key)])
         self.assertEqual(self.errors, [])
 
     def test_explicit_open_and_quick_heatmap_publish_then_close_reload_retains_document(self):
@@ -273,19 +304,19 @@ class GraphPublicationWorkflowTests(unittest.TestCase):
         self.w.open_graph_document(session.dataset_id, 'default')
         self.assertTrue(getattr(session.active_graph, 'published', False))
         key = (session.dataset_id, 'default')
-        self.assertIn(key, self.w.graph_documents._windows)
+        self.assertIn(key, self.w.graph_documents.registry.open_keys())
         self.assertIn(('heatmap', key), self.heatmap_items())
         sidecar, notice = PlotStateStore().load(self.paths[0], session.loaded_fingerprint)
         self.assertEqual(notice, '')
         self.assertTrue(sidecar['graphs'][0]['published'])
-        self.w.graph_documents._windows[key].close()
+        self.w.graph_documents.close_document(key)
         self.w.open_workbook(book.workbook_id)
         saved = self.w.save_project(self.folder / 'closed.spectra')
-        self.w.open_project(saved)
-        self.assertNotIn(key, self.w.graph_documents._windows)
+        self.clean_reopen(saved)
+        self.assertNotIn(key, self.w.graph_documents.registry.open_keys())
         self.assertIn(('heatmap', key), self.heatmap_items())
         self.w.open_graph_document(*key)
-        self.assertIn(key, self.w.graph_documents._windows)
+        self.assertIn(key, self.w.graph_documents.registry.open_keys())
         session = self.w.workspace.datasets[session.dataset_id]
         sheet = self.w.workspace.sheets[book.sheet_ids[0]]
         self.w.open_workbook(book.workbook_id)
@@ -308,7 +339,7 @@ class GraphPublicationWorkflowTests(unittest.TestCase):
     def test_first_quick_heatmap_after_reload_appears_in_project_immediately(self):
         book = self.w.import_data_files(self.entries(self.paths[:1]))
         saved = self.w.save_project(self.folder / 'unplotted.spectra')
-        self.w.open_project(saved)
+        self.clean_reopen(saved)
         session = next(iter(self.w.workspace.datasets.values()))
         graph = self.w._quick_sheet_plot(book.sheet_ids[0], 'heatmap')
         self.assertTrue(graph.published)
@@ -320,24 +351,28 @@ class GraphPublicationWorkflowTests(unittest.TestCase):
         session = next(iter(self.w.workspace.datasets.values()))
         target = create_comparison(self.w.workspace, 'Draft')
         page = self.w.open_xy_comparison(target.comparison_id)
-        page.name_edit.setText(' ')
+        pump()
+        set_xy_draft(page, 'name', ' ')
+        self.assertEqual(page.inspector_bridge._drafts.get('name'), ' ')
         with self.assertRaises(ValueError):
             self.w.open_graph_document(session.dataset_id, 'default')
         self.assertFalse(getattr(session.active_graph, 'published', True))
         self.assertIsNone(self.w._quick_sheet_plot(book.sheet_ids[0], 'heatmap'))
         self.assertFalse(session.active_graph.published)
         self.assertEqual(len(session.graphs), 1)
-        page.name_edit.setText('Draft')
+        self.assertEqual(self.errors, ['Enter a nonempty graph name.'])
+        self.errors.clear()
+        set_xy_draft(page, 'name', 'Draft')
 
     def test_invalid_analysis_editor_blocks_first_explicit_open(self):
         self.w.import_data_files(self.entries(self.paths[:1]))
         session = next(iter(self.w.workspace.datasets.values()))
         self.w.activate_dataset(session.dataset_id)
-        self.w.xmin_spin.lineEdit().setText('1e')
-        with self.assertRaisesRegex(ValueError, 'range editor'):
+        self.w.dat_properties.draftNumber('xmin', '1e', self.w.dat_properties.ownerToken)
+        with self.assertRaisesRegex(ValueError, 'pending xmin editor'):
             self.w.open_graph_document(session.dataset_id, 'default')
         self.assertFalse(session.active_graph.published)
-        self.w.xmin_spin.lineEdit().setText('1')
+        self.w.dat_properties.draftNumber('xmin', '1', self.w.dat_properties.ownerToken)
 
 
 if __name__ == '__main__':

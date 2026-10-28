@@ -6,13 +6,14 @@ import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 from PIL import Image
-from PySide6.QtWidgets import QApplication
-from spectra_app.main_window import MainWindow
+from contextlib import nullcontext
+from spectra_app.common_prompts import PromptAction
+from tests import quick_migration_case as migration
+from tests.quick_application_helpers import application, pump, wait_until
 from spectra_app.image_export import _build_heatmap_export_figure
 from spectra_app.plot_state import active_plot_recipe
-from tests.settings_helpers import isolate_settings
+from tests import dat_properties_quick_helpers as dp
 
-_APP = QApplication.instance() or QApplication([])
 NAME = '$YZD320$~$pa$~$8T3.6KRef0.2sx10$~$680nmc$~$R1_85deg$~$0.95TG-BG=18$_rep01_001_avg13_DR_R_External_d2E_Regrid.dat'
 
 class TitleParsingTests(unittest.TestCase):
@@ -49,30 +50,50 @@ class TitleParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_angle_map('85=K;85.0=Other')
 
-class TitleWorkflowTests(unittest.TestCase):
+class TitleWorkflowTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.directory = isolate_settings(self).parent
+        super().setUp()
+        self.directory = self.folder
         self.windows = []
+        self.window_errors = []
+
     def tearDown(self):
-        for window in self.windows:
-            window.close()
-            _APP.processEvents()
+        for errors in self.window_errors:
+            self.assertEqual(errors, [], 'Unexpected production Quick error')
+
     def window(self):
-        window = MainWindow()
+        if not self.windows:
+            window, errors = self.controller, self.quick_errors
+        else:
+            # Restart the actual entry against the still-isolated first profile.
+            with patch('tests.quick_application_helpers.isolated_settings',
+                       lambda: nullcontext(self.folder)):
+                host, folder, errors = self.enterContext(application())
+            self.assertEqual(folder, self.folder)
+            window = host.controller
+            self.assertIsNot(window, self.windows[-1])
         self.windows.append(window)
+        self.window_errors.append(errors)
         return window
+
+    def close_window(self, window):
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.DISCARD):
+            window.close()
+            wait_until(lambda: window._closing)
+        self.assertFalse(window.root_window.isVisible())
+
     def dat(self, name=NAME):
         path = self.directory / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('Energy(eV) 0 1 2\n' + '\n'.join(f'{1+i/10} {i+1} {i+2} {i+3}' for i in range(12)), encoding='utf-8')
         return path
     def select_builtin(self, w):
-        w.title_preset_combo.setCurrentIndex(w.title_preset_combo.findText('Current group'))
+        dp.set_choice(w, 'title_preset', 'Current group')
     def test_two_new_files_update_title_with_fixed_yz_and_missing_clears(self):
         w = self.window()
         self.select_builtin(w)
-        w.y_axis_name_edit.setText('Bias')
-        w.y_axis_unit_edit.setText('V')
+        w.dat_properties.setLabel('y_axis_name', 'Bias', w.dat_properties.ownerToken)
+        w.dat_properties.setLabel('y_axis_unit', 'V', w.dat_properties.ownerToken)
         w._load_dat_file_direct(self.dat())
         self.assertEqual(w._heat_ax.get_title(), 'E=18V 8T K')
         w._load_dat_file_direct(self.dat(NAME.replace('85deg', '175deg').replace('=18$', '=20$')))
@@ -80,36 +101,36 @@ class TitleWorkflowTests(unittest.TestCase):
         self.assertEqual(w._heat_ax.get_ylabel(), 'Bias (V)')
         w._load_dat_file_direct(self.dat('unknown.dat'))
         self.assertEqual(w._heat_ax.get_title(), '')
-        self.assertIn('Missing', w.title_template_status.text())
+        self.assertIn('Missing', dp.state(w)['title_template_status'])
     def test_override_blank_axis_reload_and_apply_template(self):
         w = self.window()
         self.select_builtin(w)
         p = self.dat()
         w._load_dat_file_direct(p)
         for title in ('My $literal$ title', ''):
-            w.plot_title_edit.setText(title)
-            w.x_axis_override_combo.setCurrentIndex(w.x_axis_override_combo.findData('pixel'))
+            w.dat_properties.setLabel('plot_title', title, w.dat_properties.ownerToken)
+            w.dat_properties._axis_override = 'pixel'
             w._on_x_axis_override_changed()
             self.assertEqual(w._heat_ax.get_title(), title)
             w._load_dat_file_direct(p)
             self.assertEqual(w._heat_ax.get_title(), title)
             self.assertEqual(w._title_settings['manual_override'], title)
-        w.title_apply_button.click()
+        dp.command(w, 'template_apply')
         self.assertEqual(w._heat_ax.get_title(), 'E=18V 8T K')
     def test_custom_preset_restart_and_portable_snapshot(self):
         w = self.window()
         self.select_builtin(w)
-        w.title_pattern_edit.setText('{valley}: {field}T / E={voltage}V')
-        w.title_angle_map_edit.setText('85=OtherK;175=OtherKp')
-        w.title_preset_name_edit.setText('My group')
-        w.title_save_button.click()
+        w.dat_properties.setTemplate('title_pattern', '{valley}: {field}T / E={voltage}V', w.dat_properties.ownerToken)
+        w.dat_properties.setTemplate('title_angle_map', '85=OtherK;175=OtherKp', w.dat_properties.ownerToken)
+        w.dat_properties.setTemplate('title_preset_name', 'My group', w.dat_properties.ownerToken)
+        dp.command(w, 'template_save')
         p = self.dat()
         w._load_dat_file_direct(p)
         self.assertEqual(w._heat_ax.get_title(), 'OtherK: 8T / E=18V')
-        w.close()
-        _APP.processEvents()
+        self.close_window(w)
+        pump()
         restored = self.window()
-        self.assertEqual(restored.title_preset_combo.currentText(), 'My group')
+        self.assertEqual(dp.state(restored)['title_preset'], 'My group')
         restored._load_dat_file_direct(self.dat(NAME.replace('85deg', '175deg')))
         self.assertEqual(restored._heat_ax.get_title(), 'OtherKp: 8T / E=18V')
         copied = self.directory / 'copy' / p.name
@@ -120,19 +141,19 @@ class TitleWorkflowTests(unittest.TestCase):
         portable = self.window()
         portable._load_dat_file_direct(copied)
         self.assertEqual(portable._heat_ax.get_title(), 'OtherK: 8T / E=18V')
-        portable.title_apply_button.click()
+        dp.command(portable, 'template_apply')
         self.assertEqual(portable._heat_ax.get_title(), 'OtherK: 8T / E=18V')
         portable._load_dat_file_direct(self.dat('new.dat'))
-        self.assertEqual(portable.title_preset_combo.currentText(), 'Manual')
+        self.assertEqual(dp.state(portable)['title_preset'], 'Manual')
     def test_v1_migration_preserves_all_plot_settings_and_blank_title(self):
         w = self.window()
         p = self.dat()
         w._load_dat_file_direct(p)
-        w.plot_title_edit.clear()
-        w.y_axis_name_edit.setText('Legacy bias')
-        w.cmap_combo.setCurrentText('viridis')
-        w.close()
-        _APP.processEvents()
+        w.dat_properties.setLabel('plot_title', '', w.dat_properties.ownerToken)
+        w.dat_properties.setLabel('y_axis_name', 'Legacy bias', w.dat_properties.ownerToken)
+        dp.set_choice(w, 'colormap', 'viridis')
+        self.close_window(w)
+        pump()
         sidecar = w._plot_state_store.path_for(p)
         payload = json.loads(sidecar.read_text(encoding='utf-8'))
         payload['plot'] = active_plot_recipe(payload['plot'])
@@ -163,8 +184,8 @@ class TitleWorkflowTests(unittest.TestCase):
         self.select_builtin(restored)
         restored._load_dat_file_direct(p)
         self.assertEqual(restored._heat_ax.get_title(), '')
-        self.assertEqual(restored.cmap_combo.currentText(), 'viridis')
-        self.assertEqual(restored.title_preset_combo.currentText(), 'Manual')
+        self.assertEqual(dp.state(restored)['colormap'], 'viridis')
+        self.assertEqual(dp.state(restored)['title_preset'], 'Manual')
     def test_export_keeps_generated_literal_title_and_saves_current_collection(self):
         w = self.window()
         self.select_builtin(w)
@@ -175,7 +196,7 @@ class TitleWorkflowTests(unittest.TestCase):
         w.open_graph_document()
         w._render_plot_page()
         page = w.plot_page.rendered_page
-        self.assertIsNotNone(page, w.plot_page.status_label.text())
+        self.assertIsNotNone(page, w.plot_page.status_text)
         self.assertIn('E=18V 8T K', ''.join(ET.fromstring(page.svg_bytes).itertext()))
         output = w.export_plot_page('png')
         self.assertTrue(output.is_file())
@@ -189,21 +210,21 @@ class TitleWorkflowTests(unittest.TestCase):
 
     def test_template_override_never_pins_future_title_or_global_manual_default(self):
         w = self.window()
-        w.plot_title_edit.setText('Legacy manual default')
+        w.dat_properties.setLabel('plot_title', 'Legacy manual default', w.dat_properties.ownerToken)
         self.select_builtin(w)
         first = self.dat()
         w._load_dat_file_direct(first)
-        w.plot_title_edit.setText('Only this DAT')
-        w.fix_annotations_chk.setChecked(False)
-        w.fix_annotations_chk.setChecked(True)
+        w.dat_properties.setLabel('plot_title', 'Only this DAT', w.dat_properties.ownerToken)
+        dp.set_flag(w, 'fix_annotations', False)
+        dp.set_flag(w, 'fix_annotations', True)
         second = self.dat(NAME.replace('85deg', '175deg'))
         w._load_dat_file_direct(second)
         self.assertEqual(w._heat_ax.get_title(), 'E=18V 8T Kp')
         self.assertEqual(w._annotation_settings.value('plot_annotations/plot_title'), 'Legacy manual default')
         w._load_dat_file_direct(first)
         self.assertEqual(w._heat_ax.get_title(), 'Only this DAT')
-        w.close()
-        _APP.processEvents()
+        self.close_window(w)
+        pump()
         restarted = self.window()
         restarted._load_dat_file_direct(first)
         self.assertEqual(restarted._heat_ax.get_title(), 'Only this DAT')
@@ -215,23 +236,23 @@ class TitleWorkflowTests(unittest.TestCase):
         self.select_builtin(w)
         p = self.dat()
         w._load_dat_file_direct(p)
-        w.plot_title_edit.clear()
-        w.close()
-        _APP.processEvents()
+        w.dat_properties.setLabel('plot_title', '', w.dat_properties.ownerToken)
+        self.close_window(w)
+        pump()
         w._annotation_settings.clear()
         restarted = self.window()
         restarted._load_dat_file_direct(p)
         self.assertEqual(restarted._heat_ax.get_title(), '')
         self.assertEqual(restarted._title_settings['manual_override'], '')
-        self.assertEqual(restarted.title_pattern_edit.text(), 'E={voltage}V {field}T {valley}')
+        self.assertEqual(dp.state(restarted)['title_pattern'], 'E={voltage}V {field}T {valley}')
 
     def test_invalid_v2_title_snapshot_is_rejected_before_partial_restore(self):
         w = self.window()
         self.select_builtin(w)
         p = self.dat()
         w._load_dat_file_direct(p)
-        w.close()
-        _APP.processEvents()
+        self.close_window(w)
+        pump()
         sidecar = w._plot_state_store.path_for(p)
         original = json.loads(sidecar.read_text(encoding='utf-8'))
         from spectra_app.plot_state import source_fingerprint
@@ -252,11 +273,11 @@ class TitleWorkflowTests(unittest.TestCase):
         w = self.window()
         self.select_builtin(w)
         w._load_dat_file_direct(self.dat())
-        w.title_pattern_edit.setText('{voltage.__class__}')
+        w.dat_properties.setTemplate('title_pattern', '{voltage.__class__}', w.dat_properties.ownerToken)
         self.assertEqual(w._heat_ax.get_title(), '')
-        self.assertIn('Use only', w.title_template_status.text())
-        w.title_preset_name_edit.setText('Bad')
-        w.title_save_button.click()
+        self.assertIn('Use only', dp.state(w)['title_template_status'])
+        w.dat_properties.setTemplate('title_preset_name', 'Bad', w.dat_properties.ownerToken)
+        dp.command(w, 'template_save')
         self.assertNotIn('Bad', w._title_presets)
 
     def test_missing_field_explanation_survives_sidecar_restore(self):
@@ -264,8 +285,8 @@ class TitleWorkflowTests(unittest.TestCase):
         self.select_builtin(w)
         p = self.dat('unknown.dat')
         w._load_dat_file_direct(p)
-        self.assertIn('Missing', w.title_template_status.text())
+        self.assertIn('Missing', dp.state(w)['title_template_status'])
         w._load_dat_file_direct(p)
         self.assertEqual(w._heat_ax.get_title(), '')
-        self.assertIn('Missing', w.title_template_status.text())
+        self.assertIn('Missing', dp.state(w)['title_template_status'])
         self.assertEqual(w._title_settings['manual_override'], None)

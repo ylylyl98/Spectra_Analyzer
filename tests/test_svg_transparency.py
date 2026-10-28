@@ -9,19 +9,15 @@ import unittest
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.colors import ListedColormap
-from PySide6.QtCore import QByteArray, QEvent, QRectF, Qt
-from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtCore import QByteArray, QRectF, Qt
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QApplication
 
-from spectra_app.dataset_state import Workspace
 from spectra_app.plot_presentation import HeatmapSnapshot, PlotPresentation
 from spectra_app.svg_export import render_hybrid_svg, render_svg_image
 from spectra_app.workbook_state import add_curve, create_comparison, create_workbook, register_xy_sheet
-from spectra_app.xy_plot_page import XYPlotPage
-
-APP = QApplication.instance() or QApplication([])
-
+from tests import quick_migration_case as migration
+from tests.quick_application_helpers import pump
 
 def render_svg(svg, background=Qt.transparent, size=(700, 500)):
     renderer = QSvgRenderer(QByteArray(svg))
@@ -57,10 +53,14 @@ def xy_comparison(workspace):
     return comparison
 
 
-class SvgTransparencyTests(unittest.TestCase):
+class SvgTransparencyTests(migration.QuickMigrationCase):
     def setUp(self):
+        super().setUp()
         colormaps.register(ListedColormap(['#ffffff', '#cc3300']), name='svg-transparency-test')
         self.addCleanup(colormaps.unregister, 'svg-transparency-test')
+
+    def tearDown(self):
+        self.assertEqual(self.quick_errors, [], 'Unexpected production Quick error')
 
     def test_heatmap_background_is_transparent_and_white_data_retains_its_alpha(self):
         for alpha in (1., .5):
@@ -89,10 +89,10 @@ class SvgTransparencyTests(unittest.TestCase):
                 np.testing.assert_array_equal(snapshot.z, original)
 
     def test_xy_background_is_transparent_but_white_curves_and_png_stay_visible(self):
-        workspace = Workspace()
+        workspace = self.controller.workspace
         comparison = xy_comparison(workspace)
-        page = XYPlotPage(workspace, comparison.comparison_id)
-        self.addCleanup(page.deleteLater)
+        page = self.controller.open_xy_comparison(comparison.comparison_id)
+        pump()
         svg = page.svg_bytes()
         image = render_svg(svg)
         self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
@@ -107,27 +107,19 @@ class SvgTransparencyTests(unittest.TestCase):
             self.assertEqual(QImage(str(png)).pixelColor(0, 0), QColor('white'))
 
 
-@unittest.skipUnless(QApplication.platformName() == 'offscreen', 'Clipboard test must not touch the system clipboard')
-class SvgClipboardIdentityTests(unittest.TestCase):
+class SvgClipboardIdentityTests(migration.QuickMigrationCase):
     def setUp(self):
-        from spectra_app.main_window import MainWindow
-        from tests.settings_helpers import isolate_settings
-        self.folder = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.window._show_error = self.fail
-        self.addCleanup(self.dispose)
+        super().setUp()
+        self.assertEqual(QGuiApplication.platformName(), 'offscreen',
+                         'Clipboard identity tests require the isolated offscreen clipboard')
+        self.window = self.controller
+        self.addCleanup(QGuiApplication.clipboard().clear)
 
-    def dispose(self):
-        from tests.settings_helpers import wait_for_background_jobs
-        wait_for_background_jobs(self.window)
-        APP.clipboard().clear()
-        self.window.close()
-        self.window.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+    def tearDown(self):
+        self.assertEqual(self.quick_errors, [], 'Unexpected production Quick error')
 
     def clipboard_svg(self):
-        mime = APP.clipboard().mimeData()
+        mime = QGuiApplication.clipboard().mimeData()
         self.assertEqual(mime.formats(), ['image/svg+xml'])
         self.assertFalse(mime.hasImage())
         return bytes(mime.data('image/svg+xml'))
@@ -138,6 +130,7 @@ class SvgClipboardIdentityTests(unittest.TestCase):
             f'{1+i/10} {i+1} {2*(i+1)} {3*(i+1)}' for i in range(12)))
         self.window._load_dat_file_direct(path)
         self.window.open_graph_document()
+        pump()
         copied = self.window.copy_graph_svg()
         svg = self.clipboard_svg()
         self.assertEqual(svg, copied.svg_bytes)
@@ -148,6 +141,7 @@ class SvgClipboardIdentityTests(unittest.TestCase):
     def test_xy_copy_and_export_share_transparent_bytes(self):
         comparison = xy_comparison(self.window.workspace)
         page = self.window.open_xy_comparison(comparison.comparison_id)
+        pump()
         self.window.copy_graph_svg()
         svg = self.clipboard_svg()
         exported = page.export(self.folder / 'xy.svg')

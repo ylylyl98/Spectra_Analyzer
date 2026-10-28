@@ -13,30 +13,26 @@ import numpy as np
 from spectra_app import workbook_state as state
 from spectra_app.project_io import read_project, write_project, ProjectFormatError
 from tests.test_project_io import rich_workspace, archive_members, overwrite_archive
-from PySide6.QtCore import QEvent, Qt
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
-from spectra_app.main_window import MainWindow
+from PySide6.QtCore import QCoreApplication, Qt
+from spectra_app.common_prompts import PromptAction
 from spectra_app.xy_import_dialog import XYImportDialog
-from tests.settings_helpers import isolate_settings
+from tests.quick_migration_case import QuickMigrationCase
 from tests.background_helpers import wait_jobs
-from tests.test_workflow import _fit_result
+from tests.scientific_fixtures import workflow_fit_result as _fit_result
 
-APP = QApplication.instance() or QApplication([])
+from tests.xy_helpers import set_xy_draft, xy_value
+from tests.workbook_quick_helpers import item
 
 
-class OrganizationUiTests(unittest.TestCase):
+class OrganizationUiTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
-        self.addCleanup(self.dispose)
+        super().setUp()
+        self.window = self.controller
+        self.errors = self.quick_errors
 
-    def dispose(self):
-        self.window.close()
-        self.window.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+    def tearDown(self):
+        self.assertEqual(self.quick_errors, [])
+        super().tearDown()
 
     def test_actual_import_defaults_per_file_even_with_selected_owner(self):
         paths = []
@@ -46,13 +42,13 @@ class OrganizationUiTests(unittest.TestCase):
             paths.append(path)
         existing = state.create_workbook(self.window.workspace, 'Selected')
         self.window._refresh_data_navigator()
-        self.window.data_navigator.setCurrentItem(self.window.data_navigator.topLevelItem(0))
+        self.window.project.select_key(('workbook', existing.workbook_id))
         def accept(dialog):
-            self.assertEqual(dialog.destination_combo.currentData(), 'per_file')
+            self.assertEqual(dialog.destination, 'per_file')
             dialog.mappings = [(1, [0]), (0, [1])]
             dialog.compare = True
-            return QDialog.Accepted
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileNames', return_value=([str(p) for p in paths], '')), patch.object(XYImportDialog, 'exec', accept):
+            return XYImportDialog.Accepted
+        with patch('spectra_app.main_window.FilePicker.getOpenFileNames', return_value=([str(p) for p in paths], '')), patch.object(XYImportDialog, 'exec', accept):
             self.window._on_import_xy()
             wait_jobs(self.window)
         self.assertFalse(self.errors)
@@ -72,14 +68,14 @@ class OrganizationUiTests(unittest.TestCase):
         owner = self.window._sheet_owner(source.sheet_id)
         page = self.window.open_workbook(owner.workbook_id, source.sheet_id).sheet_pages[source.sheet_id]
         self.assertEqual(page.model.data(page.model.index(0, 1)), 'Gaussian')
-        self.assertFalse(page.y_list.item(1).flags() & Qt.ItemIsEnabled)
-        page.table.selectAll()
+        self.assertFalse(page.columnChoices[1]['numeric'])
+        page.selectAll()
         self.assertIn('\tGaussian\tok\t', page.copy_selection())
-        with patch('spectra_app.main_window.QInputDialog.getText', return_value=('', False)):
-            page.snapshot_btn.click()
+        with patch('spectra_app.main_window.prompt_text', return_value=('', False)):
+            page.snapshot()
         self.assertFalse(any(s.role == 'snapshot' for s in workspace.sheets.values()))
-        with patch('spectra_app.main_window.QInputDialog.getText', return_value=('Frozen parameters', True)):
-            page.snapshot_btn.click()
+        with patch('spectra_app.main_window.prompt_text', return_value=('Frozen parameters', True)):
+            page.snapshot()
         snapshot = next(s for s in workspace.sheets.values() if s.role == 'snapshot')
         values, note = snapshot.data.copy(), snapshot.snapshot_note
         books = list(workspace.workbooks)
@@ -89,7 +85,7 @@ class OrganizationUiTests(unittest.TestCase):
         page = self.window.open_workbook(books[1], source.sheet_id).sheet_pages[source.sheet_id]
         self.window._on_clear_fit()
         self.assertEqual(page.model.rowCount(), 0)
-        self.assertFalse(page.snapshot_btn.isEnabled())
+        self.assertFalse(item(page.parent(), 'workbookSnapshot').isEnabled())
         np.testing.assert_equal(snapshot.data, values)
         self.assertEqual(snapshot.snapshot_note, note)
         self.assertFalse(self.errors)
@@ -115,17 +111,17 @@ class OrganizationUiTests(unittest.TestCase):
         state.add_curve(ws, comparison.comparison_id, original.sheet_id, 0, 1)
         retained = state.add_curve(ws, comparison.comparison_id, snapshot.sheet_id, 0, 1)
         graph = w.open_xy_comparison(comparison.comparison_id)
-        graph.name_edit.setText('Pending graph name')
+        set_xy_draft(graph, 'name', 'Pending graph name')
         # Invalid draft must survive source retirement without a stale curve row.
-        graph.color_edit.setText('bad')
+        set_xy_draft(graph, 'color', 'bad')
         errors = []
-        with patch.object(sys, 'excepthook', side_effect=lambda *args: errors.append(args)), patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Yes):
+        with patch.object(sys, 'excepthook', side_effect=lambda *args: errors.append(args)), patch('spectra_app.main_window.prompt_message', return_value=PromptAction.YES):
             self.assertTrue(w.remove_dataset(session.dataset_id))
-            APP.processEvents()
+            QCoreApplication.processEvents()
         self.assertEqual(errors, [])
         self.assertEqual(set(target_page.sheet_pages), {snapshot.sheet_id, other.sheet_id})
-        self.assertEqual(graph.curve_list.count(), 1)
-        self.assertEqual(graph.name_edit.text(), 'Pending graph name')
+        self.assertEqual(graph.inspector_bridge.curves.rowCount(), 1)
+        self.assertEqual(xy_value(graph, 'name'), 'Pending graph name')
         self.assertEqual(list(comparison.curves), [retained.curve_id])
         self.assertEqual(state.resolve_curve(ws, retained)[1].tolist(), [2, 4, 6])
         self.assertFalse(self.errors)
@@ -151,13 +147,13 @@ class OrganizationUiTests(unittest.TestCase):
         comparison = state.create_comparison(ws)
         curve = state.add_curve(ws, comparison.comparison_id, source.sheet_id, 0, 1)
         graph = w.open_xy_comparison(comparison.comparison_id)
-        graph.name_edit.setText('Uncommitted graph name')
-        graph.color_edit.setText('invalid draft')
+        set_xy_draft(graph, 'name', 'Uncommitted graph name')
+        set_xy_draft(graph, 'color', 'invalid draft')
         w._invalidate_peak_fits(ws.active, {0})
         self.assertEqual(page.model.rowCount(), 0)
         self.assertEqual(len(graph.axes.lines), 0)
-        self.assertEqual(graph.name_edit.text(), 'Uncommitted graph name')
-        self.assertEqual(graph.color_edit.text(), 'invalid draft')
+        self.assertEqual(xy_value(graph, 'name'), 'Uncommitted graph name')
+        self.assertEqual(xy_value(graph, 'color'), 'invalid draft')
         with patch('spectra_app.main_window.fit_multi_peak', return_value=first):
             w._on_fit()
             wait_jobs(w)
@@ -183,7 +179,7 @@ class OrganizationUiTests(unittest.TestCase):
         np.testing.assert_equal(frozen.data, values)
         np.testing.assert_equal(state.sheet_values(ws, state.ensure_dataset_sheet(ws, ws.active_dataset_id)), original)
         self.assertTrue(any(s.role == 'processed' for s in ws.sheets.values()))
-        graph.color_edit.setText('#123456')
+        set_xy_draft(graph, 'color', '#123456')
         self.assertFalse(self.errors)
 
     def test_merge_cancel_busy_and_invalid_editor_are_atomic(self):
@@ -194,17 +190,17 @@ class OrganizationUiTests(unittest.TestCase):
         state.add_curve(ws, comparison.comparison_id, sheets[0].sheet_id, 0, 1)
         graph = self.window.open_xy_comparison(comparison.comparison_id)
         before = [list(b.sheet_ids) for b in books]
-        graph.color_edit.setText('bad')
+        set_xy_draft(graph, 'color', 'bad')
         with self.assertRaises(ValueError):
             self.window.merge_workbooks([b.workbook_id for b in books], books[1].workbook_id)
         self.assertEqual([b.sheet_ids for b in books], before)
-        graph.color_edit.setText('#123456')
+        set_xy_draft(graph, 'color', '#123456')
         with patch.object(self.window, '_project_busy', return_value=True), self.assertRaises(ValueError):
             self.window.merge_workbooks([b.workbook_id for b in books], books[1].workbook_id)
         self.window._refresh_data_navigator()
-        for index in range(2):
-            self.window.data_navigator.topLevelItem(index).setSelected(True)
-        with patch('spectra_app.main_window.QInputDialog.getItem', return_value=('', False)):
+        for book in books:
+            self.window.project.select_key(('workbook', book.workbook_id), Qt.ControlModifier)
+        with patch('spectra_app.main_window.prompt_item', return_value=('', False)):
             self.window.merge_workbooks_btn.trigger()
         self.assertEqual([b.sheet_ids for b in books], before)
         self.assertFalse(self.errors)
@@ -246,7 +242,7 @@ class OrganizationModelTests(unittest.TestCase):
         self.assertTrue(np.isnan(state.resolve_curve(self.workspace, curve)[1]).all())
         self.assertIs(self.role('fit_curves', 2), curves)
 
-    def test_snapshot_merge_remove_and_source_free_schema6(self):
+    def test_snapshot_merge_remove_and_source_free_column_metadata_schema11(self):
         state.reconcile_dataset_sheets(self.workspace, 'owner-0')
         source = self.role('fit_parameters')
         snapshot = state.save_sheet_snapshot(self.workspace, source.sheet_id, 'Before clear')
@@ -261,7 +257,8 @@ class OrganizationModelTests(unittest.TestCase):
         self.assertEqual(snapshot.snapshot_note, note)
         path = self.folder / 'organized.spectra'
         write_project(path, self.workspace)
-        self.assertEqual(json.loads(archive_members(path)['manifest.json'])['version'], 8)
+        self.assertTrue(snapshot.column_metadata)
+        self.assertEqual(json.loads(archive_members(path)['manifest.json'])['version'], 11)
         for source in self.folder.glob('*.dat'):
             source.unlink()
         loaded = read_project(path)

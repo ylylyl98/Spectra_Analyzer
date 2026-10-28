@@ -1,24 +1,25 @@
-"""Selective transfer and comparison proof at the actual MainWindow boundary."""
+"""Selective transfer and comparison proof at the production Quick boundary."""
+from tests import dat_properties_quick_helpers as dat
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from copy import deepcopy
 from dataclasses import replace
 import json
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
 from shiboken6 import isValid
 
-from spectra_app.main_window import MainWindow
+from spectra_app.common_prompts import PromptAction
 from spectra_app.plot_presentation import PlotAnnotation
 from spectra_app.plot_templates import FORMAT_TEMPLATES_KEY, FormatApplicationOptions, FormatTemplate
-from tests.settings_helpers import isolate_settings
-
-APP = QApplication.instance() or QApplication([])
+from tests.quick_migration_case import QuickMigrationCase
+from tests.quick_application_helpers import application, wait_until
+from tests.formal_quick_helpers import click_item, item as quick_item, input_receiver, pump
 
 
 def ranges_only(**kwargs):
@@ -26,12 +27,11 @@ def ranges_only(**kwargs):
                                     colormap=False, colorbar=False, **kwargs)
 
 
-class PlotCopyCompareWorkflowTests(unittest.TestCase):
+class PlotCopyCompareWorkflowTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.w = MainWindow()
-        self.errors = []
-        self.w._show_error = self.errors.append
+        super().setUp()
+        self.w = self.controller
+        self.errors = self.quick_errors
         self.paths = []
         for name in ('condition-a', 'condition-b', 'condition-c'):
             path = self.folder / (name + '.dat')
@@ -40,26 +40,51 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
             self.paths.append(path)
             self.w._load_dat_file_direct(path)
         self.a, self.b, self.c = self.w.workspace.datasets.values()
-        self.w.resize(1500, 960)
-        self.w.show()
+        self.host.window.resize(1500, 960)
+        self.w.open_graph_document()
+        self.w.dat_details_action.setChecked(True)
+        self.assertTrue(self.w.request_task(2))
         # Let startup layout callbacks finish before assertions about frozen bytes.
         QTest.qWait(250)
 
     def tearDown(self):
-        self.w.close()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+        self.assertEqual(self.errors, [])
+
+    def formal_call(self, page, method, *args):
+        # Ordinary Analysis edits use their actual visible typed Properties
+        # consumer; an input lease for a Workspace page cannot authorize them.
+        self.w.dat_details_action.setChecked(True)
+        self.assertTrue(self.w.request_task(2))
+        pump()
+        source = quick_item(self.w, 'formalProperties')
+        self.assertTrue(source.isVisible())
+        self.assertIs(self.w.plot_page, page)
+        token = page.formal.capturePropertiesInput(source)
+        self.assertTrue(token, dict(view=self.w.outerView, context=self.w.contextKind,
+                                  active=self.w.graph_documents.registry.active_key,
+                                  source_owner=self.w._document_key(),
+                                  properties_current=self.w.propertiesController is page,
+                                  source_current=source.property('bridge') is page.formal,
+                                  system=page.formal.system_allowed(),
+                                  source_enabled=source.isEnabled()))
+        return getattr(page.formal, method)(*args, source, token)
 
     def copy_source(self):
         self.assertTrue(hasattr(self.w, 'copy_plot_settings'), 'Direct settings capture is missing')
         self.w.activate_dataset(self.a.dataset_id)
-        self.w.plot_title_edit.setText('Condition A')
+        # The source editor follows the active scientific DAT in Analysis;
+        # opening C in Workspace does not publish A's document automatically.
+        self.assertTrue(self.w.request_outer_view('analysis'))
+        self.assertEqual(self.w.workspace.active_dataset_id, self.a.dataset_id)
+        self.assertEqual(self.w._document_key()[0], self.a.dataset_id)
+        self.assertEqual(self.w.outerView, 'analysis')
+        self.w.dat_properties.setLabel('plot_title', 'Condition A', self.w.dat_properties.ownerToken)
         self.w.set_plot_presentation(replace(self.a.presentation, width_in=4.2, aspect_locked=False,
                                             title_position=(.23, .77)))
-        self.w.cmap_combo.setCurrentText('plasma')
+        dat.set_choice(self.w, 'colormap', 'plasma')
         for name, value in (('xmin', 1.2), ('xmax', 1.9), ('ymin', .2), ('ymax', 1.8),
                             ('vmin', -22.), ('vmax', 122.)):
-            getattr(self.w, name + '_spin').setValue(value)
+            dat.setup_number(self.w, name, value)
         return self.w.copy_plot_settings()
 
     def test_direct_copy_is_frozen_without_named_store_and_selective_inactive_paste_locks_ranges(self):
@@ -68,8 +93,8 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         copied = self.copy_source()
         self.assertIsNone(w._annotation_settings.value(FORMAT_TEMPLATES_KEY))
         self.assertEqual(copied.x_limits, (1.2, 1.9))
-        self.assertIn(str(self.paths[0]), w.plot_page.clipboard_label.text())
-        w.xmin_spin.setValue(1.4)
+        self.assertIn(str(self.paths[0]), w.plot_page.formal.state['clipboard'])
+        dat.setup_number(w, 'xmin', 1.4)
         w.set_plot_presentation(replace(self.a.presentation, width_in=3.7))
         self.b.view.annotations['plot_title'] = 'Condition B'
         old_page, old_fit, old_cube = self.b.presentation, self.b.fit_result, self.b.current_cube
@@ -96,22 +121,25 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         w.activate_dataset(self.b.dataset_id)
         self.assertEqual(self.b.view.x_limits, (1.2, 1.9))
         w._save_current_plot_state()
-        other = MainWindow()
-        self.addCleanup(other.close)
+        other_host, _, other_errors = self.enterContext(application())
+        other = other_host.controller
+        self.addCleanup(lambda: self.assertFalse(other_errors))
         other._load_dat_file_direct(self.paths[1])
         self.assertEqual(other.workspace.active.view.x_limits, (1.2, 1.9))
         self.assertEqual(other.workspace.active.presentation.title_position, (.23, .77))
-        self.assertTrue(other.xmin_lock.isChecked())
+        self.assertTrue(dat.state(other)['xmin_lock'])
 
     def test_invalid_source_editor_retains_previous_clipboard_and_named_save_uses_fresh_positions(self):
         copied = self.copy_source()
-        self.w.plot_page.font_edit.setText('')
-        self.w.plot_page._emit_presentation()
+        page = self.w.plot_page
+        original_width = page.formal.state['fields']['width_in']
+        self.formal_call(page, 'setDraft', 'width_in', '')
+        self.assertFalse(self.formal_call(page, 'commitField', 'width_in'))
         with self.assertRaisesRegex(ValueError, 'editor'):
             self.w.copy_plot_settings()
         self.assertIs(self.w._plot_settings_clipboard, copied)
-        self.w.plot_page.font_edit.setText('Arial')
-        self.w.plot_page._emit_presentation()
+        self.formal_call(page, 'setDraft', 'width_in', original_width)
+        self.assertTrue(self.formal_call(page, 'commitField', 'width_in'))
         self.w.set_plot_presentation(replace(self.a.presentation,
             annotations=(PlotAnnotation('data-note', text='A', position=(1.55, 1.), coordinate_space='data'),)))
         self.w.save_plot_format('Fresh')
@@ -125,9 +153,10 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         w, p = self.w, self.w.plot_page
         w.set_plot_presentation(replace(self.a.presentation, annotations=(
             PlotAnnotation('draft', text='Draft', position=(.2, .3)),)))
-        p.annotation_text.setText('Pending σ⁺')
-        p.annotation_x.setValue(.33)
-        p.width_spin.lineEdit().setText('4.6')
+        self.formal_call(p, 'selectAnnotation', 'draft')
+        self.formal_call(p, 'setDraft', 'annotation_text', 'Pending σ⁺')
+        self.formal_call(p, 'setDraft', 'annotation_x', '.33')
+        self.formal_call(p, 'setDraft', 'width_in', '4.6')
         captured = w.copy_plot_settings()
         self.assertEqual(captured.style.width_in, 4.6)
         self.assertEqual(captured.annotation_layout[0].text, 'Pending σ⁺')
@@ -138,22 +167,27 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         w = self.w
         w.save_plot_format('Selective')
         w.activate_dataset(self.b.dataset_id)
+        self.assertIs(w.open_graph_document(self.b.dataset_id), w.plot_page)
+        self.assertEqual(w.outerView, 'workspace')
+        pump()
+        self.assertEqual(w.workspace.active_dataset_id, self.b.dataset_id)
+        self.assertTrue(w.plot_page.command_enabled('format_load'))
         old_width = self.b.presentation.width_in
         untouched = deepcopy(self.c.view)
         selected = []
         def accept_options():
             from spectra_app.plot_dialogs import ApplyFormatDialog
-            dialogs = w.findChildren(ApplyFormatDialog)
+            dialogs = self.host.window.findChildren(ApplyFormatDialog)
             if not dialogs:
                 return
             dialog = dialogs[-1]
             selected.extend(dialog.selected_ids())
-            for check in dialog.option_checks.values():
+            for check in dialog.bridge.option_items.values():
                 check.setChecked(False)
-            dialog.option_checks['x_limits'].setChecked(True)
+            dialog.bridge.option_items['x_limits'].setChecked(True)
             dialog.accept()
         QTimer.singleShot(0, accept_options)
-        w.plot_page.format_load_btn.click()
+        w.plot_page.formal.command('format_load')
         self.assertEqual(selected, [self.b.dataset_id])
         self.assertEqual(self.b.view.x_limits, (1.2, 1.9))
         self.assertEqual(self.b.presentation.width_in, old_width)
@@ -165,54 +199,70 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         self.addCleanup(dialog.close)
         self.assertTrue(dialog.options().layout)
         self.assertFalse(dialog.options().x_limits)
-        dialog.only_format_btn.click()
-        dialog.option_checks['layout'].setChecked(False)
-        dialog.option_checks['typography'].setChecked(False)
-        dialog.option_checks['axis'].setChecked(False)
-        dialog.option_checks['colormap'].setChecked(False)
-        dialog.option_checks['colorbar'].setChecked(False)
-        dialog.option_checks['x_limits'].setChecked(True)
-        preview = dialog.preview_text.toPlainText()
+        dialog.bridge.quickOptions(False)
+        dialog.bridge.option_items['layout'].setChecked(False)
+        dialog.bridge.option_items['typography'].setChecked(False)
+        dialog.bridge.option_items['axis'].setChecked(False)
+        dialog.bridge.option_items['colormap'].setChecked(False)
+        dialog.bridge.option_items['colorbar'].setChecked(False)
+        dialog.bridge.option_items['x_limits'].setChecked(True)
+        preview = dialog.bridge.previewText
         self.assertIn('X:', preview)
         self.assertIn('Fixed', preview)
         self.assertIn('1.2', preview)
-        self.assertEqual(dialog.targets.item(0).data(Qt.UserRole), self.a.dataset_id)
-        self.assertIn(self.a.active_graph.name, dialog.targets.item(0).text())
+        self.assertEqual(dialog.bridge.targets[0].datasetId, self.a.dataset_id)
+        self.assertIn(self.a.active_graph.name, dialog.bridge.targets[0].label)
         legacy = self.w._plot_settings_clipboard.to_dict()
         for key in ('x_limits', 'y_limits', 'title_position', 'annotation_layout'):
             legacy.pop(key)
         old = FormatTemplate.from_dict(legacy)
         from spectra_app.plot_dialogs import ApplyFormatDialog
-        old_dialog = ApplyFormatDialog((self.a,), self.a.dataset_id, old, self.w)
+        old_dialog = ApplyFormatDialog((self.a,), self.a.dataset_id, old, self.host.window)
         self.addCleanup(old_dialog.close)
         for name in ('x_limits', 'y_limits', 'title_position', 'annotation_positions'):
-            self.assertFalse(old_dialog.option_checks[name].isEnabled())
-            self.assertIn('unavailable', old_dialog.option_checks[name].text().lower())
+            self.assertFalse(old_dialog.bridge.option_items[name].available)
+            self.assertIn('unavailable', old_dialog.bridge.option_items[name].label.lower())
 
     def test_title_editor_and_actual_drag_preserve_auto_geometry_text_and_annotation_delete_safety(self):
-        self.assertTrue(hasattr(self.w.plot_page, 'title_x_spin'), 'Title position editor is missing')
-        w, p = self.w, self.w.plot_page
-        w.plot_title_edit.setText('Condition C σ⁺')
+        self.assertIn('title_x', self.w.plot_page.formal.state['fields'])
+        w = self.w
+        p = w.open_graph_document()
+        w.dat_properties.setLabel('plot_title', 'Condition C σ⁺', w.dat_properties.ownerToken)
         w.set_plot_presentation(replace(self.c.presentation, frame_width_in=None, frame_height_in=None,
             annotations=(PlotAnnotation('keep', text='keep', position=(.5, .5)),)))
-        w.plot_tabs.setCurrentIndex(1)
-        p.title_x_spin.setValue(.2)
-        p.title_y_spin.setValue(.8)
+        self.assertTrue(w.request_outer_view('workspace'))
+        pump()
+        self.formal_call(p, 'setValue', 'title_x', .2)
+        self.formal_call(p, 'setValue', 'title_y', .8)
+        self.assertEqual(self.c.presentation.title_position, (.2, .8))
         QTest.qWait(250)
         w._render_plot_page()
-        APP.processEvents()
+        pump()
         before = p.rendered_page
-        self.assertIsNotNone(before, p.status_label.text())
+        self.assertIsNotNone(before, p.status_text)
+        # Hidden Analysis geometry is deferred in the Quick shell. Inspect the
+        # real live view, then return to this same formal paper for native input.
+        self.assertTrue(w.request_outer_view('analysis'))
+        self.assertEqual(w.workspace.active_dataset_id, self.c.dataset_id)
         w._layout_live_plots()
         self.assertEqual(w._heat_ax.title.get_position(), (.2, .8))
+        self.assertTrue(w.request_outer_view('workspace'))
+        self.assertIs(w.plot_page, p)
         p.select_annotation('keep')
-        start = p.preview.title_point()
-        QTest.mousePress(p.preview, Qt.LeftButton, pos=start)
-        QTest.mouseMove(p.preview, start + QPoint(20, 12), delay=10)
-        QTest.mouseRelease(p.preview, Qt.LeftButton, pos=start + QPoint(20, 12))
+        pump()
+        left, bottom, width, height = before.object_bounds['title'][0]
+        paper_width, paper_height = p.preview.paper_display_size()
+        paper = quick_item(w, 'formalPaper')
+        viewport = quick_item(w, 'formalViewport')
+        start = paper.mapToScene(QPointF((left+width/2)*paper_width,
+                                         (1-bottom-height/2)*paper_height)).toPoint()
+        self.assertTrue(viewport.contains(viewport.mapFromScene(QPointF(start))))
+        QTest.mousePress(self.host.window, Qt.LeftButton, pos=start)
+        QTest.mouseMove(self.host.window, start + QPoint(20, 12), delay=10)
+        QTest.mouseRelease(self.host.window, Qt.LeftButton, pos=start + QPoint(20, 12))
         self.assertNotEqual(self.c.presentation.title_position, (.2, .8))
-        p.preview.setFocus()
-        QTest.keyClick(p.preview, Qt.Key_Delete)
+        viewport.forceActiveFocus()
+        QTest.keyClick(self.host.window, Qt.Key_Delete)
         self.assertEqual(len(self.c.presentation.annotations), 1)
         w._render_plot_page()
         self.assertEqual(p.rendered_page.axes_bounds, before.axes_bounds)
@@ -235,14 +285,13 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         self.b.presentation = replace(self.b.presentation, annotations=targets)
         dialog = w.create_paste_settings_dialog()
         self.addCleanup(dialog.close)
-        dialog.select_all_btn.click()
-        dialog.option_checks['annotation_positions'].setChecked(True)
+        dialog.bridge.selectAll(True)
+        dialog.bridge.option_items['annotation_positions'].setChecked(True)
         self.assertEqual(dialog.annotation_pairs(), {})  # Duplicate text must not infer matches.
-        self.assertIn('skipped', dialog.preview_text.toPlainText().lower())
-        dialog.pair_combos[self.b.dataset_id]['s1'].setCurrentIndex(
-            dialog.pair_combos[self.b.dataset_id]['s1'].findData('t2'))
-        dialog.pair_combos[self.b.dataset_id]['sa'].setCurrentIndex(
-            dialog.pair_combos[self.b.dataset_id]['sa'].findData('ta'))
+        self.assertIn('skipped', dialog.bridge.previewText.lower())
+        for source_id, target_id in (('s1', 't2'), ('sa', 'ta')):
+            pair = next(p for p in dialog.bridge.pairs if p.dataset_id == self.b.dataset_id and p.source_id == source_id)
+            pair.setCurrentIndex(pair.target_ids.index(target_id))
         pairs = dialog.annotation_pairs()
         report = w.paste_plot_settings([self.b.dataset_id, self.c.dataset_id],
             options=ranges_only(title_position=True, annotation_positions=True), annotation_pairs=pairs)
@@ -263,24 +312,24 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         self.assertTrue(hasattr(self.w, 'open_plot_comparison'), 'MainWindow comparison capture is missing')
         w = self.w
         w.activate_dataset(self.a.dataset_id)
-        w.plot_title_edit.setText('Capture A')
-        self.assertIn(str(self.paths[0]), w.plot_page.comparison_btn.toolTip())
+        w.dat_properties.setLabel('plot_title', 'Capture A', w.dat_properties.ownerToken)
+        self.assertIn(str(self.paths[0]), w.plot_page.command_tooltip('comparison'))
         first = w.open_plot_comparison()
-        w.plot_title_edit.setText('Capture B')
-        w.cmap_combo.setCurrentText('plasma')
+        w.dat_properties.setLabel('plot_title', 'Capture B', w.dat_properties.ownerToken)
+        dat.set_choice(w, 'colormap', 'plasma')
         second = w.open_plot_comparison()
-        originals = [win.preview.svg_bytes for win in (first, second)]
+        originals = [win.svg_bytes for win in (first, second)]
         self.assertNotEqual(*originals)
         w.activate_dataset(self.c.dataset_id)
-        w.plot_title_edit.setText('Third active')
+        w.dat_properties.setLabel('plot_title', 'Third active', w.dat_properties.ownerToken)
         self.assertIn(str(self.paths[2]), w._comparison_action.toolTip())
-        w.cmap_combo.setCurrentText('inferno')
+        dat.set_choice(w, 'colormap', 'inferno')
         w._render_plot_page()
         owner, generation, arrays = w.workspace.active_dataset_id, w._data_generation, self.c.current_cube.z.copy()
-        main_zoom = w.plot_page.zoom_combo.currentText()
+        main_zoom = w.plot_page.zoom_text
         first.set_zoom('200%')
-        self.assertEqual(w.plot_page.zoom_combo.currentText(), main_zoom)
-        self.assertEqual(second.zoom_combo.currentText(), 'Fit')
+        self.assertEqual(w.plot_page.zoom_text, main_zoom)
+        self.assertEqual(second.bridge.zoom, 'Fit')
         for i, window in enumerate((first, second)):
             saved = window.export_svg(self.folder / f'capture-{i}.svg')
             self.assertEqual(saved.read_bytes(), originals[i])
@@ -293,10 +342,15 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
         np.testing.assert_array_equal(self.c.current_cube.z, arrays)
         first.close()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+        pump()
         self.assertEqual(w._plot_comparison_windows, [second])
-        w.close()
-        APP.processEvents()
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.DISCARD) as prompt:
+            self.host.window.close()
+            wait_until(lambda: w._closing)
+        prompt.assert_called_once()
+        self.assertEqual(prompt.call_args.args[3],
+                         (PromptAction.SAVE, PromptAction.DISCARD, PromptAction.CANCEL))
+        pump()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.assertFalse(isValid(second))
 
@@ -307,7 +361,7 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
                              ('3', [(-21., 21.), (-31., 31.), (-61., 161.)])):
             w.activate_dataset(self.a.dataset_id)
             w.set_plot_presentation(replace(self.a.presentation, height_in=5.))
-            w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData(mode))
+            dat.set_choice(w, 'color_scale', mode)
             self.a.view.color_limits = limits[0]
             self.a.view.last_valid_color_limits = limits[0]
             self.a.view.last_valid_region_color_limits = limits
@@ -334,67 +388,107 @@ class PlotCopyCompareWorkflowTests(unittest.TestCase):
 
     def test_clipped_title_does_not_intercept_clicks_beyond_heatmap_frame(self):
         self.assertTrue(hasattr(self.w.plot_page.preview, 'title_point'), 'Title interaction is missing')
-        w, p = self.w, self.w.plot_page
-        w.plot_tabs.setCurrentIndex(1)
-        w.plot_title_edit.setText('Long literal clipped title ' * 6)
+        w = self.w
+        p = w.open_graph_document()
+        self.assertTrue(w.request_outer_view('workspace'))
+        pump()
+        w.dat_properties.setLabel('plot_title', 'Long literal clipped title ' * 6, w.dat_properties.ownerToken)
         w.set_plot_presentation(replace(self.c.presentation, title_position=(.85, .85)))
         QTest.qWait(250)
         w._render_plot_page()
+        pump()
         page = p.rendered_page
-        self.assertIsNotNone(page, p.status_label.text())
+        self.assertIsNotNone(page, p.status_text)
         left, bottom, width, height = page.axes_bounds
-        outside = QPoint(round((left+width)*p.preview.width())+4, p.preview.title_point().y()+4)
-        QTest.mousePress(p.preview, Qt.LeftButton, pos=outside)
-        self.assertIsNone(p.preview._drag_title,
+        paper_width, _ = p.preview.paper_display_size()
+        paper = quick_item(w, 'formalPaper')
+        viewport = quick_item(w, 'formalViewport')
+        outside = paper.mapToScene(QPointF((left+width)*paper_width+4,
+                                           p.preview.title_point().y()+4)).toPoint()
+        self.assertTrue(viewport.contains(viewport.mapFromScene(QPointF(outside))))
+        QTest.mousePress(self.host.window, Qt.LeftButton, pos=outside)
+        self.assertIsNone(p.preview._gesture,
                           'Invisible title text outside the clipped axes must not start a drag.')
-        QTest.mouseRelease(p.preview, Qt.LeftButton, pos=outside)
+        QTest.mouseRelease(self.host.window, Qt.LeftButton, pos=outside)
 
     def test_regional_fixed_controls_can_unlock_and_return_to_visible_percentiles(self):
         # A copied regional lock must be observable and reversible in the actual controls.
         w = self.w
-        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData('2'))
+        dat.set_choice(w, 'color_scale', '2')
         self.c.view.last_valid_region_color_limits = [(-20., 20.), (-50., 130.)]
         self.c.view.color_limits = (-20., 20.)
         self.c.view.bounds.update(vmin=-20., vmax=20.)
         self.c.view.locks.update(vmin=True, vmax=True)
         w._project_plot_dataset(self.c)
-        self.assertTrue(w.vmin_lock.isEnabled())
-        self.assertTrue(w.vmax_lock.isEnabled())
-        self.assertTrue(w.auto_color_btn.isEnabled())
-        self.assertIn('Fixed', w.color_range_status.text())
-        self.assertFalse(w.vmin_spin.isEnabled())
-        w.vmax_lock.click()
-        self.assertIn('Partial', w.color_range_status.text())
+        self.assertTrue(dat.dat_item(w, 'vmin_lock').isEnabled())
+        self.assertTrue(dat.dat_item(w, 'vmax_lock').isEnabled())
+        self.assertTrue(dat.dat_item(w, 'shared_auto_colors').isEnabled())
+        self.assertIn('Fixed', dat.state(w)['color_range_status'])
+        self.assertFalse(dat.dat_item(w, 'vmin').isEnabled())
+        dat.click(w, 'vmax_lock')
+        self.assertIn('Partial', dat.state(w)['color_range_status'])
         self.assertEqual([m.get_clim()[0] for m in w._heat_meshes], [-20., -50.])
-        w.auto_color_btn.click()
-        self.assertFalse(w.vmin_lock.isChecked())
-        self.assertFalse(w.vmax_lock.isChecked())
-        w.ymin_spin.setValue(1.)
+        dat.click(w, 'shared_auto_colors')
+        self.assertFalse(dat.state(w)['vmin_lock'])
+        self.assertFalse(dat.state(w)['vmax_lock'])
+        dat.setup_number(w, 'ymin', 1.)
         np.testing.assert_allclose([m.get_clim() for m in w._heat_meshes],
                                    [(1.055, 59.45), (7.055, 119.45)], atol=1e-8)
-        self.assertIn('independent Auto', w.color_range_status.text())
+        self.assertIn('independent Auto', dat.state(w)['color_range_status'])
 
     def test_switching_global_fixed_to_regional_starts_independent_auto_ranges(self):
         w = self.w
-        w.vmin_spin.setValue(-20.)
-        w.vmax_spin.setValue(130.)
-        w.vmin_lock.setChecked(True)
-        w.vmax_lock.setChecked(True)
-        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData('2'))
-        self.assertFalse(w.vmin_lock.isChecked())
-        self.assertFalse(w.vmax_lock.isChecked())
-        w.ymin_spin.setValue(1.)
+        dat.setup_number(w, 'vmin', -20.)
+        dat.setup_number(w, 'vmax', 130.)
+        dat.set_flag(w, 'vmin_lock', True)
+        dat.set_flag(w, 'vmax_lock', True)
+        dat.set_choice(w, 'color_scale', '2')
+        self.assertFalse(dat.state(w)['vmin_lock'])
+        self.assertFalse(dat.state(w)['vmax_lock'])
+        dat.setup_number(w, 'ymin', 1.)
         np.testing.assert_allclose([m.get_clim() for m in w._heat_meshes],
                                    [(1.055, 59.45), (7.055, 119.45)], atol=1e-8)
 
     def test_copy_and_named_actions_fit_narrower_mainwindow_without_expanding_it(self):
         w = self.w
-        w.plot_tabs.setCurrentIndex(1)
-        w.resize(1250, 960)
-        APP.processEvents()
-        self.assertLessEqual(w.width(), 1250, 'Plot actions must not impose an oversized minimum window width.')
-        for button in (w.plot_page.copy_settings_btn, w.plot_page.paste_settings_btn,
-                       w.plot_page.copy_settings_to_btn, w.plot_page.comparison_btn,
-                       w.plot_page.format_save_btn, w.plot_page.format_load_btn):
-            self.assertTrue(w.plot_page.rect().contains(button.geometry().topLeft()))
-            self.assertTrue(w.plot_page.rect().contains(button.geometry().bottomRight()))
+        w.open_graph_document()
+        self.host.window.resize(1250, 960)
+        pump(60)
+        self.assertLessEqual(self.host.window.width(), 1250, 'Plot actions must not impose an oversized minimum window width.')
+        host = w
+        for name in ('formal_settings_menu', 'formal_formats_menu'):
+            button = quick_item(host, name)
+            top_left = button.mapToScene(QPointF()).toPoint()
+            bottom_right = button.mapToScene(QPointF(button.width(), button.height())).toPoint()
+            self.assertTrue(self.host.window.contentItem().contains(QPointF(top_left)), (name, top_left))
+            self.assertTrue(self.host.window.contentItem().contains(QPointF(bottom_right)), (name, bottom_right))
+        for menu, commands in (('formal_settings_menu', ('settings_copy', 'settings_paste',
+                                'settings_copy_to', 'comparison')),
+                               ('formal_formats_menu', ('format_save', 'format_load'))):
+            click_item(host, menu)
+            popup = None
+            for command in commands:
+                control = quick_item(host, 'formal_' + command)
+                self.assertTrue(control.isVisible(), command)
+                self.assertGreater(control.width(), 0, command)
+                self.assertGreater(control.height(), 0, command)
+                window = input_receiver(w, control)
+                self.assertIsNotNone(window, command)
+                self.assertIsNot(window, self.host.window, command)
+                self.assertTrue(window.isVisible(), command)
+                if popup is None:
+                    popup = window
+                self.assertIs(window, popup, command)
+                top_left = window.mapToGlobal(control.mapToScene(QPointF()).toPoint())
+                bottom_right = window.mapToGlobal(control.mapToScene(QPointF(
+                    control.width()-1, control.height()-1)).toPoint())
+                popup_bounds = window.geometry()
+                screen = window.screen()
+                self.assertIsNotNone(screen, command)
+                screen_bounds = screen.availableGeometry()
+                for point in (top_left, bottom_right):
+                    self.assertTrue(popup_bounds.contains(point), (command, point, popup_bounds))
+                    self.assertTrue(screen_bounds.contains(point), (command, point, screen_bounds))
+            QTest.keyClick(popup, Qt.Key_Escape)
+            pump()
+            self.assertFalse(quick_item(host, 'formal_' + commands[0]).isVisible(), menu)

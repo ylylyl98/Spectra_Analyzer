@@ -2,78 +2,102 @@
 from copy import deepcopy
 import unittest
 
-from PySide6.QtCore import Qt, QEvent
+from PySide6.QtCore import QCoreApplication, QPointF, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from tests.quick_migration_case import QuickMigrationCase
+from tests import formal_quick_helpers as formal
+from unittest.mock import patch
 import tests.test_xy_analysis_workflow as workflow_fixture
 from tests.settings_helpers import wait_for_background_jobs
 
-APP = QApplication.instance() or QApplication([])
+from tests.xy_analysis_quick_helpers import analysis_command, choose_analysis, type_analysis_field as _type_analysis_field
+from tests.xy_helpers import set_xy_draft, xy_value
+
+from tests.test_xy_layout_compact import click_curve_row, task, keyboard_task
+
+APP = QCoreApplication
 
 
-class XYUsabilityTests(unittest.TestCase):
+def type_analysis_field(panel, field, text):
+    window, control = _type_analysis_field(panel, field, text)
+    assert control.isVisible(), field
+    ancestor, viewport_found = control.parentItem(), False
+    while ancestor is not None:
+        if ancestor.metaObject().indexOfProperty('contentY') >= 0:
+            top = control.mapToItem(ancestor, QPointF())
+            assert top.x() >= -.5 and top.y() >= -.5, field
+            assert top.x() + control.width() <= ancestor.width() + .5, field
+            assert top.y() + control.height() <= ancestor.height() + .5, field
+            viewport_found = True
+        ancestor = ancestor.parentItem()
+    assert viewport_found, 'Analysis editor must be inside its real scroll viewport: ' + field
+    if text == '':
+        # An empty input-method commit leaves the selection intact in Qt Quick.
+        # Delete through the same actual editor/window input route as a user.
+        QTest.keyClick(window, Qt.Key_Backspace)
+        formal.pump()
+    return window, control
+
+
+class XYUsabilityTests(QuickMigrationCase):
     setUp = workflow_fixture.XYAnalysisWorkflowTests.setUp
     analyze = workflow_fixture.XYAnalysisWorkflowTests.analyze
     fit = workflow_fixture.XYAnalysisWorkflowTests.fit
 
     def dispose(self):
-        APP.clipboard().clear()
         workflow_fixture.XYAnalysisWorkflowTests.dispose(self)
 
     def select_other(self):
-        self.page.inspector_tabs.setCurrentIndex(0)
+        task(self, 0)
         APP.processEvents()
-        QTest.mouseClick(self.page.curve_list.viewport(), Qt.LeftButton,
-                        pos=self.page.curve_list.visualItemRect(self.page.curve_list.item(1)).center())
-        self.page.inspector_tabs.setCurrentIndex(1)
+        click_curve_row(self.page, 1)
+        task(self, 1)
         APP.processEvents()
-        return self.page.curve_list.item(1).data(Qt.UserRole)
+        return list(self.page.comparison.curves)[1]
 
     def test_browsing_other_curve_cannot_mutate_retained_analysis_settings(self):
         self.fit()
         saved = deepcopy(self.page.comparison.analysis_state)
         fit = self.panel.fit_result
         self.select_other()
-        self.assertFalse(self.panel.model_combo.isEnabled())
-        self.assertFalse(self.panel.preset_combo.isEnabled())
+        self.assertFalse(self.panel.bridge.state['editable'])
         # Slots are owner checked even when a non-mouse caller changes a control.
-        self.panel.preset_combo.setCurrentText('Strict')
-        self.panel.model_combo.setCurrentText('Lorentzian')
+        self.assertFalse(choose_analysis(self.panel, 'preset', 'Strict'))
+        self.assertFalse(choose_analysis(self.panel, 'model', 'Lorentzian'))
         self.assertEqual(self.page.comparison.analysis_state, saved)
         self.assertIs(self.panel.fit_result, fit)
-        self.assertIn('Resume', self.panel.resume_btn.text())
-        self.assertIn('Start analysis', self.panel.start_selected_btn.text())
-        self.panel.resume_btn.click()
+        self.assertIn('Resume', self.panel.bridge.state['resumeText'])
+        self.assertIn('Start analysis', self.panel.bridge.state['startText'])
+        analysis_command(self.panel, 'resume')
         APP.processEvents()
         self.assertEqual(self.page._selected_ids(), {saved['curve_id']})
-        self.assertEqual(self.panel.model_combo.currentText(), 'Gaussian')
+        self.assertEqual(self.panel.bridge.values['model'], 'Gaussian')
         self.assertEqual(self.page.comparison.analysis_state, saved)
         self.assertIs(self.panel.fit_result, fit)
 
     def test_all_numeric_intermediate_drafts_preserve_fit_and_payload(self):
+        self.analyze()
+        self.assertTrue(choose_analysis(self.panel, 'detector', 'D2'))
         self.fit()
         saved = deepcopy(self.page.comparison.analysis_state)
         fit = self.panel.fit_result
-        self.panel.details_btn.click()
+        analysis_command(self.panel, 'settings')
         APP.processEvents()
-        spins = (*self.panel._filter_spins(), self.panel.width_min_spin,
-                 self.panel.width_max_spin, self.panel.sg_window_spin, self.panel.sg_order_spin)
-        for spin in spins:
-            with self.subTest(editor=spin.accessibleName()):
-                edit = spin.lineEdit()
-                before = edit.text()
-                edit.setFocus()
-                QTest.keyClick(edit, Qt.Key_A, Qt.ControlModifier)
-                QTest.keyClick(edit, Qt.Key_Backspace)
-                APP.processEvents()
+        fields = ('prominence', 'noise', 'distance', 'candidateWidthMin', 'candidateWidthMax',
+                  'maxCount', 'widthMin', 'widthMax', 'sgWindow', 'sgOrder')
+        for field in fields:
+            with self.subTest(editor=field):
+                before = self.panel.bridge.drafts[field]
+                window, edit = type_analysis_field(self.panel, field, '')
+                self.assertEqual(edit.property('text'), '')
                 self.assertIs(self.panel.fit_result, fit)
                 self.assertEqual(self.page.comparison.analysis_state, saved)
-                self.assertFalse(self.panel.find_btn.isEnabled())
-                self.assertFalse(self.panel.fit_btn.isEnabled())
-                self.assertFalse(self.panel.save_btn.isEnabled())
-                self.assertTrue(self.panel.settings_error.text())
-                edit.setText(before)
-                QTest.keyClick(edit, Qt.Key_Return)
+                self.assertFalse(self.panel.bridge.state['findEnabled'])
+                self.assertFalse(self.panel.bridge.state['fitEnabled'])
+                self.assertFalse(self.panel.bridge.state['saveEnabled'])
+                self.assertTrue(self.panel.bridge.state['error'])
+                type_analysis_field(self.panel, field, before)
+                QTest.keyClick(window, Qt.Key_Return)
                 APP.processEvents()
                 self.assertIs(self.panel.fit_result, fit)
                 self.assertEqual(self.page.comparison.analysis_state, saved)
@@ -82,57 +106,53 @@ class XYUsabilityTests(unittest.TestCase):
         self.fit()
         saved = deepcopy(self.page.comparison.analysis_state)
         fit = self.panel.fit_result
-        self.panel.details_btn.click()
-        edit = self.panel.width_min_spin.lineEdit()
-        edit.setFocus()
-        QTest.keyClick(edit, Qt.Key_A, Qt.ControlModifier)
-        QTest.keyClicks(edit, '0.1')
-        APP.processEvents()
+        analysis_command(self.panel, 'settings')
+        window, edit = type_analysis_field(self.panel, 'widthMin', '0.1')
         self.assertEqual(self.page.comparison.analysis_state, saved)
         self.assertIs(self.panel.fit_result, fit)
-        QTest.keyClick(edit, Qt.Key_Return)
+        QTest.keyClick(window, Qt.Key_Return)
         APP.processEvents()
         self.assertIsNone(self.panel.fit_result)
         self.assertEqual(self.panel.captured.settings.width_min, .1)
         self.assertEqual(self.panel.progress.candidate_pool[0].position, saved['candidate_pool'][0]['position'])
-        self.assertNotIn('RMSE', self.panel.status.text())
+        self.assertNotIn('RMSE', self.panel.bridge.state['status'])
 
     def test_invalid_source_still_retires_fit_instead_of_becoming_an_editor_draft(self):
         self.fit()
+        original_fit = self.panel.fit_result
+        type_analysis_field(self.panel, 'widthMin', '-')
+        self.assertIs(self.panel.fit_result, original_fit)
         source = self.w.workspace.sheets[self.panel.captured.provenance['sheet_id']]
         source.data[0, 0] = source.data[1, 0]
         self.page.render()
+        self.assertEqual(self.panel.bridge.drafts['widthMin'], '-')
         self.assertIsNone(self.panel.fit_result)
-        self.assertFalse(self.panel.save_btn.isEnabled())
-        self.assertNotIn('RMSE', self.panel.status.text())
+        self.assertFalse(self.panel.bridge.state['saveEnabled'])
+        self.assertNotIn('RMSE', self.panel.bridge.state['status'])
 
     def test_numeric_draft_survives_navigation_and_resume_rejects_invalid_curve_draft(self):
         self.fit()
         saved = deepcopy(self.page.comparison.analysis_state)
-        self.panel.details_btn.click()
-        edit = self.panel.width_min_spin.lineEdit()
-        edit.setFocus()
-        QTest.keyClick(edit, Qt.Key_A, Qt.ControlModifier)
-        QTest.keyClick(edit, Qt.Key_Backspace)
-        self.panel.details_dialog.hide()
-        self.page.inspector_tabs.tabBar().setFocus()
-        QTest.keyClick(self.page.inspector_tabs.tabBar(), Qt.Key_Right)
+        analysis_command(self.panel, 'settings')
+        window, edit = type_analysis_field(self.panel, 'widthMin', '')
+        self.panel.details_dialog.window().hide()
+        keyboard_task(self, 2)
         APP.processEvents()
-        self.assertEqual(edit.text(), '')
+        self.assertEqual(edit.property('text'), '')
         self.assertEqual(self.page.comparison.analysis_state, saved)
-        self.page.inspector_tabs.setCurrentIndex(1)
-        self.panel.details_btn.click()
+        task(self, 1)
+        analysis_command(self.panel, 'settings')
         APP.processEvents()
-        self.assertEqual(edit.text(), '')
-        edit.setText('0.000000001')
-        QTest.keyClick(edit, Qt.Key_Return)
-        self.panel.details_dialog.hide()
+        self.assertEqual(edit.property('text'), '')
+        window, edit = type_analysis_field(self.panel, 'widthMin', '0.000000001')
+        QTest.keyClick(window, Qt.Key_Return)
+        self.panel.details_dialog.window().hide()
         other = self.select_other()
-        self.page.color_edit.setText('invalid color')
+        set_xy_draft(self.page, 'color', 'invalid color')
         self.page.resume_analysis_action.trigger()
         APP.processEvents()
         self.assertEqual(self.page._selected_ids(), {other})
-        self.assertEqual(self.page.color_edit.text(), 'invalid color')
+        self.assertEqual(xy_value(self.page, 'color'), 'invalid color')
         self.assertEqual(self.page.comparison.analysis_state, saved)
 
     def test_common_interval_tracks_visible_curves_and_navigation_uses_real_data_bounds(self):
@@ -144,21 +164,21 @@ class XYUsabilityTests(unittest.TestCase):
         narrow = add_curve(self.w.workspace, self.page.comparison_id, sheet.sheet_id, 0, 1)
         self.page.refresh()
         self.analyze()
-        self.panel.edit_interval_btn.click()
-        self.page.x_range_combo.setCurrentIndex(self.page.x_range_combo.findData('common'))
+        analysis_command(self.panel, 'interval')
+        self.page.inspector_bridge.setRangeMode('common')
         APP.processEvents()
         self.assertEqual(self.page.axes._comparison_display.x_limits, (-2, 2))
-        self.assertIn('Common overlap of visible curves: -2 to 2', self.page.display_status.text())
-        self.page.inspector_tabs.setCurrentIndex(1)
+        self.assertIn('Common overlap of visible curves: -2 to 2', self.page.inspector_bridge.displayStatus)
+        task(self, 1)
         self.page.axes.set_xlim(.6, .8)
-        self.panel.find_btn.click()
+        analysis_command(self.panel, 'find')
         wait_for_background_jobs(self.w)
         self.assertEqual(self.panel.captured.provenance['interval'], (-2, 2))
-        self.assertIn('-2 to 2', self.panel.context_label.text())
+        self.assertIn('-2 to 2', self.panel.bridge.state['context'])
         narrow.visible = False
         self.page.render()
         self.assertEqual(self.page.axes._comparison_display.x_limits, (-6, 6))
-        self.assertIn('-6 to 6', self.panel.context_label.text())
+        self.assertIn('-6 to 6', self.panel.bridge.state['context'])
         self.assertEqual(self.panel.captured.provenance['interval'], (-6, 6))
 
     def test_analyze_selected_starts_other_curve_and_resume_restores_saved_curve(self):
@@ -167,14 +187,15 @@ class XYUsabilityTests(unittest.TestCase):
         comparison_id = self.page.comparison_id
         target = self.folder / 'resume-usability.spectra'
         self.w.save_project(target)
-        self.assertTrue(self.w.open_project(target))
+        with patch('spectra_app.main_window.prompt_message', side_effect=AssertionError('Clean saved project unexpectedly requested discard')):
+            self.assertTrue(self.w.open_project(target))
         self.w.open_xy_comparison(comparison_id)
-        self.page = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
-        self.panel = self.page.analysis_panel
+        self.page = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
+        self.panel = self.page.analysis_controller
         self.assertTrue(self.page.resume_analysis_action.isEnabled())
         other = self.select_other()
         self.assertEqual(self.page.comparison.analysis_state, saved)
-        self.panel.resume_btn.click()
+        analysis_command(self.panel, 'resume')
         APP.processEvents()
         self.assertEqual(self.page._selected_ids(), {saved['curve_id']})
         self.assertIsNotNone(self.panel.fit_result)
@@ -184,7 +205,7 @@ class XYUsabilityTests(unittest.TestCase):
         self.assertEqual(self.page._selected_ids(), {other})
         self.assertEqual(self.panel.captured.curve_id, other)
         self.assertIsNone(self.panel.fit_result)
-        self.panel.find_btn.click()
+        analysis_command(self.panel, 'find')
         wait_for_background_jobs(self.w)
         self.assertEqual(self.panel.captured.curve_id, other)
         self.assertEqual(len(self.panel.peaks.indices), 1)
@@ -192,14 +213,17 @@ class XYUsabilityTests(unittest.TestCase):
     def test_edit_interval_navigation_preserves_unrelated_drafts(self):
         self.fit()
         saved = deepcopy(self.page.comparison.analysis_state)
-        self.page.stack_step_edit.setText('unfinished offset')
-        self.panel.edit_interval_btn.click()
+        set_xy_draft(self.page, 'stack_step', 'unfinished offset')
+        analysis_command(self.panel, 'interval')
         APP.processEvents()
-        self.assertEqual(self.page.inspector_tabs.currentIndex(), 2)
-        self.assertTrue(self.page.x_range_combo.hasFocus())
-        self.assertEqual(self.page.stack_step_edit.text(), 'unfinished offset')
+        self.assertEqual(self.controller.taskIndex, 2)
+        self.assertTrue(formal.item(self.controller, 'xyChoice_x_range_mode').hasActiveFocus())
+        self.assertEqual(xy_value(self.page, 'stack_step'), 'unfinished offset')
         self.assertEqual(self.page.comparison.analysis_state, saved)
-        self.assertIn('visible curves', self.page.x_range_combo.itemText(self.page.x_range_combo.findData('common')))
+        choices = formal.item(self.controller, 'xyChoice_x_range_mode').property('model')
+        if hasattr(choices, 'toVariant'):
+            choices = choices.toVariant()
+        self.assertIn('Common overlap', [choice['label'] for choice in choices])
 
 
 if __name__ == '__main__':

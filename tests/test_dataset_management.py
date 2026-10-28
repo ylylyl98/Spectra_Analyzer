@@ -1,4 +1,7 @@
+from tests import source_navigation_helpers as sn
 """Dataset management through workspace, Qt and saved-project boundaries."""
+from tests import analysis_header_quick_helpers as ah
+from tests import ordinary_analysis_quick_helpers as oa
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
@@ -9,18 +12,18 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QTimer
-from PySide6.QtGui import QContextMenuEvent
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMenu, QMessageBox
 
 from spectra_app.dataset_state import DatasetSession, Workspace
-from spectra_app.main_window import MainWindow
+from spectra_app.common_prompts import PromptAction
+from tests import dat_properties_quick_helpers as dp
 from tests.background_helpers import wait_jobs
-from tests.settings_helpers import isolate_settings
-from tests.test_workflow import _fit_result
-
-APP = QApplication.instance() or QApplication([])
+from tests.scientific_fixtures import workflow_fit_result as _fit_result
+from tests.quick_migration_case import QuickMigrationCase
+from tests.quick_application_helpers import application, pump
+from tests.formal_quick_helpers import item, input_receiver
 
 
 class WorkspaceRemovalTests(unittest.TestCase):
@@ -43,10 +46,10 @@ class WorkspaceRemovalTests(unittest.TestCase):
         self.assertEqual(workspace.path_index, {})
 
 
-class DatasetManagementTests(unittest.TestCase):
+class DatasetManagementTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self, project_dialogs=True).parent
-        self.windows, self.errors, self.paths = [], [], []
+        super().setUp()
+        self.windows, self.errors, self.paths = [], self.quick_errors, []
         for name in ('first', 'second', 'third'):
             folder = self.folder / name
             folder.mkdir()
@@ -59,19 +62,17 @@ class DatasetManagementTests(unittest.TestCase):
     def tearDown(self):
         for window in self.windows:
             wait_jobs(window)
-            with patch.object(window, '_confirm_project_discard_async',
-                              side_effect=lambda continuation: continuation()):
-                window.close()
-                # Close approval schedules a second close on the GUI event loop.
-                APP.processEvents()
-            window.deleteLater()
-        APP.processEvents()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+        self.assertEqual(self.quick_errors, [])
+        super().tearDown()
 
     def window(self):
-        window = MainWindow()
-        window._show_error = self.errors.append
+        if not self.windows:
+            window = self.controller
+        else:
+            host, _, errors = self.enterContext(application())
+            window = host.controller
+            window._show_error = self.errors.append
+            self.addCleanup(lambda: self.assertEqual(errors, []))
         self.windows.append(window)
         return window
 
@@ -79,26 +80,15 @@ class DatasetManagementTests(unittest.TestCase):
         window = self.window()
         for path in self.paths[:count]:
             window._load_dat_file_direct(path)
+            window.open_graph_document()
+        self.assertTrue(window.request_outer_view('analysis'))
+        window.request_task(1)
+        pump()
         return window, list(window.workspace.datasets.values())
 
     def remove(self, window, dataset_id):
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Yes):
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.YES):
             return window.remove_dataset(dataset_id)
-
-    def menu_choice(self, callback):
-        failures = []
-        def choose():
-            menu = APP.activePopupWidget()
-            try:
-                self.assertIsInstance(menu, QMenu)
-                callback(menu)
-            except BaseException as exc:
-                failures.append(exc)
-            finally:
-                if menu is not None:
-                    menu.close()
-        QTimer.singleShot(0, choose)
-        return failures
 
     def test_inactive_remove_preserves_drafts_results_view_and_history(self):
         w, (a, b, c) = self.loaded()
@@ -106,10 +96,10 @@ class DatasetManagementTests(unittest.TestCase):
         c.fit_result = _fit_result(2.0)
         c.fit_gate_idx = 1
         c.fit_export_rows = [{'gate': '1', 'center': '2'}]
-        w.plot_gate_index_spin.setValue(1)
-        w.plot_title_edit.setText('active pending title')
-        w.prom_spin.lineEdit().setText('0.127')
-        w.analysis_text.setPlainText('retained analysis')
+        ah.edit(w, 'index', '1', commit=True)
+        w.dat_properties.setLabel('plot_title', 'active pending title', w.dat_properties.ownerToken)
+        oa.draft(w, 'prominence', '0.127')
+        oa.set_summary(w, 'retained analysis')
         history = w._edit_histories[c.dataset_id]
         commands = tuple(history.undo_stack)
         pending = w._pending_history_edit
@@ -117,10 +107,10 @@ class DatasetManagementTests(unittest.TestCase):
         rendered = w.plot_page.rendered_page
         self.assertTrue(self.remove(w, a.dataset_id))
         self.assertIs(w.workspace.active, c)
-        self.assertEqual(w.plot_title_edit.text(), 'active pending title')
-        self.assertEqual(w.prom_spin.lineEdit().text(), '0.127')
-        self.assertEqual(w.analysis_text.toPlainText(), 'retained analysis')
-        self.assertEqual(w.plot_gate_index_spin.value(), 1)
+        self.assertEqual(dp.state(w)['plot_title'], 'active pending title')
+        self.assertEqual(oa.text(w, 'prominence'), '0.127')
+        self.assertEqual(oa.summary(w), 'retained analysis')
+        self.assertEqual(int(ah.text(w, 'index')), 1)
         self.assertEqual((w._heat_ax.get_xlim(), w._heat_ax.get_ylim()), limits)
         self.assertIs(w.plot_page.rendered_page, rendered)
         self.assertIs(w._pending_history_edit, pending)
@@ -136,19 +126,19 @@ class DatasetManagementTests(unittest.TestCase):
         w, (a, b, c) = self.loaded()
         for index, session in enumerate((a, b, c)):
             w.activate_dataset(session.dataset_id)
-            w.plot_title_edit.setText(f'owner {index}')
-            w.prom_spin.setValue(.1 + index / 10)
-            w.analysis_text.setPlainText(f'summary {index}')
+            w.dat_properties.setLabel('plot_title', f'owner {index}', w.dat_properties.ownerToken)
+            oa.set_number(w, 'prominence', .1 + index / 10)
+            oa.set_summary(w, f'summary {index}')
             w.capture_active_dataset(render=False)
         w.activate_dataset(b.dataset_id)
-        w.plot_title_edit.setText('removed draft')
-        w.prom_spin.setValue(.9)
+        w.dat_properties.setLabel('plot_title', 'removed draft', w.dat_properties.ownerToken)
+        oa.set_number(w, 'prominence', .9)
         w._lasso_mode = True
         self.assertTrue(self.remove(w, b.dataset_id))
         self.assertIs(w.workspace.active, c)
-        self.assertEqual(w.plot_title_edit.text(), 'owner 2')
-        self.assertAlmostEqual(w.prom_spin.value(), .3)
-        self.assertEqual(w.analysis_text.toPlainText(), 'summary 2')
+        self.assertEqual(dp.state(w)['plot_title'], 'owner 2')
+        self.assertAlmostEqual(oa.value(w, 'prominence'), .3)
+        self.assertEqual(oa.summary(w), 'summary 2')
         self.assertFalse(w._lasso_mode)
         self.assertFalse(w._annotation_edit_timer.isActive())
         self.assertIsNone(w._pending_history_edit)
@@ -156,15 +146,15 @@ class DatasetManagementTests(unittest.TestCase):
         self.assertEqual(c.view.annotations['plot_title'], 'owner 2')
         self.assertTrue(self.remove(w, c.dataset_id))
         self.assertIs(w.workspace.active, a)
-        self.assertEqual(w.plot_title_edit.text(), 'owner 0')
-        self.assertAlmostEqual(w.prom_spin.value(), .1)
+        self.assertEqual(dp.state(w)['plot_title'], 'owner 0')
+        self.assertAlmostEqual(oa.value(w, 'prominence'), .1)
 
     def test_cancel_has_no_mutation_and_names_the_source(self):
         w, (a, b, c) = self.loaded()
-        w.plot_title_edit.setText('uncommitted')
+        w.dat_properties.setLabel('plot_title', 'uncommitted', w.dat_properties.ownerToken)
         before = {path: path.read_bytes() for path in self.folder.rglob('*') if path.is_file()}
         pending = w._pending_history_edit
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Cancel) as prompt:
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.CANCEL) as prompt:
             self.assertFalse(w.remove_dataset(b.dataset_id))
         message = prompt.call_args.args[2]
         self.assertIn(str(b.source_path), message)
@@ -181,41 +171,48 @@ class DatasetManagementTests(unittest.TestCase):
         destination.mkdir()
         project = w.save_project(destination / 'empty later.spectra')
         saved_digest, saved_stamp = w._project_saved_digest, w._project_saved_stamp
-        w.fix_processing_chk.setChecked(True)
-        w.fix_regions_chk.setChecked(True)
-        w.fix_region_edges_chk.setChecked(True)
-        w.cmap_combo.setCurrentIndex(w.cmap_combo.findData('magma'))
-        w.prom_spin.lineEdit().setText('')
-        w.plot_page.font_edit.setText('removed font draft')
+        w.processing.setFixed(True)
+        dp.set_flag(w, 'fix_regions', True)
+        dp.set_flag(w, 'fix_region_edges', True)
+        dp.set_choice(w, 'colormap', 'magma')
+        w.request_task(2)
+        pump()
+        source = item(w, 'formalProperties')
+        oa.draft(w, 'prominence', '')
+        self.assertEqual(oa.text(w, 'prominence'), '')
+        token = w.plot_page.formal.capturePropertiesInput(source)
+        self.assertTrue(token)
+        w.plot_page.formal.setDraft('width_in', 'removed width draft', source, token)
+        self.assertEqual(w.plot_page.formal._drafts['width_in'], 'removed width draft')
         source_files = {path: path.read_bytes() for path in a.source_path.parent.iterdir() if path.is_file()}
         self.assertTrue(self.remove(w, a.dataset_id))
         self.assertEqual(w._project_path, project)
         self.assertEqual(w._project_saved_digest, saved_digest)
         self.assertEqual(w._project_saved_stamp, saved_stamp)
-        self.assertTrue(w.isWindowModified())
-        self.assertIn('*', w.windowTitle())
+        self.assertTrue(w.projectModified)
+        self.assertIn('*', w.title)
         self.assertEqual(w._output_folder(), destination)
         self.assertIsNone(w.current_cube)
         self.assertEqual(w.figure.axes, [])
         self.assertIsNone(w.plot_page.rendered_page)
         self.assertIsNone(w.plot_page.preview.snapshot)
-        self.assertEqual(w.analysis_text.toPlainText(), '')
-        self.assertEqual(w.plot_title_edit.text(), '')
-        self.assertFalse(w.fix_processing_chk.isChecked())
-        self.assertFalse(w.fix_regions_chk.isChecked())
-        self.assertFalse(w.fix_region_edges_chk.isChecked())
+        self.assertEqual(oa.summary(w), '')
+        self.assertEqual(dp.state(w)['plot_title'], '')
+        self.assertFalse(w.processing.fixed)
+        self.assertFalse(dp.state(w)['fix_regions'])
+        self.assertFalse(dp.state(w)['fix_region_edges'])
         self.assertEqual(w._selected_colormap(), w._unregistered_session.view.colormap)
-        self.assertTrue(w.prom_spin.hasAcceptableInput())
-        self.assertFalse(w.plot_page.export_svg_btn.isEnabled())
+        self.assertTrue(oa.acceptable(w, 'prominence'))
+        self.assertFalse(w.plot_page.command_enabled('export_svg'))
         self.assertFalse(w._graph_command_actions['copy_graph'].isEnabled())
         self.assertEqual(w._edit_histories, {})
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Cancel) as guard:
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.CANCEL) as guard:
             self.assertFalse(w.new_project())
         self.assertEqual(guard.call_count, 1)
         self.assertEqual(w._project_path, project)
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Save):
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.SAVE):
             self.assertTrue(w._confirm_project_discard())
-        self.assertFalse(w.isWindowModified())
+        self.assertFalse(w.projectModified)
         self.assertEqual(source_files, {path: path.read_bytes() for path in source_files})
         a.source_path.unlink()
         restored = self.window()
@@ -223,12 +220,12 @@ class DatasetManagementTests(unittest.TestCase):
             self.assertTrue(restored.open_project(project))
         self.assertEqual(restored.workspace.datasets, {})
         self.assertIsNone(restored.workspace.active)
-        self.assertFalse(restored.isWindowModified())
+        self.assertFalse(restored.projectModified)
         self.assertEqual(restored._output_folder(), destination)
 
     def test_busy_import_analysis_and_batch_reject_without_prompt(self):
         w, (a,) = self.loaded(1)
-        with patch('spectra_app.main_window.QMessageBox.warning', side_effect=AssertionError('busy prompt')):
+        with patch('spectra_app.main_window.prompt_message', side_effect=AssertionError('busy prompt')):
             w._dat_import_pending = True
             with self.assertRaisesRegex(ValueError, 'Wait'):
                 w.remove_dataset(a.dataset_id)
@@ -245,13 +242,15 @@ class DatasetManagementTests(unittest.TestCase):
 
     def test_busy_recheck_after_confirmation_keeps_dataset(self):
         w, (a,) = self.loaded(1)
-        def choice(*args):
+        def choice(*args, **kwargs):
             w._dat_import_pending = True
-            return QMessageBox.Yes
+            return PromptAction.YES
         try:
-            with patch('spectra_app.main_window.QMessageBox.warning', side_effect=choice):
+            with patch('spectra_app.main_window.prompt_message', side_effect=choice) as prompt:
                 with self.assertRaisesRegex(ValueError, 'Wait'):
                     w.remove_dataset(a.dataset_id)
+            self.assertEqual(prompt.call_args.args[3:], ((PromptAction.YES, PromptAction.CANCEL), PromptAction.CANCEL))
+            self.assertEqual(prompt.call_args.kwargs, {'kind': 'warning'})
             self.assertIs(w.workspace.active, a)
         finally:
             w._dat_import_pending = False
@@ -285,7 +284,7 @@ class DatasetManagementTests(unittest.TestCase):
             self.assertFalse(w._dat_import_pending)
             b = w.workspace.active
             self.assertEqual(b.source_path, self.paths[1])
-            w.plot_title_edit.setText('project new import')
+            w.dat_properties.setLabel('plot_title', 'project new import', w.dat_properties.ownerToken)
             w.capture_active_dataset(render=False)
             w._save_current_plot_state()
             w.activate_dataset(a.dataset_id)
@@ -293,9 +292,9 @@ class DatasetManagementTests(unittest.TestCase):
         self.assertEqual(observed, [(False, destination)] * 3)
         self.assertFalse(self.paths[1].with_name('sample.dat.plot.json').exists())
         self.assertFalse(b.sidecar_writes_enabled)
-        self.assertFalse(w.x_axis_override_combo.isEnabled())
+        self.assertFalse(dp.state(w)['source_axis_enabled'])
         w._refresh_project_modified()
-        self.assertTrue(w.isWindowModified())
+        self.assertTrue(w.projectModified)
 
     def test_async_import_into_empty_saved_project_and_unsaved_compatibility(self):
         w = self.window()
@@ -311,41 +310,28 @@ class DatasetManagementTests(unittest.TestCase):
         wait_jobs(ordinary)
         self.assertTrue(ordinary.workspace.active.sidecar_writes_enabled)
         self.assertEqual(ordinary._output_folder(), self.paths[1].parent)
-        ordinary.plot_title_edit.setText('source owned')
+        ordinary.dat_properties.setLabel('plot_title', 'source owned', ordinary.dat_properties.ownerToken)
         ordinary.capture_active_dataset(render=False)
         ordinary._save_current_plot_state()
         self.assertTrue(self.paths[1].with_name('sample.dat.plot.json').exists())
 
     def test_context_targets_filtered_inactive_item_and_right_click_preserves_owner(self):
         w, (a, b, c) = self.loaded()
-        w.imported_dataset_search.setText('second')
-        w.show()
-        APP.processEvents()
-        item = w.imported_dataset_list.item(1)
-        position = w.imported_dataset_list.visualItemRect(item).center()
-        menus = []
-        def choose(menu):
-            menus.append([action.text() for action in menu.actions() if not action.isSeparator()])
-            next(action for action in menu.actions() if action.text() == 'Copy Source Path').trigger()
-        QTest.mouseClick(w.imported_dataset_list.viewport(), Qt.RightButton, pos=position)
+        w.source_navigation.setSearchText('second')
+        sn.click(w, 'sourceDataset_0', Qt.RightButton)
         self.assertIs(w.workspace.active, c)
-        failures = self.menu_choice(choose)
-        event = QContextMenuEvent(QContextMenuEvent.Mouse, position,
-                                 w.imported_dataset_list.viewport().mapToGlobal(position))
-        QApplication.sendEvent(w.imported_dataset_list.viewport(), event)
-        self.assertEqual(failures, [])
-        self.assertTrue(menus)
-        self.assertEqual(menus[-1], ['Copy Source Path', 'Open Source Folder',
-                                    'Open Export Folder', 'Remove from Project'])
-        self.assertEqual(APP.clipboard().text(), str(b.source_path))
+        self.assertTrue(sn.control(w, 'sourceDatasetMenu').property('visible'))
+        self.assertEqual([sn.control(w, name).property('text') for name in
+                          ('sourceCopy', 'sourceOpenFolder', 'sourceOpenExport', 'sourceRemove')],
+                         ['Copy Source Path', 'Open Source Folder', 'Open Export Folder', 'Remove from Project'])
+        sn.click(w, 'sourceCopy', menu=True)
+        self.assertEqual(QGuiApplication.clipboard().text(), str(b.source_path))
         self.assertIs(w.workspace.active, c)
-        with patch('spectra_app.main_window.QMenu', side_effect=AssertionError('blank menu')):
-            w._show_dataset_context_menu(QPoint(5, w.imported_dataset_list.viewport().height() - 2))
-        failures = self.menu_choice(lambda menu: next(action for action in menu.actions()
-                              if action.text() == 'Remove from Project').trigger())
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Yes):
-            w._show_dataset_context_menu(position)
-        self.assertEqual(failures, [])
+        sn.click(w, 'sourceDatasets', Qt.RightButton)
+        self.assertFalse(sn.control(w, 'sourceDatasetMenu').property('visible'))
+        sn.click(w, 'sourceDataset_0', Qt.RightButton)
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.YES):
+            sn.click(w, 'sourceRemove', menu=True)
         self.assertNotIn(b.dataset_id, w.workspace.datasets)
         self.assertIs(w.workspace.active, c)
 
@@ -362,7 +348,7 @@ class DatasetManagementTests(unittest.TestCase):
         w.save_project(output / 'folder.spectra')
         source.unlink()
         w._copy_dataset_source_path(a.dataset_id)
-        self.assertEqual(APP.clipboard().text(), str(a.source_path))
+        self.assertEqual(QGuiApplication.clipboard().text(), str(a.source_path))
         with patch('spectra_app.main_window.QDesktopServices.openUrl', return_value=True) as opened:
             self.assertTrue(w._open_dataset_folder(a.dataset_id))
         self.assertTrue(opened.call_args.args[0].isLocalFile())
@@ -378,28 +364,27 @@ class DatasetManagementTests(unittest.TestCase):
         with patch('spectra_app.main_window.QDesktopServices.openUrl', side_effect=AssertionError('missing folder')):
             self.assertFalse(w._open_dataset_folder(a.dataset_id))
         self.assertIn(str(missing), self.errors[-1])
+        self.assertEqual(len(self.errors), 2)
+        self.errors.clear()
         self.assertFalse(missing.exists())
         w._dat_import_pending = True
-        def inspect(menu):
-            remove = next(action for action in menu.actions() if action.text() == 'Remove from Project')
-            self.assertFalse(remove.isEnabled())
         try:
-            failures = self.menu_choice(inspect)
-            w._show_dataset_context_menu(w.imported_dataset_list.visualItemRect(
-                w.imported_dataset_list.item(0)).center())
-            self.assertEqual(failures, [])
+            sn.click(w, 'sourceDataset_0', Qt.RightButton)
+            self.assertFalse(sn.control(w, 'sourceRemove').isEnabled())
+            QTest.keyClick(input_receiver(w, sn.control(w, 'sourceNavigation')), Qt.Key_Escape)
         finally:
             w._dat_import_pending = False
 
     def test_frozen_comparison_survives_removal_with_identical_hybrid_svg(self):
         w, (a,) = self.loaded(1)
+        w._render_plot_page()
         comparison = w.open_plot_comparison()
-        svg = comparison.preview.svg_bytes
+        svg = comparison.svg_bytes
         self.assertIn(b'<image', svg)
         self.assertIn(b'<text', svg)
         self.assertTrue(self.remove(w, a.dataset_id))
         self.assertTrue(comparison.isVisible())
-        self.assertEqual(comparison.preview.svg_bytes, svg)
+        self.assertEqual(comparison.svg_bytes, svg)
         comparison.close()
         comparison.deleteLater()
 
@@ -407,13 +392,20 @@ class DatasetManagementTests(unittest.TestCase):
         w, (a, b, c) = self.loaded()
         w.activate_dataset(a.dataset_id)
         w._capture_formal_source()
-        self.assertEqual(w.plot_page.preview.snapshot.owner_token[0], a.dataset_id)
+        removed_page = w.plot_page
+        removed_key = (a.dataset_id, a.active_graph_id)
+        self.assertEqual(removed_page.preview.snapshot.owner_token[0], a.dataset_id)
         w.activate_dataset(c.dataset_id)
-        w.plot_title_edit.setText('retained draft')
+        active_page, active_snapshot = w.plot_page, w.plot_page.preview.snapshot
+        w.dat_properties.setLabel('plot_title', 'retained draft', w.dat_properties.ownerToken)
         pending = w._pending_history_edit
         self.assertTrue(self.remove(w, a.dataset_id))
-        self.assertIsNone(w.plot_page.preview.snapshot)
-        self.assertEqual(w.plot_title_edit.text(), 'retained draft')
+        self.assertIsNone(w.graph_documents.document_for(removed_key))
+        self.assertTrue(removed_page.retired)
+        self.assertTrue(removed_page.preview._disposed)
+        self.assertIs(w.plot_page, active_page)
+        self.assertIs(w.plot_page.preview.snapshot, active_snapshot)
+        self.assertEqual(dp.state(w)['plot_title'], 'retained draft')
         self.assertIs(w._pending_history_edit, pending)
         self.assertIs(w.workspace.active, c)
 
@@ -460,7 +452,7 @@ class DatasetManagementTests(unittest.TestCase):
         self.assertEqual(list(w.workspace.datasets), [a.dataset_id])
         self.assertIs(w.workspace.active, a)
         w._csv_seeds_map = {w._current_gate_index(): [2.0]}
-        w._seeds_from_csv_radio.setChecked(True)
+        oa.set_value(w, 'csv_source', True)
         started.clear()
         release.clear()
         def blocked_fit(*args, **kwargs):
@@ -486,7 +478,7 @@ class DatasetManagementTests(unittest.TestCase):
         self.assertEqual(w.workspace.datasets, {})
         self.assertIsNone(w.fit_result)
         self.assertEqual(w._unregistered_session.fit_export_rows, [])
-        self.assertEqual(w.analysis_text.toPlainText(), '')
+        self.assertEqual(oa.summary(w), '')
         self.assertEqual(self.errors, [])
 
 

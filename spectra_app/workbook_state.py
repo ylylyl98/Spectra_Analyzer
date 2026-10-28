@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from datetime import datetime, timezone
 import math
 import os
@@ -10,6 +11,9 @@ import re
 from uuid import uuid4
 
 import numpy as np
+
+from .plot_presentation import PlotPresentation
+from .signal_titles import automatic_signal_label, infer_source_signal_kind
 
 
 def _id():
@@ -39,6 +43,8 @@ class Sheet:
     fit_gate_idx: int | None = None
     text_columns: dict[int, list[str]] = field(default_factory=dict)
     snapshot_note: str = ''
+    result_id: str | None = None
+    column_metadata: dict[int, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -54,6 +60,11 @@ class Curve:
     width: float = 1.5
     y_offset: float = 0.0
     style: str = 'line'
+    marker_shape: str = 'ball'
+    marker_size: float = 5.0
+    marker_fill: str = 'full'
+    marker_edge_color: str = 'auto'
+    marker_edge_width: float = 1.0
 
 
 @dataclass
@@ -70,6 +81,7 @@ class Comparison:
     x_range: tuple[float, float] | None = None
     plot_title: str = ''
     analysis_state: dict | None = None
+    presentation: PlotPresentation | None = None
 
 
 _COLORS = ('#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f')
@@ -157,7 +169,8 @@ def _cube(workspace, sheet, mode):
     session = workspace.datasets.get(sheet.dataset_id)
     if session is None:
         raise ValueError('DAT Sheet references a missing dataset.')
-    cube = session.base_cube if mode == 'raw' else session.current_cube
+    cube = (session.processing_results[sheet.result_id].cube if sheet.result_id is not None and mode == 'processed'
+            else session.base_cube if mode == 'raw' else session.current_cube)
     if cube is None:
         raise ValueError('DAT Sheet requires an available scientific cube.')
     return cube
@@ -208,13 +221,132 @@ def sheet_shape(workspace, sheet, mode=None):
     return sheet.data.shape if cube is None else (cube.energy.size, cube.gate.size + 1)
 
 
-def sheet_columns(workspace, sheet, mode=None):
+def _source_sheet_columns(workspace, sheet, mode=None):
     sheet = _sheet(workspace, sheet)
     cube = _cube(workspace, sheet, mode)
     if sheet.role == 'fit_parameters':
         return list(_PARAMETER_COLUMNS)
     return list(sheet.column_names) if cube is None else [cube.energy_label] + [
         f'{cube.gate_label} = {gate:g}' for gate in cube.gate]
+
+
+_LABEL_UNITS = frozenset(('eV', 'meV', 'keV', 'nm', 'µm', 'um', 'm', 'cm', 'mm', 's', 'ms',
+    'µs', 'us', 'Hz', 'kHz', 'MHz', 'GHz', 'V', 'mV', 'A', 'mA', 'µA', 'uA', 'nA',
+    'K', '°C', 'T', 'mT', 'W', 'mW', 'cm^-1', 'counts', 'counts/s', 'cps', 'a.u.', 'a. u.', '%'))
+
+
+def sheet_column_metadata(workspace, sheet, column, mode=None):
+    """Effective display cells, separate from source coordinates and identities."""
+    sheet = _sheet(workspace, sheet)
+    if type(column) is not int or not 0 <= column < sheet_shape(workspace, sheet, mode)[1]:
+        raise ValueError('Column index is outside the Sheet.')
+    units = ''
+    cube = _cube(workspace, sheet, mode)
+    if cube is not None:
+        # Gate is the series coordinate, never the unit of the measured signal.
+        name = f'{cube.gate[column - 1]:g}' if column > 0 else cube.energy_label
+    else:
+        name = _PARAMETER_COLUMNS[column] if sheet.role == 'fit_parameters' else sheet.column_names[column]
+    if cube is None or column == 0:
+        match = re.fullmatch(r'(.*?)\s*\(([^()]*)\)', name)
+        if match and match[2] in _LABEL_UNITS:
+            name, units = match[1].rstrip(), match[2]
+    return dict(long_name=name, units=units) | sheet.column_metadata.get(column, {})
+
+
+def _metadata_label(metadata):
+    name, units = metadata['long_name'], metadata['units']
+    return f'{name} ({units})' if units and name else name or units
+
+
+def initialize_comparison_labels(workspace, comparison):
+    """Choose common quantities once, after a new graph's source batch is known."""
+    def numeric_name(name):
+        try:
+            float(name)
+        except ValueError:
+            return False
+        return True
+
+    x_metadata, y_metadata = [], []
+    for curve in comparison.curves.values():
+        sheet = workspace.sheets[curve.sheet_id]
+        x_metadata.append(sheet_column_metadata(workspace, sheet, curve.x_column, curve.mode))
+        if sheet.kind == 'dat' and sheet.role in ('original', 'processed') and curve.y_column > 0:
+            session = workspace.datasets[sheet.dataset_id]
+            cube = session.base_cube
+            kind = cube.signal_source_kind
+            if kind == 'unknown':
+                kind = infer_source_signal_kind(cube.source_path or str(sheet.source_path or ''))
+            processing = (session.processing_results[sheet.result_id].processing
+                          if sheet.result_id is not None else session.applied)
+            label = automatic_signal_label(kind,
+                curve.mode == 'processed' and processing.mode == 'energy_second_derivative',
+                cube.signal_kind == 'energy_second_derivative')
+            name, units = label.rsplit(' (', 1)
+            metadata = dict(long_name=name, units=units[:-1])
+            overrides = dict(sheet.column_metadata.get(curve.y_column, {}))
+            if 'long_name' in overrides and numeric_name(overrides['long_name']):
+                del overrides['long_name']
+            metadata.update(overrides)
+        else:
+            metadata = sheet_column_metadata(workspace, sheet, curve.y_column, curve.mode)
+            # Embedded Gate snapshots retain numeric series names; they do not
+            # declare the measured signal's physical quantity.
+            if numeric_name(metadata['long_name']):
+                metadata = dict(metadata, long_name='Signal')
+        y_metadata.append(metadata)
+
+    def common(metadata, fallback):
+        if not metadata:
+            return fallback
+        names = {item['long_name'] for item in metadata}
+        units = {item['units'] for item in metadata}
+        return _metadata_label(dict(long_name=next(iter(names)) if len(names) == 1 else fallback,
+                                    units=next(iter(units)) if len(units) == 1 else ''))
+
+    comparison.x_label = common(x_metadata, 'X')
+    comparison.y_label = common(y_metadata, 'Signal')
+
+
+def sheet_columns(workspace, sheet, mode=None):
+    """Consumer labels; untouched columns keep their exact legacy strings."""
+    sheet = _sheet(workspace, sheet)
+    names = _source_sheet_columns(workspace, sheet, mode)
+    for column in sheet.column_metadata:
+        if type(column) is int and 0 <= column < len(names):
+            names[column] = _metadata_label(sheet_column_metadata(workspace, sheet, column, mode))
+    return names
+
+
+def _validate_column_metadata(metadata, count):
+    if not isinstance(metadata, dict):
+        raise ValueError('Column metadata must be a mapping.')
+    for column, fields in metadata.items():
+        if type(column) is not int or not 0 <= column < count:
+            raise ValueError('Column metadata index is outside the Sheet.')
+        if not isinstance(fields, dict) or not fields or not set(fields) <= {'long_name', 'units'}:
+            raise ValueError('Column metadata requires Long Name or Units fields.')
+        for value in fields.values():
+            _text(value, 'Column metadata', nonempty=False)
+            if '\n' in value or '\r' in value:
+                raise ValueError('Column metadata must fit on one line.')
+
+
+def set_sheet_column_metadata(workspace, sheet_id, column, **fields):
+    sheet = workspace.sheets[sheet_id]
+    _validate_column_metadata({column: fields}, sheet_shape(workspace, sheet)[1])
+    updated = dict(sheet.column_metadata.get(column, {})) | fields
+    if updated == sheet.column_metadata.get(column):
+        return False
+    automatic = [curve for comparison in workspace.comparisons.values() for curve in comparison.curves.values()
+                 if curve.sheet_id == sheet_id and curve.y_column == column and curve.label in (
+                     default_curve_label(workspace, sheet, column),
+                     default_curve_label(workspace, sheet, column, disambiguate_source=False))]
+    sheet.column_metadata[column] = updated
+    for curve in automatic:
+        curve.label = default_curve_label(workspace, sheet, column)
+    return True
 
 
 def sheet_numeric_columns(workspace, sheet, mode=None):
@@ -306,12 +438,15 @@ def register_xy_sheet(workspace, workbook_id, name, data, column_names, *, sourc
     return sheet
 
 
-def ensure_dataset_sheet(workspace, dataset_id, role='original', fit_gate_idx=None):
+def ensure_dataset_sheet(workspace, dataset_id, role='original', fit_gate_idx=None, *, result_id=None):
     """Return/create a stable lightweight projection within the source owner."""
-    for sheet in workspace.sheets.values():
-        if sheet.kind == 'dat' and (sheet.dataset_id, sheet.role, sheet.fit_gate_idx) == (dataset_id, role, fit_gate_idx):
-            return sheet
     session = workspace.datasets[dataset_id]
+    if role == 'processed' and result_id is None:
+        result_id = next((key for key, result in session.processing_results.items()
+                          if result.cube is session.current_cube), None)
+    for sheet in workspace.sheets.values():
+        if sheet.kind == 'dat' and (sheet.dataset_id, sheet.role, sheet.fit_gate_idx, sheet.result_id) == (dataset_id, role, fit_gate_idx, result_id):
+            return sheet
     name = session.source_path.name if session.source_path else 'DAT'
     original = next((s for s in workspace.sheets.values() if s.dataset_id == dataset_id and s.role == 'original'), None)
     book = (next(b for b in workspace.workbooks.values() if original.sheet_id in b.sheet_ids)
@@ -323,9 +458,76 @@ def ensure_dataset_sheet(workspace, dataset_id, role='original', fit_gate_idx=No
                   y_columns=([4] if role == 'fit_parameters' else [1] if role == 'fit_curves' else
                              list(range(1, (session.current_cube if role == 'processed' else session.base_cube).gate.size + 1))),
                   column_names=['X', 'Total fit'] if role == 'fit_curves' else [])
+    sheet.result_id = result_id
     workspace.sheets[sheet.sheet_id] = sheet
     book.sheet_ids.append(sheet.sheet_id)
     return sheet
+
+
+def _processing_result_name(workspace, session, processing):
+    number = 1
+    names = {sheet.name for sheet in workspace.sheets.values() if sheet.dataset_id == session.dataset_id}
+    order = 'd⁴/dE⁴' if session.base_cube.signal_kind == 'energy_second_derivative' else 'd²/dE²'
+    smoothing = f'SG {processing.window_length}, p3' if processing.smooth else 'SG off'
+    while any(name.startswith(f'Processed {number} ·') for name in names):
+        number += 1
+    return f'Processed {number} · {order} · {smoothing}'
+
+
+def retain_current_processing_result(workspace, dataset_id):
+    """Promote the legacy moving Processed projection once, before replacing it."""
+    from .dataset_state import ProcessingResult
+    session = workspace.datasets[dataset_id]
+    if session.current_cube is session.base_cube and session.applied.mode == 'original':
+        for graph in session.graphs.values():
+            if graph.analysis is None and graph.source_mode == 'processed' and graph.result_id is None:
+                graph.source_mode = 'raw'
+        return None
+    existing = next((result for result in session.processing_results.values()
+                     if result.cube is session.current_cube), None)
+    if existing is not None:
+        return existing
+    sheet = ensure_dataset_sheet(workspace, dataset_id, 'processed')
+    result = ProcessingResult(_id(), session.current_cube, deepcopy(session.applied))
+    session.processing_results[result.result_id] = result
+    sheet.result_id = result.result_id
+    if sheet.name == 'Processed':
+        sheet.name = _processing_result_name(workspace, session, result.processing)
+    for graph in session.graphs.values():
+        if graph.analysis is None and graph.source_mode == 'processed' and graph.result_id is None:
+            graph.result_id = result.result_id
+    return result
+
+
+def add_processing_result(workspace, dataset_id, cube, processing):
+    """Publish one independent run and a linked Heatmap using current visuals."""
+    from .dataset_state import GraphState, ProcessingResult, graph_signal_label, refresh_graph_colors
+    session = workspace.datasets[dataset_id]
+    retain_current_processing_result(workspace, dataset_id)
+    name = _processing_result_name(workspace, session, processing)
+    result = ProcessingResult(_id(), cube, deepcopy(processing))
+    session.processing_results[result.result_id] = result
+    if cube is not session.current_cube:
+        session._clear_derived_results()
+    session.current_cube = cube
+    session.applied, session.pending = deepcopy(processing), deepcopy(processing)
+    source = session.active_graph
+    graph_name, count = f'{name} Heatmap', 2
+    while any(graph.name == graph_name for graph in session.graphs.values()):
+        graph_name, count = f'{name} Heatmap {count}', count + 1
+    graph = GraphState(_id(), graph_name, deepcopy(source.view), deepcopy(source.presentation),
+                       'processed', deepcopy(source.gate_indices) if source.gate_indices is not None else list(range(cube.gate.size)),
+                       True, result_id=result.result_id)
+    session.graphs[graph.graph_id] = graph
+    session.activate_graph(graph.graph_id)
+    refresh_graph_colors(graph, cube)
+    if graph.view.signal_title_auto:
+        graph.view.annotations['signal_title'] = graph_signal_label(session, graph)
+    sheet = ensure_dataset_sheet(workspace, dataset_id, 'processed', result_id=result.result_id)
+    sheet.name = name
+    if graph.gate_indices is not None:
+        sheet.y_columns = [index + 1 for index in graph.gate_indices]
+    return sheet, graph
 
 
 def reconcile_dataset_sheets(workspace, dataset_id):
@@ -334,7 +536,10 @@ def reconcile_dataset_sheets(workspace, dataset_id):
     session = workspace.datasets.get(dataset_id)
     if session is not None:
         ensure_dataset_sheet(workspace, dataset_id)
-        if session.applied.mode != 'original' or session.current_cube is not session.base_cube:
+        if session.processing_results:
+            for result_id in session.processing_results:
+                ensure_dataset_sheet(workspace, dataset_id, 'processed', result_id=result_id)
+        elif session.applied.mode != 'original' or session.current_cube is not session.base_cube:
             ensure_dataset_sheet(workspace, dataset_id, 'processed')
         if _retained_fits(session) or session.fit_export_rows:
             ensure_dataset_sheet(workspace, dataset_id, 'fit_parameters')
@@ -351,6 +556,8 @@ def reconcile_dataset_sheets(workspace, dataset_id):
             continue
         sheet.source_path = workspace.datasets[dataset_id].source_path
         count = sheet_shape(workspace, sheet)[1]
+        sheet.column_metadata = {column: fields for column, fields in sheet.column_metadata.items()
+                                 if type(column) is int and 0 <= column < count}
         sheet.x_column = sheet.x_column if 0 <= sheet.x_column < count else 0
         sheet.y_columns = [index for index in sheet.y_columns if 0 <= index < count]
         for comparison in workspace.comparisons.values():
@@ -381,8 +588,11 @@ def save_sheet_snapshot(workspace, sheet_id, name):
     context = ''
     if source.dataset_id is not None:
         session = workspace.datasets[source.dataset_id]
-        context = f' · Applied processing: {session.applied.recipe()}'
-        context += f' · Analysis axis: {session.current_cube.energy_label}'
+        result = session.processing_results.get(source.result_id)
+        processing = result.processing if result is not None else session.applied
+        cube = result.cube if result is not None else session.current_cube
+        context = f' · Applied processing: {processing.recipe()}'
+        context += f' · Analysis axis: {cube.energy_label}'
         if source.fit_gate_idx is not None:
             context += f' · Gate {source.fit_gate_idx} = {session.current_cube.gate[source.fit_gate_idx]:g}'
             result = _retained_fits(session).get(source.fit_gate_idx)
@@ -394,9 +604,10 @@ def save_sheet_snapshot(workspace, sheet_id, name):
     if source.snapshot_note:
         note += '\n' + source.snapshot_note
     snapshot = Sheet(name=name, kind='snapshot', source_path=source.source_path, data=data,
-                     column_names=sheet_columns(workspace, source), x_column=source.x_column,
+                     column_names=_source_sheet_columns(workspace, source), x_column=source.x_column,
                      y_columns=list(source.y_columns), role='snapshot', text_columns=text_columns,
-                     snapshot_note=note)
+                     snapshot_note=note, column_metadata={column: sheet_column_metadata(workspace, source, column)
+                                                         for column in range(columns)})
     _validate_sheet_source(workspace, snapshot)
     owner = next(book for book in workspace.workbooks.values() if sheet_id in book.sheet_ids)
     workspace.sheets[snapshot.sheet_id] = snapshot
@@ -419,7 +630,30 @@ def merge_workbooks(workspace, workbook_ids, destination_id):
 
 
 def remove_sheet(workspace, sheet_id):
-    workspace.sheets.pop(sheet_id)
+    sheet = workspace.sheets.pop(sheet_id)
+    if sheet.result_id is not None and sheet.dataset_id in workspace.datasets:
+        session = workspace.datasets[sheet.dataset_id]
+        graph_ids = [graph.graph_id for graph in session.graphs.values() if graph.result_id == sheet.result_id]
+        if len(graph_ids) == len(session.graphs):
+            from .dataset_state import GraphState
+            fallback = GraphState(_id(), name='Original Heatmap', source_mode='raw', published=False)
+            session.graphs[fallback.graph_id] = fallback
+        for graph_id in graph_ids:
+            session.remove_graph(graph_id)
+        removed_result = session.processing_results.pop(sheet.result_id)
+        if session.current_cube is removed_result.cube:
+            session._clear_derived_results()
+            if session.active_graph.result_id is not None:
+                session.activate_graph(session.active_graph_id)
+            elif session.processing_results:
+                result = session.processing_results[next(reversed(session.processing_results))]
+                session.current_cube = result.cube
+                session.applied, session.pending = deepcopy(result.processing), deepcopy(result.processing)
+            else:
+                from .dataset_state import ProcessingState
+                session.current_cube = session.base_cube
+                session.applied, session.pending = ProcessingState(), ProcessingState()
+        prune_document_layout(workspace)
     for book in workspace.workbooks.values():
         book.sheet_ids[:] = [identity for identity in book.sheet_ids if identity != sheet_id]
     removed = []
@@ -452,7 +686,7 @@ def remove_dataset_sheets(workspace, dataset_id):
 
 
 def create_comparison(workspace, name='Comparison'):
-    comparison = Comparison(name=_name(name))
+    comparison = Comparison(name=_name(name), presentation=PlotPresentation())
     workspace.comparisons[comparison.comparison_id] = comparison
     return comparison
 
@@ -469,6 +703,19 @@ def validate_curve_style(curve):
             or not math.isfinite(curve.width) or curve.width <= 0):
         raise ValueError('Curve width must be finite and positive.')
     _finite_number(curve.y_offset, 'Curve Y offset')
+    if curve.marker_shape not in ('ball', 'o', 's', '^', 'v', '<', '>', 'D', 'p', 'h', '*', '+', 'x'):
+        raise ValueError('Unknown curve symbol shape.')
+    if curve.marker_fill not in ('full', 'none', 'left', 'right', 'top', 'bottom'):
+        raise ValueError('Unknown curve symbol fill.')
+    _finite_number(curve.marker_size, 'Curve symbol size')
+    if curve.marker_size <= 0:
+        raise ValueError('Curve symbol size must be positive.')
+    _finite_number(curve.marker_edge_width, 'Curve symbol outline width')
+    if curve.marker_edge_width < 0:
+        raise ValueError('Curve symbol outline width cannot be negative.')
+    if (not isinstance(curve.marker_edge_color, str) or curve.marker_edge_color != 'auto'
+            and not re.fullmatch(r'#[0-9a-fA-F]{6}', curve.marker_edge_color)):
+        raise ValueError('Curve symbol outline must be auto or a six-digit hex color.')
 
 
 def _finite_number(value, name):
@@ -478,6 +725,8 @@ def _finite_number(value, name):
 
 def validate_comparison_display(comparison):
     _text(comparison.plot_title, 'Plot title', nonempty=False)
+    if comparison.presentation is not None and not isinstance(comparison.presentation, PlotPresentation):
+        raise ValueError('Comparison presentation requires PlotPresentation or None.')
     if comparison.normalization not in ('none', 'maxabs', 'minmax'):
         raise ValueError('Unknown comparison normalization.')
     if comparison.x_range_mode not in ('all', 'common', 'manual'):
@@ -501,9 +750,15 @@ def curve_source_key(workspace, sheet_id, x_column, y_column, mode=None):
     mode = sheet.mode if mode is None else mode
     if sheet.kind == 'dat' and sheet.role in ('original', 'processed'):
         role = 'processed' if mode == 'processed' else 'original'
+        result_id = sheet.result_id if role == 'processed' else None
+        if role == 'processed' and sheet.role == 'original':
+            session = workspace.datasets[sheet.dataset_id]
+            result_id = next((key for key, result in session.processing_results.items()
+                              if result.cube is session.current_cube), None)
         canonical = next((s for s in workspace.sheets.values()
-                          if s.kind == 'dat' and s.dataset_id == sheet.dataset_id and s.role == role), None)
-        sheet_id = canonical.sheet_id if canonical else ('dat', sheet.dataset_id, role)
+                          if s.kind == 'dat' and s.dataset_id == sheet.dataset_id and s.role == role
+                          and s.result_id == result_id), None)
+        sheet_id = canonical.sheet_id if canonical else ('dat', sheet.dataset_id, role, result_id)
     return sheet_id, x_column, y_column, mode
 
 
@@ -563,7 +818,7 @@ def add_curve(workspace, comparison_id, sheet_id, x_column, y_column, *, mode=No
     comparison = workspace.comparisons[comparison_id]
     sheet = workspace.sheets[sheet_id]
     mode = sheet.mode if mode is None else mode
-    if sheet.kind == 'dat' and sheet.role in ('original', 'processed'):
+    if sheet.kind == 'dat' and sheet.role in ('original', 'processed') and not (mode == 'processed' and sheet.result_id is not None):
         sheet = ensure_dataset_sheet(workspace, sheet.dataset_id, 'processed' if mode == 'processed' else 'original')
         sheet_id = sheet.sheet_id
     if mode != sheet.mode:
@@ -652,6 +907,12 @@ def _validate_sheet_source(workspace, sheet):
         raise ValueError('Invalid Sheet source path.')
     if sheet.role not in ('original', 'processed', 'fit_parameters', 'fit_curves', 'snapshot'):
         raise ValueError('Unknown Sheet role.')
+    if sheet.result_id is not None:
+        _text(sheet.result_id, 'Processing result reference')
+        session = workspace.datasets.get(sheet.dataset_id)
+        if (sheet.kind != 'dat' or sheet.role != 'processed' or session is None
+                or sheet.result_id not in session.processing_results):
+            raise ValueError('Processed Sheet references a missing processing result.')
     if sheet.role == 'fit_curves':
         if type(sheet.fit_gate_idx) is not int or sheet.fit_gate_idx < 0:
             raise ValueError('Fit curves require a nonnegative Gate index.')
@@ -734,8 +995,9 @@ def validate_workbook_state(workspace):
         raise ValueError('Each Sheet requires exactly one workbook owner.')
     for sheet in workspace.sheets.values():
         _validate_sheet_source(workspace, sheet)
+        _validate_column_metadata(sheet.column_metadata, sheet_shape(workspace, sheet)[1])
         if sheet.kind == 'dat':
-            projection = (sheet.dataset_id, sheet.role, sheet.fit_gate_idx)
+            projection = (sheet.dataset_id, sheet.role, sheet.fit_gate_idx, sheet.result_id)
             if projection in datasets:
                 raise ValueError('A DAT may have only one Sheet for each role and Gate.')
             datasets.add(projection)

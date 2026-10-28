@@ -15,18 +15,16 @@ from spectra_app.background_jobs import CancelledError, JobContext, LoadRequest
 from spectra_app.data_import import prepare_data_batch
 from spectra_app.dataset_state import (AnalysisControls, DatasetDefaults, FixedRecipe,
                                       ProcessingState, ViewState)
-from spectra_app.main_window import MainWindow
 from spectra_app.plot_state import PlotStateStore, source_fingerprint
 from spectra_app.workbook_state import create_comparison
 from spectra_app.xy_import_dialog import XYImportDialog
-from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog
 from tests.background_helpers import wait_jobs
-from tests.settings_helpers import isolate_settings
+from tests.quick_migration_case import QuickMigrationCase
+from tests import formal_quick_helpers as quick
 
-APP = QApplication.instance() or QApplication([])
-
+from tests.xy_helpers import set_xy_draft, xy_value
 
 class ContentDetectionTests(unittest.TestCase):
     def test_matrix_header_is_evidence_independent_of_suffix_and_separator(self):
@@ -169,23 +167,17 @@ class UnifiedParseReuseTests(unittest.TestCase):
         self.assertEqual([error.path for error in errors], [missing, invalid])
 
 
-class UnifiedImportGuards(unittest.TestCase):
+class UnifiedImportGuards(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
+        super().setUp()
+        self.window = self.controller
+        self.errors = self.quick_errors
         self.paths = [self.folder / 'matrix.csv', self.folder / 'ordinary.dat']
         self.paths[0].write_text('Energy(eV),2,-1\n1,20,10\n2,40,30\n')
         self.paths[1].write_text('3 10 20\n1 30 40\n2 50 60\n')
-        self.addCleanup(self.dispose)
 
-    def dispose(self):
+    def tearDown(self):
         wait_jobs(self.window)
-        self.window.close()
-        self.window.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
 
     def prepared(self):
         entries, errors = prepare_data_batch(
@@ -198,16 +190,16 @@ class UnifiedImportGuards(unittest.TestCase):
         entries = self.prepared()
         dialog = XYImportDialog([entry.table for entry in entries], {}, entries=entries)
         self.addCleanup(dialog.deleteLater)
-        self.assertEqual(dialog.type_combo.currentData(), 'dat')
-        self.assertFalse(dialog.x_combo.isEnabled())
+        self.assertEqual(dialog.bridge.kind, 'dat')
+        self.assertFalse(dialog.bridge.xEditable)
         self.assertIn('Gate = -1', dialog.tables[0].column_names)
         np.testing.assert_equal(dialog.tables[0].data, [[1, 10, 20], [2, 30, 40]])
-        dialog.type_combo.setCurrentIndex(dialog.type_combo.findData('xy'))
-        self.assertTrue(dialog.x_combo.isEnabled())
-        self.assertIn('Manual type correction', dialog.type_reason.text())
-        dialog.file_list.setCurrentRow(1)
-        dialog.type_combo.setCurrentIndex(dialog.type_combo.findData('dat'))
-        self.window.import_data_files(entries, mappings=dialog.mappings)
+        dialog.bridge.setKind('xy')
+        self.assertTrue(dialog.bridge.xEditable)
+        self.assertIn('Manual type correction', dialog.bridge.typeReason)
+        dialog.bridge.selectSource(1)
+        dialog.bridge.setKind('dat')
+        self.window.import_data_files(dialog.entries, mappings=dialog.mappings)
         original = [sheet for sheet in self.window.workspace.sheets.values() if sheet.role == 'original']
         self.assertEqual([sheet.kind for sheet in original], ['xy', 'dat'])
         np.testing.assert_equal(original[0].data, [[1, 20, 10], [2, 40, 30]])
@@ -230,12 +222,22 @@ class UnifiedImportGuards(unittest.TestCase):
         target_page = self.window.open_xy_comparison(target.comparison_id)
         current = create_comparison(self.window.workspace, 'Current')
         page = self.window.open_xy_comparison(current.comparison_id)
-        page.name_edit.setText('Pending name')
-        target_page.name_edit.setText(' ')
+        quick.pump()
+        set_xy_draft(page, 'name', 'Pending name')
+        self.assertEqual(xy_value(page, 'name'), 'Pending name')
+        self.assertEqual(self.window.graph_documents.registry.active_key,
+                         ('xy', current.comparison_id, ''))
+        self.assertFalse(target_page.inspector_bridge.enabled)
+        set_xy_draft(target_page, 'name', ' ')
+        self.assertEqual(xy_value(target_page, 'name'), 'Target')
+        # An inactive scene rejects new input. Seed the retained hidden draft
+        # at its real state owner to exercise append's two-owner preflight.
+        target_page.inspector_bridge._drafts['name'] = ' '
+        self.assertEqual(xy_value(target_page, 'name'), ' ')
         with self.assertRaisesRegex(ValueError, 'nonempty'):
             self.window.import_data_files(self.prepared(), comparison_id=target.comparison_id)
         self.assertEqual(current.name, 'Current')
-        self.assertEqual(page.name_edit.text(), 'Pending name')
+        self.assertEqual(xy_value(page, 'name'), 'Pending name')
         self.assertFalse(self.window.workspace.sheets)
         self.assertFalse(self.window.workspace.datasets)
 
@@ -266,9 +268,9 @@ class UnifiedImportGuards(unittest.TestCase):
             self.assertFalse(w._background_jobs.busy)
             self.assertFalse(w._dat_import_pending)
             self.assertEqual(len(dialog.entries), 2)
-            self.assertIn(str(invalid), dialog.feedback.text())
+            self.assertIn(str(invalid), dialog.bridge.feedback)
             seen.extend(entry.kind for entry in dialog.entries)
-            return QDialog.Accepted
+            return XYImportDialog.Accepted
         with patch.object(XYImportDialog, 'exec', review):
             w._import_data_files([self.paths[0], invalid, self.paths[1]], review=True)
             wait_jobs(w)
@@ -305,9 +307,9 @@ class UnifiedImportGuards(unittest.TestCase):
             path.unlink()
         def review(dialog):
             self.assertTrue(all(dialog.reused))
-            self.assertFalse(dialog.type_combo.isEnabled())
+            self.assertFalse(dialog.bridge.typeEditable)
             self.assertEqual([entry.kind for entry in dialog.entries], ['dat', 'xy'])
-            return QDialog.Accepted
+            return XYImportDialog.Accepted
         with patch('spectra_app.data_import.source_fingerprint', side_effect=AssertionError('retained source read')), \
                 patch.object(XYImportDialog, 'exec', review):
             w._import_data_files(self.paths, review=True)
@@ -323,19 +325,21 @@ class UnifiedImportGuards(unittest.TestCase):
         self.assertEqual(w.graph_documents.keys(), (('workbook', book.workbook_id, ''),))
         sheet = w.workspace.sheets[book.sheet_ids[0]]
         page = w.open_workbook(book.workbook_id).sheet_pages[sheet.sheet_id]
-        w.show()
-        APP.processEvents()
-        header = page.table.horizontalHeader()
-        point = QPoint(header.sectionViewportPosition(2) + header.sectionSize(2) // 2, header.height() // 2)
+        self.host.show()
+        quick.pump()
+        scene = w.graph_documents.content_item(('workbook', book.workbook_id, ''))
+        header = quick.item(scene, 'sheetHeaders')
+        point = header.mapToScene(QPointF(page.columnPosition(2) - float(header.property('contentX'))
+                                         + page.columnWidth(2) / 2, header.height() / 6)).toPoint()
         with patch('spectra_app.main_window.load_dat_cube', side_effect=AssertionError('reread')):
-            QTest.mouseClick(header.viewport(), Qt.LeftButton, Qt.NoModifier, point)
+            QTest.mouseClick(self.host.window, Qt.LeftButton, Qt.NoModifier, point)
+            quick.pump()
         self.assertEqual(w.workspace.active_dataset_id, sheet.dataset_id)
         self.assertEqual(w.current_gate, 2)
         self.assertIs(w.current_cube, entries[0].session.current_cube)
-        self.assertIs(w.plot_tabs.currentWidget(), w.graph_documents)
-        w.plot_tabs.setCurrentIndex(next(index for index in range(w.plot_tabs.count())
-                                        if w.plot_tabs.tabText(index) == 'Analysis'))
-        self.assertIsNot(w.plot_tabs.currentWidget(), w.graph_documents)
-        self.assertTrue(w.generate_heatmap_btn.isEnabled())
+        self.assertEqual(w.outerView, 'workspace')
+        self.assertTrue(w.request_outer_view('analysis'))
+        self.assertEqual(w.outerView, 'analysis')
+        self.assertTrue(w.processing.applyEnabled)
         self.assertIsNotNone(w._heat_mesh)
         self.assertFalse(self.errors)

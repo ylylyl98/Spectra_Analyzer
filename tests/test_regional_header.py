@@ -1,3 +1,4 @@
+from tests import dat_properties_quick_helpers as dat
 import unittest
 import os
 from dataclasses import replace
@@ -54,12 +55,12 @@ class RegionalHeaderTests(unittest.TestCase):
         fixture.setUp()
         try:
             window = fixture.make_window(title="p3 8T 0.5TG-BG=0")
-            window.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
+            window.dat_properties.setLabel('signal_title', "d²(ΔR/R)/dE² (a. u.)", window.dat_properties.ownerToken)
             presentation = (window.workspace.active or window._unregistered_session).presentation
             window.set_plot_presentation(replace(presentation, colorbar=replace(
                 presentation.colorbar, width_in=1.2, gap_in=.5)))
             for count in (2, 3):
-                window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData(str(count)))
+                dat.set_choice(window, 'color_scale', str(count))
                 for mesh, limits in zip(window._heat_meshes, ((-89000, 60000), (-2500, 2400), (-0.006, 0.008))):
                     mesh.set_clim(*limits)
                 for size in ((6.4, 4.8), (8, 6)):

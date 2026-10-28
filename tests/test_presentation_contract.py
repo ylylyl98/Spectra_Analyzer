@@ -1,9 +1,13 @@
+from tests import ordinary_analysis_quick_helpers as oa
+from tests import dat_properties_quick_helpers as dat
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from dataclasses import replace
 from pathlib import Path
 import json
+import shutil
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import numpy as np
@@ -11,88 +15,163 @@ from PIL import Image
 from matplotlib import rc_context
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
-from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QSlider, QSpinBox, QScrollArea
+from PySide6.QtTest import QTest
+from tests import quick_migration_case as migration
+from tests import source_navigation_helpers as sn
+from tests.quick_application_helpers import pump
+from tests.formal_quick_helpers import item, ensure_visible
 from tests.test_image_export import _cube
-from tests.test_workflow import _fit_result
-from spectra_app.main_window import MainWindow
-from tests.settings_helpers import isolate_settings
+from tests.scientific_fixtures import workflow_fit_result as _fit_result
+from spectra_app.dataset_state import canonical_path
 from spectra_app.image_export import _build_heatmap_export_figure, export_figure_png
 
-_APP = QApplication.instance() or QApplication([])
+def wheel(receiver, control):
+    point = control.mapToScene(QPointF(control.width()/2, control.height()/2)).toPoint()
+    QTest.mouseMove(receiver, point)
+    pump()
+    event = QWheelEvent(QPointF(point), QPointF(receiver.mapToGlobal(point)),
+                        QPoint(), QPoint(0, -120), Qt.NoButton, Qt.NoModifier,
+                        Qt.NoScrollPhase, False)
+    # Flickable uses input timestamps to measure wheel velocity; independent
+    # native events must not all appear to occur at timestamp zero.
+    event.setTimestamp(time.monotonic_ns() // 1_000_000)
+    QCoreApplication.sendEvent(receiver, event)
+    pump()
 
-def wheel(widget):
-    point = widget.rect().center()
-    event = QWheelEvent(QPointF(point), QPointF(widget.mapToGlobal(point)), QPoint(), QPoint(0, -120), Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False)
-    QApplication.sendEvent(widget, event)
-    _APP.processEvents()
 
-class PresentationContractTests(unittest.TestCase):
+class PresentationContractTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.settings_path = isolate_settings(self)
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
-        self.set_cube(replace(_cube(np.arange(24.).reshape(3,8)), gate_label='Doping (V)', source_path='sample.dat'))
-        self.window.current_folder = str(self.settings_path.parent)
+        super().setUp()
+        self.window = self.controller
+        self.errors = self.quick_errors
+        source = self.folder / 'sample.dat'
+        cube = replace(_cube(np.arange(24.).reshape(3, 8)),
+                       gate_label='Doping (V)', source_path=str(source))
+        source.write_text('X ' + ' '.join(f'{gate:.17g}' for gate in cube.gate) + '\n' +
+                          '\n'.join(' '.join(f'{value:.17g}' for value in row)
+                                    for row in np.column_stack((cube.energy, cube.z.T))),
+                          encoding='utf-8')
+        session = self.window.initialize_dataset(
+            source, (cube, None, None, ''), self.window.snapshot_dataset_defaults())
+        session.sidecar_writes_enabled = False
+        self.window.register_dataset(session)
+        self.window.activate_dataset(session.dataset_id, capture_outgoing=False)
+        self.window.current_folder = str(self.folder)
         self.window._set_view_limits_to_auto()
         self.window._plot_cube()
-        self.window.plot_tabs.setCurrentIndex(0)
+        self.window.open_graph_document()
+        self.assertTrue(self.window.request_outer_view('analysis'))
+        self.window.dat_details_action.setChecked(True)
+        self.window.request_task(2)
+        pump(60)
+
     def tearDown(self):
-        self.window.close()
-        _APP.processEvents()
-        self.window.deleteLater()
-        _APP.processEvents()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        _APP.processEvents()
+        self.assertEqual(self.quick_errors, [], 'Unexpected production Quick error')
 
     def set_cube(self, cube):
         # A raw graph renders Original data, independently of applied data.
         self.window._base_cube = self.window.current_cube = cube
+        self.bind_source_path(cube.source_path)
+
+    def bind_source_path(self, path):
+        workspace, session = self.window.workspace, self.window.workspace.active
+        workspace.path_index = {key: owner for key, owner in workspace.path_index.items()
+                                if owner != session.dataset_id}
+        session.source_path = Path(path)
+        workspace.path_index[canonical_path(path)] = session.dataset_id
+        self.assertIs(workspace.dataset_for_path(path), session)
+
+    def move_source_to(self, folder):
+        """Copy the real DAT to the canonical output folder under test."""
+        session = self.window.workspace.active
+        source = Path(folder) / session.source_path.name
+        # A cube can retain its original measurement provenance while the
+        # imported DAT copy supplies the actual source folder for exports.
+        original = self.folder / 'sample.dat'
+        if source != original:
+            shutil.copy2(original, source)
+        self.bind_source_path(source)
+        self.window.current_folder = str(folder)
 
     def test_wheel_preserves_focused_controls_and_scrolls_parent_page(self):
+        from spectra_app.curve_prompts import CurveColorPromptBridge
+        from spectra_app.quick_dialog import QuickDialog
         w = self.window
-        w.resize(1100, 680)
-        w.plot_tabs.setCurrentIndex(0)
-        w.show()
-        _APP.processEvents()
-        w._analysis_tabs.setCurrentIndex(0)
-        for control, scroll in ((w.cmap_combo, w._view_sidebar_scroll),
-                                (w.peak_smooth_win_spin, w._analysis_sidebar_scroll),
-                                (w.xmin_spin, w._view_sidebar_scroll)):
-            w._sidebar_tabs.setCurrentWidget(scroll)
-            _APP.processEvents()
-            control.setFocus()
-            scroll.verticalScrollBar().setValue(0)
-            before = control.currentIndex() if hasattr(control, 'currentIndex') else control.value()
-            wheel(control)
-            after = control.currentIndex() if hasattr(control, 'currentIndex') else control.value()
-            self.assertEqual(after, before)
-            self.assertGreater(scroll.verticalScrollBar().value(), 0,
-                               (type(control).__name__, scroll.verticalScrollBar().maximum(), control.isVisible()))
-        dialog = QDialog(w)
-        for control in (QSpinBox(dialog), QSlider(Qt.Horizontal, dialog)):
-            control.setValue(50)
-            control.setFocus()
-            wheel(control)
-            self.assertEqual(control.value(), 50)
+        w.root_window.resize(1100, 680)
+        w.root_window.show()
+        pump()
+        oa.select_tab(w, 0)
+        for field in ('colormap', 'xmin'):
+            control = dat.reveal(w, field)
+            control.forceActiveFocus()
+            scroll = item(w, 'propertiesScroll').property('contentItem')
+            before = dat.state(w)[field]
+            before_scroll = scroll.property('contentY')
+            wheel(w.root_window, control)
+            self.assertEqual(dat.state(w)[field], before)
+            self.assertGreater(scroll.property('contentY'), before_scroll,
+                               (field, scroll.property('contentHeight'), control.isVisible()))
+        oa.set_value(w, 'peak_smooth', True)
+        control = oa.focus(w, 'peak_smooth_window')
+        scroll = item(w, 'propertiesScroll').property('contentItem')
+        # Keep the revealed editor inside the actual viewport; resetting this
+        # taller Quick form to its top would send the wheel below the window.
+        before_scroll = scroll.property('contentY')
+        center = control.mapToItem(scroll, QPointF(control.width()/2, control.height()/2))
+        self.assertTrue(0 <= center.y() <= scroll.height())
+        self.assertLess(before_scroll, scroll.property('contentHeight') - scroll.height())
+        before = oa.value(w, 'peak_smooth_window')
+        wheel(w.root_window, control)
+        self.assertEqual(oa.value(w, 'peak_smooth_window'), before)
+        self.assertGreater(scroll.property('contentY'), before_scroll,
+                           (type(control).__name__, scroll.property('contentHeight'), control.isVisible()))
+
+        # Cover the real production SpinBox and modal Slider, replacing the
+        # retired generic QWidget controls with actual available consumers.
+        sn.reveal(w)
+        spin = ensure_visible(item(w, 'sourceVisibleRows'))
+        spin.forceActiveFocus()
+        before = spin.property('value')
+        wheel(w.root_window, spin)
+        self.assertEqual(spin.property('value'), before)
+        bridge = CurveColorPromptBridge('#336699')
+        dialog = QuickDialog(bridge, 'CurveColorPrompt.qml', w,
+                             title='Curve color', size=(500, 570), minimum_size=(380, 470))
+        self.addCleanup(dialog.deleteLater)
+        bridge.acceptRequested.connect(dialog.accept)
+        bridge.rejectRequested.connect(dialog.reject)
+        dialog.show()
+        pump()
+        slider = ensure_visible(item(dialog, 'curveColorHue'))
+        slider.forceActiveFocus()
+        before = slider.property('value')
+        wheel(dialog.window(), slider)
+        self.assertEqual(slider.property('value'), before)
+        dialog.close()
+        pump()
+
         calls = []
         w.canvas.mpl_connect('scroll_event', calls.append)
         limits = w._heat_ax.get_xlim(), w._heat_ax.get_ylim()
-        wheel(w.canvas)
-        self.assertEqual(calls, [])
+        wheel(w.root_window, item(w, 'analysisCanvasInput'))
+        # Quick preserves the documented Matplotlib registry callback while
+        # scrolling its viewport; the canvas bridge contract requires no zoom.
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0].canvas, w.canvas)
+        self.assertEqual(calls[0].step, -1)
         self.assertEqual((w._heat_ax.get_xlim(), w._heat_ax.get_ylim()), limits)
-        w.peak_smooth_win_spin.stepUp()
-        self.assertEqual(w.peak_smooth_win_spin.value(), 13)
+        oa.key(w, 'peak_smooth_window', Qt.Key_Up)
+        self.assertEqual(oa.value(w, 'peak_smooth_window'), 13)
 
     def test_annotations_are_independent_exact_and_synchronized(self):
         w = self.window
         self.assertEqual(w._heat_ax.get_title(), '')
-        self.assertEqual(w.y_axis_name_edit.text(), 'Doping')
-        self.assertEqual(w.y_axis_unit_edit.text(), 'V')
+        self.assertEqual(dat.state(w)['y_axis_name'], 'Doping')
+        self.assertEqual(dat.state(w)['y_axis_unit'], 'V')
         title = '  Sample_A~B  $literal$  '
-        w.plot_title_edit.setText(title)
-        w.y_axis_name_edit.setText('Bias')
-        w.y_axis_unit_edit.setText('mV')
+        w.dat_properties.setLabel('plot_title', title, w.dat_properties.ownerToken)
+        w.dat_properties.setLabel('y_axis_name', 'Bias', w.dat_properties.ownerToken)
+        w.dat_properties.setLabel('y_axis_unit', 'mV', w.dat_properties.ownerToken)
         self.assertEqual(w._heat_ax.get_title(), title)
         self.assertEqual(w._heat_ax.get_ylabel(), 'Bias (mV)')
         w.canvas.draw()
@@ -104,7 +183,7 @@ class PresentationContractTests(unittest.TestCase):
         self.assertEqual(exported.texts[0].get_text(), title)
         self.assertEqual(exported.axes[0].get_ylabel(), 'Bias (mV)')
         np.testing.assert_array_equal(w.current_cube.gate, [1., 2., 3.])
-        w.y_axis_unit_edit.clear()
+        w.dat_properties.setLabel('y_axis_unit', '', w.dat_properties.ownerToken)
         self.assertEqual(w._heat_ax.get_ylabel(), 'Bias')
 
     def test_live_presentation_fonts_and_legacy_fixed_export_contract(self):
@@ -166,7 +245,7 @@ class PresentationContractTests(unittest.TestCase):
                         gap = (bar.get_window_extent(renderer).y0 - heat_bounds.y1) / figure.dpi
                         if figure is w.figure:
                             factor = 96*w._analysis_display_scale()*w.canvas.device_pixel_ratio/w.figure.dpi
-                            self.assertAlmostEqual(gap, w._unregistered_session.presentation.colorbar.frame_gap_in*factor)
+                            self.assertAlmostEqual(gap, w.workspace.active.presentation.colorbar.frame_gap_in*factor)
                         else:
                             self.assertGreaterEqual(gap, .03)
                             self.assertLessEqual(gap, .05)
@@ -178,13 +257,13 @@ class PresentationContractTests(unittest.TestCase):
 
     def test_regional_colorbars_are_compact_and_share_one_signal_label(self):
         w = self.window
-        w.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
-        w.plot_title_edit.setText("Regional title")
+        w.dat_properties.setLabel('signal_title', "d²(ΔR/R)/dE² (a. u.)", w.dat_properties.ownerToken)
+        w.dat_properties.setLabel('plot_title', "Regional title", w.dat_properties.ownerToken)
         for mode, names in (("2", ("Left", "Right")), ("3", ("Left", "Middle", "Right"))):
             with self.subTest(mode=mode):
-                w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData(mode))
+                dat.set_choice(w, 'color_scale', mode)
                 w.canvas.draw()
-                p = w._unregistered_session.presentation
+                p = w.workspace.active.presentation
                 factor = 96*w._analysis_display_scale()*w.canvas.device_pixel_ratio/w.figure.dpi
                 self.assertEqual([bar.ax.get_xlabel() for bar in w._heat_colorbars], [""] * len(names))
                 self.assertTrue(all(
@@ -216,9 +295,9 @@ class PresentationContractTests(unittest.TestCase):
 
     def test_regional_title_has_priority_over_compact_colorbar_row(self):
         w = self.window
-        w.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
-        w.plot_title_edit.setText("A long regional heatmap title")
-        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData("3"))
+        w.dat_properties.setLabel('signal_title', "d²(ΔR/R)/dE² (a. u.)", w.dat_properties.ownerToken)
+        w.dat_properties.setLabel('plot_title', "A long regional heatmap title", w.dat_properties.ownerToken)
+        dat.set_choice(w, 'color_scale', "3")
         w.canvas.draw()
         renderer = w.canvas.get_renderer()
         title = w._heat_ax.title.get_window_extent(renderer)
@@ -239,15 +318,17 @@ class PresentationContractTests(unittest.TestCase):
 
     def test_view_settings_group_follows_control_workflows(self):
         w = self.window
-        groups = [box.title() for box in w.findChildren(QGroupBox)]
-        self.assertLess(groups.index("Color Scale"), groups.index("View Range"))
-        self.assertLess(groups.index("View Range"), groups.index("Labels"))
-        self.assertTrue(w._region_edges_row.isHidden())
+        colors = dat.dat_item(w, 'shared_colors_section')
+        ranges = dat.dat_item(w, 'shared_ranges_section')
+        labels = dat.dat_item(w, 'shared_labels_section')
+        self.assertLess(colors.y(), ranges.y())
+        self.assertLess(ranges.y(), labels.y())
+        self.assertFalse(dat.dat_item(w, 'edge0').isVisible())
 
     def test_compact_export_labels_fit_without_overlap_for_signed_scientific_axes(self):
         w = self.window
         for title in ('', 'Sample_A: gate scan'):
-            w.plot_title_edit.setText(title)
+            w.dat_properties.setLabel('plot_title', title, w.dat_properties.ownerToken)
             for limits in ((1., 3.), (-3., -1.), (10000., 30000.), (-10000., -3000.)):
                 with self.subTest(title=title, limits=limits):
                     w._heat_ax.set_xlim(limits)
@@ -281,7 +362,7 @@ class PresentationContractTests(unittest.TestCase):
         for size in ((4., 5.), (8., 6.), (12., 8.)):
             w.figure.set_size_inches(*size)
             for title in ('', 'E=18V 9T Kp', 'E=18V 9T Kp — reflection gate scan'):
-                w.plot_title_edit.setText(title)
+                w.dat_properties.setLabel('plot_title', title, w.dat_properties.ownerToken)
                 for limits in ((1., 3.), (10000., 30000.)):
                     w._heat_ax.set_ylim(limits)
                     detached = _build_heatmap_export_figure(w.figure, selected_axes=(w._heat_ax, w._heat_colorbar.ax))
@@ -317,10 +398,10 @@ class PresentationContractTests(unittest.TestCase):
         original = w._heatmap_export_filename()
         self.assertEqual(original, 'sample_Graph 1_export01.png')
         self.assertEqual(w._heatmap_export_filename(), original)
-        w.plot_title_edit.setText('not_a_filename')
-        w.fit_smooth_chk.setChecked(True)
+        w.dat_properties.setLabel('plot_title', 'not_a_filename', w.dat_properties.ownerToken)
+        oa.set_value(w, 'fit_smooth', True)
         self.assertEqual(w._heatmap_export_filename(), original)
-        w.y_axis_unit_edit.setText('mV')
+        w.dat_properties.setLabel('y_axis_unit', 'mV', w.dat_properties.ownerToken)
         self.assertEqual(w._heatmap_export_filename(), original)
         w._heat_ax.set_xlim(2., 8.)
         self.assertEqual(w._heatmap_export_filename(), original)
@@ -341,14 +422,18 @@ class PresentationContractTests(unittest.TestCase):
         self.set_cube(replace(w.current_cube, source_path=source.replace('rep01', 'rep02')))
         self.assertNotEqual(w._heatmap_export_filename(), filename)
         self.set_cube(replace(w.current_cube, source_path=source))
-        w.plot_title_edit.setText('Independent display title')
-        w.plot_page.height_spin.setValue(4.5)  # Space for the deliberately long provenance title.
+        w.dat_properties.setLabel('plot_title', 'Independent display title', w.dat_properties.ownerToken)
+        # Properties remains the current visible ordinary Analysis consumer.
+        source_item = item(w, 'formalProperties')
+        token = w.plot_page.formal.capturePropertiesInput(source_item)
+        self.assertTrue(token)
+        w.plot_page.formal.setValue('height_in', 4.5, source_item, token)  # Space for the long provenance title.
         w._render_plot_page()
-        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_label.text())
+        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_text)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / filename
-            w.current_folder = tmp
-            with patch('spectra_app.main_window.QFileDialog.getSaveFileName', side_effect=AssertionError('PNG must save without a dialog')):
+            self.move_source_to(tmp)
+            with patch('spectra_app.main_window.FilePicker.getSaveFileName', side_effect=AssertionError('PNG must save without a dialog')):
                 w._on_export_png()
             self.assertEqual(self.errors, [])
             with Image.open(path) as image:
@@ -375,14 +460,14 @@ class PresentationContractTests(unittest.TestCase):
     def test_png_export_uses_next_unused_sequence_in_current_dat_folder(self):
         w = self.window
         w._render_plot_page()
-        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_label.text())
+        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_text)
         with tempfile.TemporaryDirectory() as tmp:
-            w.current_folder = tmp
+            self.move_source_to(tmp)
             existing = Path(tmp) / 'sample_Graph 1_export01.png'
             existing.write_bytes(b'preserve original export')
             third = Path(tmp) / 'sample_Graph 1_export03.png'
             third.write_bytes(b'preserve third export')
-            with patch('spectra_app.main_window.QFileDialog.getSaveFileName', side_effect=AssertionError('PNG must save without a dialog')):
+            with patch('spectra_app.main_window.FilePicker.getSaveFileName', side_effect=AssertionError('PNG must save without a dialog')):
                 w._on_export_png()
                 self.assertEqual(self.errors, [])
                 self.assertTrue((Path(tmp) / 'sample_Graph 1_export02.png').is_file())
@@ -394,7 +479,7 @@ class PresentationContractTests(unittest.TestCase):
             self.assertEqual(w._heatmap_export_filename(), 'sample_Graph 1_export05.png')
             next_folder = Path(tmp) / 'next'
             next_folder.mkdir()
-            w.current_folder = str(next_folder)
+            self.move_source_to(next_folder)
             w._on_export_png()
             self.assertEqual(self.errors, [])
             self.assertTrue((next_folder / 'sample_Graph 1_export01.png').is_file())

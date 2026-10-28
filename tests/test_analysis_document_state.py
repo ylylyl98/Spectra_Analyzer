@@ -293,7 +293,8 @@ class AnalysisDocumentStateTests(unittest.TestCase):
         restored = read_project(target).comparisons[comparison.comparison_id]
         self.assertEqual(restored.analysis_state, comparison.analysis_state)
         with zipfile.ZipFile(target) as archive:
-            self.assertEqual(json.loads(archive.read('manifest.json'))['version'], 9)
+            # Newly created comparisons retain their presentation in schema 12.
+            self.assertEqual(json.loads(archive.read('manifest.json'))['version'], 12)
         comparison.analysis_state['invalid'] = float('nan')
         with self.assertRaises(ProjectFormatError):
             write_project(target, self.workspace)

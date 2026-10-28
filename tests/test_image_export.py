@@ -1,3 +1,4 @@
+from tests import dat_properties_quick_helpers as dat
 import os
 import json
 import tempfile
@@ -12,7 +13,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from matplotlib.figure import Figure
 from PIL import Image
-from PySide6.QtWidgets import QApplication
 
 from spectra_app.dat_io import DataCube
 from spectra_app.image_export import (
@@ -24,12 +24,9 @@ from spectra_app.image_export import (
     _cb_fmt_regional,
     export_figure_png,
 )
-from spectra_app.main_window import MainWindow
 from spectra_app.svg_export import write_svg_png
-from tests.settings_helpers import isolate_settings
-
-
-_APP = QApplication.instance() or QApplication([])
+from tests.quick_migration_case import QuickMigrationCase
+from tests.quick_application_helpers import pump
 
 
 def _cube(z: np.ndarray, *, title: str = "export test") -> DataCube:
@@ -56,26 +53,34 @@ def _cube(z: np.ndarray, *, title: str = "export test") -> DataCube:
     )
 
 
-class ImageExportTests(unittest.TestCase):
-    def setUp(self) -> None:
-        isolate_settings(self)
-        self.windows: list[MainWindow] = []
-
+class ImageExportTests(QuickMigrationCase):
     def tearDown(self) -> None:
-        for window in self.windows:
-            window.close()
+        self.assertFalse(self.quick_errors)
+        super().tearDown()
 
-    def make_window(self, *, title: str = "export test") -> MainWindow:
-        window = MainWindow()
-        window._show_error = lambda message: self.fail(f"unexpected Qt error: {message}")
-        window.current_cube = _cube(np.arange(24, dtype=float).reshape(3, 8), title=title)
+    def make_window(self, *, title: str = "export test"):
+        window = self.controller
+        cube = _cube(np.arange(24, dtype=float).reshape(3, 8), title=title)
+        source = self.folder / f'export-{len(window.workspace.datasets)}.dat'
+        np.savetxt(source, np.column_stack((cube.energy, cube.z.T)),
+                   header='Energy ' + ' '.join(map(str, cube.gate)), comments='')
+        session = window.initialize_dataset(
+            source, (cube, None, None, ''), window.snapshot_dataset_defaults())
+        session.sidecar_writes_enabled = False
+        window.register_dataset(session)
+        window.activate_dataset(session.dataset_id, capture_outgoing=False)
         window.current_gate = 2.0
         window._set_view_limits_to_auto()
         window._plot_cube()
-        self.windows.append(window)
+        window.open_graph_document()
+        # Detached legacy exports copy the real live Analysis artists. Their
+        # presentation geometry is intentionally deferred while Analysis hides.
+        self.assertTrue(window.request_outer_view('analysis'))
+        window.request_task(2)
+        pump(60)
         return window
 
-    def make_graph_window(self, folder: str) -> MainWindow:
+    def make_graph_window(self, folder: str):
         window = self.make_window()
         source = Path(folder) / "heatmap.dat"
         source.write_text("Energy(eV) 0 1\n1.0 1 2\n1.1 2 3\n1.2 3 4\n", encoding="utf-8")
@@ -85,11 +90,11 @@ class ImageExportTests(unittest.TestCase):
 
     def test_detached_export_uses_reference_layout_and_only_heatmap_artists(self) -> None:
         window = self.make_window(title="Very long heatmap export title with several words")
-        window.cmap_combo.setCurrentText("RdBu_r_p0p45")
+        dat.set_choice(window, 'colormap', "RdBu_r_p0p45")
         window._heat_ax.set_xlim(2.0, 7.0)
         window._heat_ax.set_ylim(1.2, 2.8)
-        window.vmin_spin.setValue(2.0)
-        window.vmax_spin.setValue(19.0)
+        dat.setup_number(window, 'vmin', 2.0)
+        dat.setup_number(window, 'vmax', 19.0)
         window._update_spectrum_only()
 
         detached = _build_heatmap_export_figure(
@@ -130,11 +135,11 @@ class ImageExportTests(unittest.TestCase):
 
     def test_detached_export_copies_mesh_coordinates_array_cmap_norm_and_ranges(self) -> None:
         window = self.make_window()
-        window.cmap_combo.setCurrentText("RdBu_r_0.6")
+        dat.set_choice(window, 'colormap', 'RdBu_r_p0p6')
         window._heat_ax.set_xlim(2.0, 7.0)
         window._heat_ax.set_ylim(1.2, 2.8)
-        window.vmin_spin.setValue(2.0)
-        window.vmax_spin.setValue(19.0)
+        dat.setup_number(window, 'vmin', 2.0)
+        dat.setup_number(window, 'vmax', 19.0)
         window._update_spectrum_only()
         live_mesh = window._heat_mesh
         live_heat = window._heat_ax
@@ -151,7 +156,7 @@ class ImageExportTests(unittest.TestCase):
 
     def test_detached_regional_export_copies_all_meshes_norms_and_colorbars(self) -> None:
         window = self.make_window()
-        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
+        dat.set_choice(window, 'color_scale', "3")
         detached = _build_heatmap_export_figure(
             window.figure,
             selected_axes=(window._heat_ax, *[bar.ax for bar in window._heat_colorbars]),
@@ -172,11 +177,9 @@ class ImageExportTests(unittest.TestCase):
         for region_count in (2, 3):
             with self.subTest(region_count=region_count):
                 window = self.make_window(title="Long regional export title with several words")
-                window.plot_title_edit.setText("Long regional export title with several words")
-                window.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
-                window.color_scale_combo.setCurrentIndex(
-                    window.color_scale_combo.findData(str(region_count))
-                )
+                window.dat_properties.setLabel('plot_title', "Long regional export title with several words", window.dat_properties.ownerToken)
+                window.dat_properties.setLabel('signal_title', "d²(ΔR/R)/dE² (a. u.)", window.dat_properties.ownerToken)
+                dat.set_choice(window, 'color_scale', str(region_count))
                 window._layout_live_plots()
                 detached = _build_heatmap_export_figure(
                     window.figure,
@@ -222,8 +225,8 @@ class ImageExportTests(unittest.TestCase):
 
     def test_regional_endpoint_ticks_are_compact_and_separated_within_each_bar(self) -> None:
         window = self.make_window(title="p3 8T 0.5TG-BG=0")
-        window.signal_title_combo.setCurrentText("d²(ΔR/R)/dE² (a. u.)")
-        window.color_scale_combo.setCurrentIndex(window.color_scale_combo.findData("3"))
+        window.dat_properties.setLabel('signal_title', "d²(ΔR/R)/dE² (a. u.)", window.dat_properties.ownerToken)
+        dat.set_choice(window, 'color_scale', "3")
         window._layout_live_plots()
         ranges = ((-0.07239, 1.053), (-0.03265, 0.02476), (-0.006, 0.008))
         for mesh, colorbar, (vmin, vmax) in zip(window._heat_meshes, window._heat_colorbars, ranges):
@@ -231,7 +234,7 @@ class ImageExportTests(unittest.TestCase):
             colorbar.mappable.set_clim(vmin, vmax)
         # Live bars retain their saved geometry and three ticks. Give those
         # labels room; the detached legacy export below still fits endpoints.
-        presentation = window._unregistered_session.presentation
+        presentation = window.workspace.active.presentation
         window.set_plot_presentation(replace(presentation, colorbar=replace(
             presentation.colorbar, width_in=1.2, gap_in=.5)))
         window._layout_live_plots()
@@ -317,7 +320,7 @@ class ImageExportTests(unittest.TestCase):
 
     def test_export_preserves_live_figure_and_artists(self) -> None:
         window = self.make_window()
-        window.cmap_combo.setCurrentText("RdBu_r_p0p45")
+        dat.set_choice(window, 'colormap', "RdBu_r_p0p45")
         window._heat_ax.set_xlim(2.0, 7.0)
         window._heat_ax.set_ylim(1.2, 2.8)
         window._update_spectrum_only()
@@ -384,9 +387,9 @@ class ImageExportTests(unittest.TestCase):
             source.write_text("Energy(eV) 0 1\n1.0 1 2\n1.1 2 3\n1.2 3 4\n", encoding="utf-8")
             window._load_dat_file_direct(source)
             window.open_graph_document()
-            window.plot_title_edit.setText("Saved title")
+            window.dat_properties.setLabel('plot_title', "Saved title", window.dat_properties.ownerToken)
             window._render_plot_page()
-            self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+            self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_text)
             browsing_folder = Path(tmp) / "other-folder"
             browsing_folder.mkdir()
             window.current_folder = str(browsing_folder)
@@ -397,7 +400,7 @@ class ImageExportTests(unittest.TestCase):
             self.assertFalse(sidecar.exists())
             existing = Path(tmp) / "source_Graph 1_export01.png"
             existing.write_bytes(b"preserve original export")
-            with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")):
+            with patch("spectra_app.main_window.FilePicker.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")):
                 window._on_export_png()
             output = Path(tmp) / "source_Graph 1_export02.png"
             self.assertTrue(output.is_file())
@@ -407,14 +410,16 @@ class ImageExportTests(unittest.TestCase):
             self.assertEqual(payload["version"], 6)
             self.assertEqual(payload["plot"]["graphs"][0]["plot"]["annotations"]["plot_title"], "Saved title")
             self.assertFalse((browsing_folder / "source_Graph 1_export02.png").exists())
-            self.assertIn(str(output), window.statusBar().currentMessage())
+            self.assertEqual(window.statusText, '')
             with Image.open(output) as image:
                 self.assertEqual(image.format, "PNG")
                 metadata = json.loads(image.info["SpectraAnalyzer"])
             self.assertEqual(metadata["plot_title"], "Saved title")
             self.assertEqual(metadata["source_path"], str(source))
-            window.close()
-        self.assertTrue(window.export_png_btn.isEnabled())
+            with patch.object(window, '_confirm_project_discard_async', lambda callback: callback()):
+                window.close()
+            pump()
+        self.assertTrue(window.plot_page.command_enabled('export_png'))
 
     def test_main_window_export_uses_current_svg_without_spectrum_or_editing_handles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -422,11 +427,11 @@ class ImageExportTests(unittest.TestCase):
             window._spec_ax.set_title("Spectrum-only export sentinel")
             window._spec_ax.lines[0].set_gid("spectrum-only-line")
             window._render_plot_page()
-            self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_label.text())
+            self.assertIsNotNone(window.plot_page.rendered_page, window.plot_page.status_text)
             annotation = window.plot_page.add_annotation("arrow", "Formal annotation")
             window._render_plot_page()
             page = window.plot_page.rendered_page
-            self.assertIsNotNone(page, window.plot_page.status_label.text())
+            self.assertIsNotNone(page, window.plot_page.status_text)
             self.assertEqual(window.plot_page.preview.selected_id, annotation.id)
             preview_bytes = window.plot_page.preview.svg_bytes
             root = ET.fromstring(preview_bytes)
@@ -437,7 +442,7 @@ class ImageExportTests(unittest.TestCase):
             self.assertEqual(len(root.findall('.//{http://www.w3.org/2000/svg}image')), 1)
             window.current_folder = tmp
             path = Path(tmp) / "heatmap_Graph 1_export01.png"
-            with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), patch(
+            with patch("spectra_app.main_window.FilePicker.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), patch(
                 "spectra_app.main_window.write_svg_png", wraps=write_svg_png
             ) as export, patch("spectra_app.main_window.render_hybrid_svg", side_effect=AssertionError("Export must use the current preview")):
                 window._on_export_png()
@@ -455,13 +460,13 @@ class ImageExportTests(unittest.TestCase):
             window = self.make_graph_window(tmp)
             window._render_plot_page()
             page = window.plot_page.rendered_page
-            self.assertIsNotNone(page, window.plot_page.status_label.text())
+            self.assertIsNotNone(page, window.plot_page.status_text)
             errors: list[str] = []
             window._show_error = errors.append
             window.current_folder = tmp
             existing = Path(tmp) / "heatmap_Graph 1_export01.png"
             existing.write_bytes(b"preserve original export")
-            with patch("spectra_app.main_window.QFileDialog.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), patch(
+            with patch("spectra_app.main_window.FilePicker.getSaveFileName", side_effect=AssertionError("PNG must save without a dialog")), patch(
                 "spectra_app.main_window.write_svg_png", side_effect=OSError("disk full")
             ) as export:
                 window._on_export_png()
@@ -475,11 +480,10 @@ class ImageExportTests(unittest.TestCase):
             self.assertIs(window.plot_page.rendered_page, page)
 
     def test_main_window_export_action_is_guarded_without_data(self) -> None:
-        window = MainWindow()
-        self.windows.append(window)
+        window = self.controller
         errors: list[str] = []
         window._show_error = errors.append
-        self.assertFalse(window.export_png_btn.isEnabled())
+        self.assertFalse(window.plot_page.command_enabled('export_png'))
         with patch("spectra_app.main_window.write_svg_png") as export:
             window._on_export_png()
         export.assert_not_called()

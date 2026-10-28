@@ -44,7 +44,7 @@ class SelectiveFormatTests(unittest.TestCase):
         expected = {
             'layout': {'width_in', 'height_in', 'heatmap_dpi', 'frame_width_in',
                        'frame_height_in', 'aspect_locked'},
-            'typography': {'font_family', 'numeric_pt', 'text_pt'},
+            'typography': {'numeric_pt', 'text_pt'},
             'axis': {'axis.exchange_xy', 'axis.flip_x', 'axis.border'},
             'colormap': {'colormap'},
             'colorbar': {'colorbar.alignment', 'colorbar.gap_in'},

@@ -1,25 +1,33 @@
 """DAT workbench acceptance checks at the document, UI, and saved-output boundaries."""
+from tests import analysis_header_quick_helpers as ah
 import csv
 import json
 from dataclasses import replace
 from pathlib import Path
 import threading
-import unittest
 from unittest.mock import patch
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QTableWidget
+from PySide6.QtQuick import QQuickItem
+from spectra_app.quick_dialog import QuickDialog
 
 from tests import test_analysis_workbench as base
+from tests import analysis_quick_helpers as aq
 from tests.settings_helpers import wait_for_background_jobs
+from tests.quick_migration_case import QuickMigrationCase
 from spectra_app.analysis_document import AnalysisSeed, rebind_analysis_input
 from spectra_app.project_io import read_project, write_project
 
 
-class DatUsabilityTests(unittest.TestCase):
+class DatUsabilityTests(QuickMigrationCase):
     setUp = base.AnalysisWorkbenchTests.setUp
-    dispose = base.AnalysisWorkbenchTests.dispose
+
+    def dispose(self):
+        wait_for_background_jobs(self.w, timeout=10)
+        self.assertEqual(self.callback_errors, [])
+        self.assertEqual(self.quick_errors, [])
+
     enter = base.AnalysisWorkbenchTests.enter
     find = base.AnalysisWorkbenchTests.find
 
@@ -30,7 +38,7 @@ class DatUsabilityTests(unittest.TestCase):
         seeds = [AnalysisSeed(1.35123, manual=True), AnalysisSeed(1.35124, kind='dip', manual=True)]
         doc.set_seeds(gate, seeds)
         self.w._workbench_refresh()
-        self.w.workbench_linecut_btn.click()
+        aq.command(self.w, 'linecut')
         comparison = list(self.w.workspace.comparisons.values())[-1]
         self.assertEqual(len(comparison.curves), 3)
         sheet = self.w.workspace.sheets[next(iter(comparison.curves.values())).sheet_id]
@@ -49,12 +57,12 @@ class DatUsabilityTests(unittest.TestCase):
     def test_unchanged_input_is_disabled_and_model_rebind_is_a_noop(self):
         graph = self.enter()
         self.find()
-        self.w.workbench_model.setCurrentText('Gaussian')
-        self.w.workbench_fit_btn.click()
+        aq.set_choice(self.w, 'model', 'Gaussian')
+        aq.command(self.w, 'fit')
         wait_for_background_jobs(self.w, timeout=15)
         doc, token = graph.analysis, graph.analysis.job_token
         fitted = dict(doc.science.batch_fit_result_map)
-        self.assertFalse(self.w.workbench_bind_btn.isEnabled())
+        self.assertFalse(aq.control(self.w, 'analysis_rebind').isEnabled())
         self.assertIs(rebind_analysis_input(self.session), doc)
         self.w._workbench_rebind_input()
         self.assertIs(graph.analysis, doc)
@@ -69,7 +77,7 @@ class DatUsabilityTests(unittest.TestCase):
         doc = graph.analysis
         self.session.applied.window_length += 2
         self.w._workbench_refresh()
-        self.assertTrue(self.w.workbench_bind_btn.isEnabled())
+        self.assertTrue(aq.control(self.w, 'analysis_rebind').isEnabled())
         with patch.object(self.w, '_workbench_confirm_rebind', return_value='cancel') as confirm:
             self.w._workbench_rebind_input()
         self.assertEqual(confirm.call_args.args[0], 3)
@@ -87,28 +95,28 @@ class DatUsabilityTests(unittest.TestCase):
     def test_gate_filter_restore_and_pending_scope_do_not_mutate_applied_filter(self):
         graph = self.enter()
         self.find()
-        self.w.workbench_scope.setCurrentIndex(0)
+        aq.set_choice(self.w, 'scope', 'current')
         self.w._set_current_gate_from_index(0, update_plot=True)
-        self.w.workbench_filter_preset.setCurrentText('Loose')
-        self.w.workbench_filter_btn.click()
+        aq.set_choice(self.w, 'filterPreset', 'Loose')
+        aq.command(self.w, 'filter')
         self.w._set_current_gate_from_index(1, update_plot=True)
-        self.w.workbench_filter_preset.setCurrentText('Strict')
-        self.assertIn('Pending: Strict', self.w.workbench_filter_state.text())
+        aq.set_choice(self.w, 'filterPreset', 'Strict')
+        self.assertIn('Pending: Strict', aq.state(self.w)['filterState'])
         self.assertEqual(graph.analysis.filters_by_gate[1].preset, 'Balanced')
-        self.w.workbench_filter_btn.click()
+        aq.command(self.w, 'filter')
         self.w._set_current_gate_from_index(0, update_plot=True)
-        self.assertEqual(self.w.workbench_filter_preset.currentText(), 'Loose')
-        self.assertIn('Applied: Loose', self.w.workbench_filter_state.text())
-        self.w.workbench_scope.setCurrentIndex(1)
-        self.assertIn('mixed', self.w.workbench_filter_state.text().lower())
-        self.assertIn('All 3 Gates', self.w.workbench_filter_state.text())
+        self.assertEqual(aq.state(self.w)['filterPreset'], 'Loose')
+        self.assertIn('Applied: Loose', aq.state(self.w)['filterState'])
+        aq.set_choice(self.w, 'scope', 'all')
+        self.assertIn('mixed', aq.state(self.w)['filterState'].lower())
+        self.assertIn('All 3 Gates', aq.state(self.w)['filterState'])
 
     def test_mixed_fit_summary_messages_and_locate_gate(self):
         from spectra_app.fitting import fit_multi_peak
         graph = self.enter()
         self.find()
         graph.analysis.set_seeds(2, [])
-        self.w.workbench_model.setCurrentText('Gaussian')
+        aq.set_choice(self.w, 'model', 'Gaussian')
         count = 0
         def controlled(*args, **kwargs):
             nonlocal count
@@ -117,28 +125,33 @@ class DatUsabilityTests(unittest.TestCase):
                 raise ValueError('Gate trace has invalid data')
             return fit_multi_peak(*args, **kwargs)
         with patch('spectra_app.fitting.fit_multi_peak', side_effect=controlled):
-            self.w.workbench_fit_btn.click()
+            aq.command(self.w, 'fit')
             wait_for_background_jobs(self.w, timeout=15)
-        summary = self.w.workbench_status.text()
+        summary = aq.state(self.w)['status']
         for expected in ('1 fitted', '1 failed', '1 no-seed', '0 cancelled', '3/3 processed'):
             self.assertIn(expected, summary)
-        with patch.object(QDialog, 'exec', return_value=0):
-            self.w._workbench_results_table()
-        dialog = self.w.findChildren(QDialog)[-1]
-        table = dialog.findChild(QTableWidget)
-        message_col = next(c for c in range(table.columnCount()) if table.horizontalHeaderItem(c).text() == 'Message')
-        self.assertEqual(table.horizontalHeader().visualIndex(message_col), 2,
+        dialog = self.w._workbench_results_table()
+        self.addCleanup(dialog.reject)
+        self.assertIsInstance(dialog, QuickDialog)
+        bridge = dialog.bridge
+        table = bridge.tableModel
+        self.assertEqual(table.headerData(2, Qt.Horizontal, Qt.DisplayRole), 'Message',
                          'Failure reasons must be visible beside Gate and Status without horizontal scrolling')
-        failed_row = next(r for r in range(table.rowCount()) if 'invalid data' in table.item(r, message_col).text())
-        table.setCurrentCell(failed_row, 0)
-        dialog.findChild(type(self.w.workbench_fit_btn), 'analysisLocateGate').click()
+        failed_row = next(r for r in range(table.rowCount())
+                          if 'invalid data' in table.data(table.index(r, 2), Qt.DisplayRole))
+        self.assertTrue(bridge.selectCell(failed_row, 0, bridge.ownerToken))
+        self.assertTrue(bridge.locate(bridge.ownerToken))
         self.assertEqual(self.w._current_gate_index(), 1)
 
     def test_cancel_retains_completed_fit_and_reports_remaining_gates(self):
         from spectra_app.fitting import fit_multi_peak
         graph = self.enter()
         self.find()
-        self.w.workbench_model.setCurrentText('Gaussian')
+        aq.set_choice(self.w, 'model', 'Gaussian')
+        aq.command(self.w, 'fit')
+        wait_for_background_jobs(self.w, timeout=15)
+        previous = dict(graph.analysis.science.batch_fit_result_map)
+        self.assertEqual(set(previous), {0, 1, 2})
         started, release = threading.Event(), threading.Event()
         count = 0
         def controlled(*args, **kwargs):
@@ -150,31 +163,35 @@ class DatUsabilityTests(unittest.TestCase):
             return fit_multi_peak(*args, **kwargs)
         try:
             with patch('spectra_app.fitting.fit_multi_peak', side_effect=controlled):
-                self.w.workbench_fit_btn.click()
+                aq.command(self.w, 'fit')
                 self.assertTrue(started.wait(5))
                 self.w._cancel_background_job()
                 release.set()
                 wait_for_background_jobs(self.w, timeout=15)
         finally:
             release.set()
-        self.assertEqual(set(graph.analysis.science.batch_fit_result_map), {0})
-        self.assertIn('1 fitted', self.w.workbench_status.text())
-        self.assertIn('2 cancelled', self.w.workbench_status.text())
+        fits = graph.analysis.science.batch_fit_result_map
+        self.assertEqual(set(fits), {0, 1, 2})
+        self.assertIsNot(fits[0], previous[0], 'Completed Gate must retain its newly computed fit')
+        self.assertIs(fits[1], previous[1], 'Cancelled Gate must retain its previous fit')
+        self.assertIs(fits[2], previous[2], 'Unstarted Gate must retain its previous fit')
+        self.assertIn('1 fitted', aq.state(self.w)['status'])
+        self.assertIn('2 cancelled', aq.state(self.w)['status'])
         self.assertIn('Cancelled', graph.analysis.gate_messages[1])
 
     def test_all_gate_parameters_save_to_workbook_and_csv_with_precision_and_provenance(self):
         graph = self.enter()
         self.find()
         graph.analysis.set_seeds(2, [AnalysisSeed(1.351234567891, kind='dip', enabled=False, manual=True)])
-        self.w.workbench_scope.setCurrentIndex(0)
+        aq.set_choice(self.w, 'scope', 'current')
         self.w._set_current_gate_from_index(0, update_plot=True)
-        self.w.workbench_model.setCurrentText('Gaussian')
-        self.w.workbench_fit_btn.click()
+        aq.set_choice(self.w, 'model', 'Gaussian')
+        aq.command(self.w, 'fit')
         wait_for_background_jobs(self.w, timeout=15)
         graph.analysis.gate_status[1] = 'failed'
         graph.analysis.gate_messages[1] = 'Test failure detail'
         target = self.folder / 'parameters.csv'
-        with patch('spectra_app.analysis_workbench.QFileDialog.getSaveFileName', return_value=(str(target), 'CSV')):
+        with patch('spectra_app.analysis_workbench.FilePicker.getSaveFileName', return_value=(str(target), 'CSV')):
             self.w._workbench_export_parameters()
         with target.open(newline='', encoding='utf-8-sig') as handle:
             rows = list(csv.DictReader(handle))
@@ -195,12 +212,18 @@ class DatUsabilityTests(unittest.TestCase):
         gate = self.w._current_gate_index()
         graph.analysis.set_seeds(gate, [AnalysisSeed(1.35123, manual=True, gamma=.01)])
         self.w._workbench_refresh()
-        self.assertIn('HWHM', self.w.workbench_seeds.horizontalHeaderItem(4).text())
-        self.assertIn('eV', self.w.workbench_seeds.horizontalHeaderItem(4).text())
-        self.assertFalse(self.w.workbench_seeds.item(0, 5).flags() & Qt.ItemIsEditable)
-        self.w.workbench_model.setCurrentText('Voigt')
-        self.assertIn('sigma', self.w.workbench_seeds.horizontalHeaderItem(4).text().lower())
-        self.assertTrue(self.w.workbench_seeds.item(0, 5).flags() & Qt.ItemIsEditable)
+        self.host.show()
+        seed_id = graph.analysis.seeds_by_gate[gate][0].seed_id
+        aq.select_seed(self.w, seed_id)
+        aq.command(self.w, 'seeds')
+        aq.pump()
+        self.assertIn('HWHM', aq.state(self.w)['widthLabel'])
+        self.assertIn('eV', aq.state(self.w)['xLabel'])
+        self.assertFalse(aq.item(self.w.workbench_seed_dialog, seed_id + ':gamma').isEnabled())
+        aq.set_choice(self.w, 'model', 'Voigt')
+        self.assertIn('sigma', aq.state(self.w)['widthLabel'].lower())
+        self.assertTrue(aq.item(self.w.workbench_seed_dialog, seed_id + ':gamma').isEnabled())
+        self.assertEqual(graph.analysis.seeds_by_gate[gate][0].gamma, .01)
 
     def test_effective_d2_windows_show_segment_adjustments_and_input_context_is_frozen(self):
         graph = self.enter()
@@ -211,32 +234,32 @@ class DatUsabilityTests(unittest.TestCase):
         z[0, 7:10] = np.nan
         z[0, 25:29] = np.nan
         doc.science.current_cube = replace(cube, z=z)
-        self.w.workbench_scope.setCurrentIndex(0)
+        aq.set_choice(self.w, 'scope', 'current')
         self.w._set_current_gate_from_index(0, update_plot=True)
-        self.w.workbench_detector.setCurrentIndex(1)
-        self.w.workbench_sg_window.setValue(12)
-        self.assertIn('7, 13', self.w.workbench_d2_note.text())
+        aq.set_choice(self.w, 'detector', 'D2')
+        aq.setup_number(self.w, 'd2Window', 12)
+        self.assertIn('7, 13', aq.state(self.w)['d2Note'])
         self.session.graphs[self.source_id].gate_indices = [0]
         self.w._workbench_refresh()
-        text = self.w.analysis_context_label.text()
+        text = ah.context(self.w)
         self.assertIn('Frozen', text)
-        self.assertIn(doc.input_version[:8], text)
-        self.assertIn('visible 3/3', text)
+        self.assertIn(doc.input_version[:8], ah.details(self.w))
+        self.assertIn('3/3 Gates', text)
         self.assertIn('analyzed 1', text)
         self.assertIn('Source changed', text)
 
     def test_fit_linecut_uses_full_frozen_source_with_interval_fit(self):
         graph = self.enter()
         self.find(all_gates=False)
-        self.w.workbench_model.setCurrentText('Gaussian')
-        self.w.workbench_xmin.setValue(1.2)
-        self.w.workbench_xmax.setValue(1.5)
-        self.w.workbench_fit_btn.click()
+        aq.set_choice(self.w, 'model', 'Gaussian')
+        aq.setup_number(self.w, 'xmin', 1.2)
+        aq.setup_number(self.w, 'xmax', 1.5)
+        aq.command(self.w, 'fit')
         wait_for_background_jobs(self.w, timeout=15)
         cube = graph.analysis.science.current_cube
         gate = self.w._current_gate_index()
         fit = graph.analysis.science.batch_fit_result_map[gate]
-        self.w.workbench_linecut_btn.click()
+        aq.command(self.w, 'linecut')
         comparison = list(self.w.workspace.comparisons.values())[-1]
         sheet = self.w.workspace.sheets[next(iter(comparison.curves.values())).sheet_id]
         np.testing.assert_array_equal(sheet.data[:, :2], np.column_stack([cube.energy, cube.z[gate]]))
@@ -246,20 +269,30 @@ class DatUsabilityTests(unittest.TestCase):
         np.testing.assert_allclose(sheet.data[valid, 3:], (fit.components + fit.baseline).T)
 
     def test_replace_confirmation_defaults_to_cancel_and_gate_scope_change_is_detected(self):
-        from PySide6.QtWidgets import QMessageBox
+        from spectra_app.quick_dialog import QuickDialog
         graph = self.enter()
         self.find()
         self.session.graphs[self.source_id].gate_indices = [0, 2]
         self.w._workbench_refresh()
-        self.assertTrue(self.w.workbench_bind_btn.isEnabled())
+        self.assertTrue(aq.control(self.w, 'analysis_rebind').isEnabled())
         captured = []
-        def inspect(box):
-            captured.append(box)
-            self.assertIs(box.defaultButton(), box.button(QMessageBox.Cancel))
-            self.assertIn('3 Gates', box.text())
-            self.assertTrue(any('Duplicate' in button.text() for button in box.buttons()))
+        def inspect(host):
+            captured.append(host)
+            self.assertEqual(host.bridge.state['rebindCount'], 3)
+            cancel = aq.item(host, 'analysis_rebind_cancel')
+            self.assertIsNotNone(aq.item(host, 'analysis_rebind_duplicate'))
+            host.show()
+            aq.pump()
+            self.assertTrue(cancel.hasActiveFocus(), 'Cancel must receive default keyboard focus')
+            texts = [str(child.property('text')) for child in host.rootObject().findChildren(QQuickItem)
+                     if child.property('text') is not None]
+            self.assertTrue(any('3 Gates' in text for text in texts), texts)
+            from PySide6.QtTest import QTest
+            QTest.keyClick(host.window(), Qt.Key_Escape)
+            self.assertEqual(host.result(), QuickDialog.Rejected)
+            return host.result()
         old = graph.analysis
-        with patch.object(QMessageBox, 'exec', inspect):
+        with patch.object(QuickDialog, 'exec', inspect):
             self.w._workbench_rebind_input()
         self.assertEqual(len(captured), 1)
         self.assertIs(graph.analysis, old)

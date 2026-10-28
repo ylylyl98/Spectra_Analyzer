@@ -1,32 +1,28 @@
 """Shared physical frame and Origin-style linear tick contracts."""
+from tests import dat_properties_quick_helpers as dat
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from dataclasses import replace
 import unittest
+import time
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from matplotlib.font_manager import FontProperties, findfont
-from PySide6.QtGui import QFontDatabase, QImage
+from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtQuick import QQuickItem
 
-from spectra_app.main_window import MainWindow
+from tests.quick_migration_case import QuickMigrationCase
 from spectra_app.plot_presentation import AxisPresentation, ColorbarTicks, HeatmapSnapshot, PlotAnnotation, PlotPresentation
 from spectra_app.plot_templates import FormatStyle
 from spectra_app.svg_export import apply_heatmap_axis_style, render_hybrid_svg
 from spectra_app import svg_export
-from tests.settings_helpers import isolate_settings
-
-APP = QApplication.instance() or QApplication([])
-if os.name == 'nt' and os.environ.get('QT_QPA_PLATFORM') == 'offscreen':
-    # Windows offscreen needs native font files for stable widget metrics.
-    for family in ('Consolas', 'Arial', 'Segoe UI'):
-        QFontDatabase.addApplicationFont(findfont(FontProperties(family=family)))
-
+from tests.formal_quick_helpers import item, pump
+from tests.quick_application_helpers import application
+from contextlib import contextmanager
 
 def assert_compact_axis_boxes(test, ax, renderer, points_to_pixels, *, inside):
     """Catch whole-row corner padding and stale endpoint alignment in real text."""
@@ -53,7 +49,7 @@ def assert_compact_axis_boxes(test, ax, renderer, points_to_pixels, *, inside):
             test.assertEqual(label.get_horizontalalignment(), 'center')
 
 
-class TickRecordsTests(unittest.TestCase):
+class TickRecordsTests(QuickMigrationCase):
     def test_qtsvg_clips_long_literal_multiline_title_inside_frame(self):
         snapshot = HeatmapSnapshot(x=[1., 2.], y=[0., 1.], z=np.ones((2, 2)),
                                    x_label='Energy (eV)', y_label='Gate (V)', signal_label='PL (arb. units)')
@@ -227,17 +223,89 @@ class TickRecordsTests(unittest.TestCase):
                             [left*page_width, (1-bottom-height)*page_height, width*page_width, height*page_height], atol=1e-5)
 
 
-class SharedFrameQtTests(unittest.TestCase):
+class SharedFrameQtTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
+        super().setUp()
         path = self.folder / 'scan.dat'
         path.write_text('Energy(eV) 0 1 2\n' + '\n'.join(
             f'{1+i/10} {-i-1} {i+1} {10*(i+1)}' for i in range(12)), encoding='utf-8')
-        self.window = MainWindow(); self.window._show_error = self.fail
-        self.window._load_dat_file_direct(path); self.window.show(); APP.processEvents()
+        self.window = self.controller; self.window._show_error = self.fail
+        self.window._load_dat_file_direct(path)
+        self.window.open_graph_document()
+        self.window.request_outer_view('analysis')
+        self.window.request_task(2)
+        pump(100)
 
     def tearDown(self):
-        self.window.close(); APP.processEvents()
+        self.assertFalse(self.quick_errors)
+        super().tearDown()
+
+    def set_formal_value(self, field, value):
+        w = self.window
+        self.assertEqual(w.outerView, 'analysis')
+        w.dat_details_action.setChecked(True)
+        self.assertTrue(w.request_task(2))
+        pump(60)
+        source = item(w, 'formalProperties')
+        self.assertTrue(source.isVisible())
+        self.assertIs(source.property('bridge'), w.plot_page.formal)
+        owner = w.plot_page.formal.capturePropertiesInput(source)
+        self.assertTrue(owner)
+        self.assertTrue(w.plot_page.formal.propertiesInputCurrent(source, owner))
+        w.plot_page.formal.setValue(field, value, source, owner)
+
+    def wait_for_analysis_layout(self):
+        """Observe natural measured layout and completed visible Quick frames."""
+        w = self.window
+        viewport = item(w, 'analysisCanvasViewport')
+        header = item(w, 'analysisHeader')
+        summary = item(w, 'contextSummary')
+        flow = summary.parentItem()
+        frames = [0]
+        def frame_completed():
+            frames[0] += 1
+        visible = w.root_window.isVisible()
+        if visible:
+            w.root_window.frameSwapped.connect(frame_completed)
+        deadline, previous, stable = time.monotonic() + 1., None, 0
+        state = None
+        try:
+            while time.monotonic() < deadline:
+                before = frames[0]
+                if visible:
+                    # Schedule ordinary rendering so deferred QML text/Flow
+                    # measurements reach the real viewport before comparing it.
+                    w.root_window.update()
+                pump(1)
+                while visible and frames[0] == before and time.monotonic() < deadline:
+                    pump(1)
+                timer = getattr(w, '_view_layout_timer', None)
+                required = max((child.y() + child.height() for child in flow.childItems()
+                                if child.isVisible()), default=0.)
+                state = (w.root_window.width(), w.root_window.height(),
+                         viewport.width(), viewport.height(),
+                         w.dat_canvas.viewportWidth, w.dat_canvas.viewportHeight,
+                         w.dat_canvas.contentWidth, w.dat_canvas.contentHeight,
+                         header.height(), flow.height(), flow.implicitHeight(), required,
+                         tuple(w.figure.get_size_inches()), w.figure.dpi,
+                         w.canvas.device_pixel_ratio, tuple(w._heat_ax.get_position().bounds))
+                ready = (w.outerView == 'analysis'
+                         and not getattr(w, '_annotation_layout_pending', False)
+                         and not getattr(w, '_laying_out_live_plots', False)
+                         and not (timer and timer.isActive()))
+                if visible:
+                    ready = (ready and frames[0] > before
+                             and round(viewport.width()) == round(w.dat_canvas.viewportWidth)
+                             and round(viewport.height()) == round(w.dat_canvas.viewportHeight)
+                             and flow.height() >= required and flow.implicitHeight() >= required)
+                stable = stable + 1 if ready and state == previous else 0
+                previous = state if ready else None
+                if stable >= 2:
+                    return
+            self.fail(f'Analysis layout did not converge through natural events: {state}')
+        finally:
+            if visible:
+                w.root_window.frameSwapped.disconnect(frame_completed)
 
     def logical_frame(self):
         w = self.window; w.canvas.draw()
@@ -246,28 +314,28 @@ class SharedFrameQtTests(unittest.TestCase):
 
     def test_title_edits_keep_live_and_formal_frames_with_hidden_plot_and_regional_bars(self):
         w = self.window
-        w.plot_tabs.setCurrentIndex(0)
+        self.assertTrue(w.request_outer_view('analysis'))
         for auto, exchange, mode in ((False, False, 'global'), (True, True, 'global'), (False, True, '3')):
             p = replace(w.workspace.active.presentation,
                         height_in=5. if mode == '3' else 3.45,
                         frame_width_in=None if auto else 2.9, frame_height_in=None if auto else 2.8,
                         axis=AxisPresentation(exchange_xy=exchange))
             w.set_plot_presentation(p)
-            w.color_scale_combo.setCurrentIndex(0 if mode == 'global' else w.color_scale_combo.findData(mode))
-            w.plot_title_edit.clear(); w._finish_annotation_edit(); w._render_plot_page()
+            dat.set_choice(w, 'color_scale', mode)
+            w.dat_properties.setLabel('plot_title', '', w.dat_properties.ownerToken); w._finish_annotation_edit(); w._render_plot_page()
             baseline = w.plot_page.rendered_page
-            self.assertIsNotNone(baseline, w.plot_page.status_label.text())
+            self.assertIsNotNone(baseline, w.plot_page.status_text)
             frame = self.logical_frame().copy()
             bar_bounds = [bar.ax.get_position().bounds for bar in w._heat_colorbars]
             for title in ('Condition A', 'A long manual title with literal $text$\nSecond line ' * 4):
                 with self.subTest(auto=auto, exchange=exchange, mode=mode, title=title):
-                    w.plot_title_edit.setText(title)
+                    w.dat_properties.setLabel('plot_title', title, w.dat_properties.ownerToken)
                     np.testing.assert_allclose(self.logical_frame(), frame, atol=1e-8)
                     w._finish_annotation_edit()
                     np.testing.assert_allclose(self.logical_frame(), frame, atol=1e-8)
                     w._render_plot_page()
                     page = w.plot_page.rendered_page
-                    self.assertIsNotNone(page, w.plot_page.status_label.text())
+                    self.assertIsNotNone(page, w.plot_page.status_text)
                     self.assertEqual(page.axes_bounds, baseline.axes_bounds)
                     self.assertEqual(page.colorbar_bounds, baseline.colorbar_bounds)
                     np.testing.assert_allclose(self.logical_frame(), frame, atol=1e-8)
@@ -283,15 +351,15 @@ class SharedFrameQtTests(unittest.TestCase):
 
     def test_regional_overlay_supports_empty_custom_colorbar_labels(self):
         w = self.window
-        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData('3'))
+        dat.set_choice(w, 'color_scale', '3')
         p = replace(w.workspace.active.presentation, height_in=5.)
         ticks = {f'region-{index+1}': ColorbarTicks(tuple(bar.get_ticks()), ('', '', ''))
                  for index, bar in enumerate(w._heat_colorbars)}
         w.set_plot_presentation(replace(p, colorbar=replace(p.colorbar, ticks=ticks)))
         before = self.logical_frame()
-        w.plot_title_edit.setText('Condition A'); w._finish_annotation_edit()
+        w.dat_properties.setLabel('plot_title', 'Condition A', w.dat_properties.ownerToken); w._finish_annotation_edit()
         w._render_plot_page()
-        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_label.text())
+        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_text)
         np.testing.assert_allclose(self.logical_frame(), before)
         w.canvas.draw()
         self.assertGreater(w._heat_signal_label.get_window_extent(w.canvas.get_renderer()).y0,
@@ -330,17 +398,19 @@ class SharedFrameQtTests(unittest.TestCase):
                                         frame_width_in=2.2, frame_height_in=1.3))
         w._render_plot_page(); page = w.plot_page.rendered_page
         self.assertIsNotNone(page)
-        self.assertIsInstance(w.analysis_scroll, QScrollArea)
+        self.assertIsInstance(item(w, 'applicationDatCanvas'), QQuickItem)
+        self.assertIsInstance(w.canvas, FigureCanvasAgg)
         mesh, cube, norm = w._heat_mesh, w.current_cube, w._heat_mesh.norm
         limits = w._heat_ax.get_xlim(), w._heat_ax.get_ylim()
         for zoom, factor in (('100%', 1), ('150%', 1.5), ('200%', 2)):
-            w.plot_page.set_zoom(zoom); APP.processEvents()
+            w.plot_page.set_zoom(zoom); pump()
             expected = np.array([2.2, 1.3]) * 96 * factor
             np.testing.assert_allclose(self.logical_frame(), expected, atol=1)
-            preview = w.plot_page.preview.size()
-            visible = np.array([preview.width()*page.axes_bounds[2], preview.height()*page.axes_bounds[3]])
+            paper_width, paper_height = w.plot_page.preview.paper_display_size()
+            visible = np.array([paper_width*page.axes_bounds[2], paper_height*page.axes_bounds[3]])
             np.testing.assert_allclose(self.logical_frame(), visible, atol=1)
-            w.resize(1000 if factor == 1 else 1250, 720); APP.processEvents()
+            w.root_window.resize(1000 if factor == 1 else 1250, 720); pump()
+            self.wait_for_analysis_layout()
             np.testing.assert_allclose(self.logical_frame(), expected, atol=1)
             self.assertEqual(w.plot_page.preview.svg_bytes, page.svg_bytes)
             self.assertIs(w.plot_page.rendered_page, page)
@@ -350,14 +420,14 @@ class SharedFrameQtTests(unittest.TestCase):
 
     def test_native_tick_modes_apply_count_increment_and_minor_count(self):
         w = self.window; page = w.plot_page
-        page.x_mode_combo.setCurrentText('By count'); page.x_count_spin.setValue(7)
-        page.x_minor_count_spin.setValue(3)
+        self.set_formal_value('axis_x_mode', 'By count'); self.set_formal_value('axis_x_count', 7)
+        self.set_formal_value('axis_x_minor_count', 3)
         w.canvas.draw()
         self.assertEqual(len(w._heat_ax.get_xticks()), 7)
         self.assertEqual(len(w._heat_ax.xaxis.get_minorticklocs()), 18)
         self.assertEqual(w.workspace.active.presentation.axis.x_major_count, 7)
         self.assertEqual(w.workspace.active.presentation.width_in, 91.5/25.4)
-        page.x_mode_combo.setCurrentText('By increment'); page.x_step_spin.setValue(.2)
+        self.set_formal_value('axis_x_mode', 'By increment'); self.set_formal_value('axis_x_step', .2)
         self.assertIsNone(w.workspace.active.presentation.axis.x_major_count)
         np.testing.assert_allclose(np.diff(w._heat_ax.get_xticks()), .2)
 
@@ -366,50 +436,77 @@ class SharedFrameQtTests(unittest.TestCase):
         p = replace(w.workspace.active.presentation, height_in=3.5625,
                     frame_width_in=2.5625, frame_height_in=2.5625)
         w.set_plot_presentation(p)
-        self.assertEqual(w.plot_page.height_spin.value(), 3.563)
-        self.assertEqual(w.plot_page.frame_width_spin.value(), 2.563)
-        w.plot_page.numeric_spin.setValue(11)
+        self.assertEqual(float(w.plot_page.formal.state['fields']['height_in']), 3.563)
+        self.assertEqual(float(w.plot_page.formal.state['fields']['frame_width_in']), 2.563)
+        self.set_formal_value('numeric_pt', 11)
         actual = w.workspace.active.presentation
         self.assertEqual(actual.width_in, p.width_in)
         self.assertEqual(actual.height_in, p.height_in)
         self.assertEqual((actual.frame_width_in, actual.frame_height_in), (2.5625, 2.5625))
         w._render_plot_page(); page = w.plot_page.rendered_page
-        self.assertIsNotNone(page, w.plot_page.status_label.text())
+        self.assertIsNotNone(page, w.plot_page.status_text)
         self.assertEqual(page.figure_size_in, (p.width_in, 3.5625))
         np.testing.assert_allclose(page.plot_size_in, [2.5625, 2.5625], atol=1e-12)
 
     def test_analysis_fit_uses_its_viewport_at_startup_resize_and_tab_switch(self):
-        self.window.close()
-        self.window = MainWindow(); self.window._show_error = self.fail
+        with patch.object(self.window, '_confirm_project_discard_async', lambda callback: callback()):
+            self.window.close()
+        pump()
+        self.assertTrue(self.window._closing)
+        @contextmanager
+        def same_profile():
+            yield self.folder
+        with patch('tests.quick_application_helpers.isolated_settings', same_profile):
+            host, folder, errors = self.enterContext(application())
+        self.assertEqual(folder, self.folder)
+        self.addCleanup(lambda: self.assertFalse(errors))
+        self.assertIsNot(host.controller, self.window)
+        self.window = host.controller; self.window._show_error = self.fail
+        self.window.root_window.hide()
         w = self.window
         w._load_dat_file_direct(self.folder / 'scan.dat')
-        self.assertFalse(w.isVisible())
+        w.open_graph_document()
+        w.request_outer_view('analysis')
+        w.request_task(2)
+        self.assertFalse(w.root_window.isVisible())
+        self.wait_for_analysis_layout()
         np.testing.assert_allclose(self.logical_frame(), np.array([2.9, 2.8])*96, atol=1)
-        w.resize(1500, 960); w.show(); w.plot_tabs.setCurrentIndex(0); QTest.qWait(350)
-        self.assertEqual(w.plot_tabs.currentIndex(), 0)
+        w.root_window.resize(1500, 1120); w.root_window.show(); self.assertTrue(w.request_outer_view('analysis')); QTest.qWait(350)
+        self.assertEqual(w.outerView, 'analysis')
         self.assertEqual(w.plot_page.display_scale, 1.)
+        # Publishing the first page updates command availability and settles
+        # the actual Quick command row before measuring the Analysis viewport.
+        w._render_plot_page()
+        pump(150)
+        self.wait_for_analysis_layout()
         initial = self.logical_frame()
         self.assertTrue(np.all(initial >= np.array([2.9, 2.8])*96*1.35), initial)
         self.assertAlmostEqual(initial[0]/initial[1], 2.9/2.8)
         self.assertAlmostEqual(w._spec_ax.get_window_extent().height/w.canvas.device_pixel_ratio, 95.)
-        self.assertEqual(w.analysis_scroll.horizontalScrollBar().maximum(), 0)
-        self.assertEqual(w.analysis_scroll.verticalScrollBar().maximum(), 0)
+        viewport = item(w, 'analysisCanvasViewport')
+        self.assertLessEqual(viewport.property('contentWidth'), viewport.width()+1)
+        self.assertLessEqual(viewport.property('contentHeight'), viewport.height()+1)
+        self.assertAlmostEqual(viewport.property('contentX'), 0., delta=1)
+        self.assertAlmostEqual(viewport.property('contentY'), 0., delta=1)
         w._render_plot_page(); page = w.plot_page.rendered_page
-        self.assertIsNotNone(page, w.plot_page.status_label.text())
+        self.assertIsNotNone(page, w.plot_page.status_text)
         owner, saved, cube, norm = w._plot_owner_token(), w.workspace.active.presentation, w.current_cube, w._heat_mesh.norm
         science = cube.z.copy()
         view = w._heat_ax.get_xlim(), w._heat_ax.get_ylim(), w._heat_mesh.get_clim(), w.current_gate
-        w.plot_tabs.setCurrentIndex(1); QTest.qWait(150)
+        self.assertTrue(w.request_outer_view('workspace')); QTest.qWait(150)
         plot_scale = w.plot_page.display_scale
         self.assertGreater(plot_scale, .1)
         np.testing.assert_allclose(self.logical_frame(), initial, atol=1)
-        w.plot_tabs.setCurrentIndex(0); QTest.qWait(150)
+        self.assertTrue(w.request_outer_view('analysis')); QTest.qWait(150)
+        self.wait_for_analysis_layout()
         np.testing.assert_allclose(self.logical_frame(), initial, atol=1)
-        w.resize(1100, 740); QTest.qWait(150)
+        w.root_window.resize(1100, 740); QTest.qWait(150)
+        self.wait_for_analysis_layout()
         smaller = self.logical_frame()
         self.assertTrue(np.all(smaller < initial*.9), (smaller, initial))
         self.assertEqual(w.plot_page.display_scale, plot_scale)
-        w.resize(1500, 960); QTest.qWait(150)
+        w.root_window.resize(1500, 1120); QTest.qWait(150)
+        self.wait_for_analysis_layout()
         np.testing.assert_allclose(self.logical_frame(), initial, atol=1)
         QTest.qWait(200)
         np.testing.assert_allclose(self.logical_frame(), initial, atol=1)
@@ -421,20 +518,25 @@ class SharedFrameQtTests(unittest.TestCase):
         self.assertIs(w.current_cube, cube); self.assertIs(w._heat_mesh.norm, norm)
         np.testing.assert_array_equal(cube.z, science)
         self.assertEqual((w._heat_ax.get_xlim(), w._heat_ax.get_ylim(), w._heat_mesh.get_clim(), w.current_gate), view)
-        w.analysis_zoom_combo.setCurrentText('200%'); APP.processEvents()
+        self.assertTrue(w.analysisNavigation.setZoom('200%', w.analysisNavigation.ownerToken)); pump()
+        self.wait_for_analysis_layout()
         np.testing.assert_allclose(self.logical_frame(), np.array([2.9, 2.8])*192, atol=1)
-        self.assertEqual(w.plot_page.zoom_combo.currentText(), '200%')
+        self.assertEqual(w.plot_page.zoom_text, '200%')
         original = w.canvas.device_pixel_ratio
         try:
-            w.canvas._set_device_pixel_ratio(2.)
+            w.dat_canvas.set_device_pixel_ratio(2.)
             w._layout_live_plots()
             np.testing.assert_allclose(self.logical_frame(), np.array([2.9, 2.8])*192, atol=1)
         finally:
-            w.canvas._set_device_pixel_ratio(original)
-        w.analysis_zoom_combo.setCurrentText('Fit'); QTest.qWait(250)
+            w.dat_canvas.set_device_pixel_ratio(original)
+        self.assertTrue(w.analysisNavigation.setZoom('Fit', w.analysisNavigation.ownerToken)); QTest.qWait(250)
+        self.wait_for_analysis_layout()
         np.testing.assert_allclose(self.logical_frame(), initial, atol=1)
-        self.assertEqual(w.analysis_scroll.horizontalScrollBar().maximum(), 0)
-        self.assertEqual(w.analysis_scroll.verticalScrollBar().maximum(), 0)
+        viewport = item(w, 'analysisCanvasViewport')
+        self.assertLessEqual(viewport.property('contentWidth'), viewport.width()+1)
+        self.assertLessEqual(viewport.property('contentHeight'), viewport.height()+1)
+        self.assertAlmostEqual(viewport.property('contentX'), 0., delta=1)
+        self.assertAlmostEqual(viewport.property('contentY'), 0., delta=1)
 
     def test_invalid_manual_ticks_after_toolbar_coordinate_log_retire_exports(self):
         w = self.window
@@ -446,9 +548,9 @@ class SharedFrameQtTests(unittest.TestCase):
                         axis=AxisPresentation(**fields))
             w.set_plot_presentation(p)
             self.assertIsNone(w.plot_page.rendered_page)
-            self.assertFalse(w.plot_page.export_svg_btn.isEnabled())
-            self.assertFalse(w.plot_page.export_png_btn.isEnabled())
-            self.assertIn('linear', w.plot_page.status_label.text())
+            self.assertFalse(w.plot_page.command_enabled('export_svg'))
+            self.assertFalse(w.plot_page.command_enabled('export_png'))
+            self.assertIn('linear', w.plot_page.status_text)
             w._render_plot_page(); self.assertIsNone(w.plot_page.rendered_page)
             for extension in ('svg', 'png'):
                 with self.assertRaises(ValueError):
@@ -458,21 +560,21 @@ class SharedFrameQtTests(unittest.TestCase):
             self.assertGreater(len(w._spec_ax.lines), 0)
         w._heat_ax.set_xscale('linear')
         w._render_plot_page()
-        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_label.text())
+        self.assertIsNotNone(w.plot_page.rendered_page, w.plot_page.status_text)
         self.assertEqual(w.workspace.active.presentation.axis.x_major_count, 7)
-        self.assertTrue(w.plot_page.export_svg_btn.isEnabled())
+        self.assertTrue(w.plot_page.command_enabled('export_svg'))
 
     def test_crowded_manual_count_disables_exports_and_keeps_editor_choice(self):
         w = self.window
         w._render_plot_page(); self.assertIsNotNone(w.plot_page.rendered_page)
-        w.plot_page.x_mode_combo.setCurrentText('By count')
-        w.plot_page.x_count_spin.setValue(100)
+        self.set_formal_value('axis_x_mode', 'By count')
+        self.set_formal_value('axis_x_count', 100)
         w._render_plot_page()
         self.assertIsNone(w.plot_page.rendered_page)
-        self.assertFalse(w.plot_page.export_svg_btn.isEnabled())
-        self.assertFalse(w.plot_page.export_png_btn.isEnabled())
+        self.assertFalse(w.plot_page.command_enabled('export_svg'))
+        self.assertFalse(w.plot_page.command_enabled('export_png'))
         self.assertEqual(w.workspace.active.presentation.axis.x_major_count, 100)
-        self.assertEqual(w.plot_page.x_count_spin.value(), 100)
+        self.assertEqual(int(w.plot_page.formal.state['fields']['axis_x_count']), 100)
         w._set_current_gate_from_value(1., update_plot=True)
         self.assertGreater(len(w._spec_ax.lines), 0)
 
@@ -482,20 +584,20 @@ class SharedFrameQtTests(unittest.TestCase):
         w._heat_ax.set_xscale('log'); w._layout_live_plots()
         original = w._heat_ax.xaxis.get_minorticklocs().copy()
         self.assertGreater(len(original), 0)
-        p.x_minor_count_spin.setValue(3)
+        self.set_formal_value('axis_x_minor_count', 3)
         self.assertEqual(w.workspace.active.presentation.axis.x_minor_count, 3)
         self.assertIsNone(p.rendered_page)
-        self.assertFalse(p.export_svg_btn.isEnabled()); self.assertFalse(p.export_png_btn.isEnabled())
-        self.assertIn('linear', p.status_label.text())
+        self.assertFalse(p.command_enabled('export_svg')); self.assertFalse(p.command_enabled('export_png'))
+        self.assertIn('linear', p.status_text)
         w._render_plot_page(); self.assertIsNone(p.rendered_page)
         self.assertGreater(len(w._heat_ax.xaxis.get_minorticklocs()), 0)
-        p.x_minor_count_spin.setValue(1); w._render_plot_page()
-        self.assertIsNotNone(p.rendered_page, p.status_label.text())
+        self.set_formal_value('axis_x_minor_count', 1); w._render_plot_page()
+        self.assertIsNotNone(p.rendered_page, p.status_text)
         self.assertEqual(w._heat_ax.get_xscale(), 'log')
         np.testing.assert_allclose(w._heat_ax.xaxis.get_minorticklocs(), original)
-        p.x_minor_count_spin.setValue(0)
+        self.set_formal_value('axis_x_minor_count', 0)
         self.assertEqual(len(w._heat_ax.xaxis.get_minorticklocs()), 0)
-        p.x_minor_count_spin.setValue(1)
+        self.set_formal_value('axis_x_minor_count', 1)
         np.testing.assert_allclose(w._heat_ax.xaxis.get_minorticklocs(), original)
 
     def test_sidecar_counts_restore_and_legacy_auto_never_uses_other_owner(self):
@@ -512,7 +614,8 @@ class SharedFrameQtTests(unittest.TestCase):
         w.set_plot_presentation(replace(p, frame_width_in=None, frame_height_in=None))
         w._render_plot_page(); old = w.plot_page.rendered_page
         self.assertIsNotNone(old)
-        w.plot_tabs.setCurrentIndex(0)
+        self.assertTrue(w.request_outer_view('analysis'))
+        self.wait_for_analysis_layout()
         np.testing.assert_allclose(self.logical_frame(), np.array(old.plot_size_in)*96, atol=1)
         bpath = self.folder / 'other.dat'
         bpath.write_text('Energy(eV) 0 1\n1 1 2\n2 3 4', encoding='utf-8')

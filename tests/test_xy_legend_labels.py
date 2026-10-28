@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication
 
 from spectra_app.dat_io import load_dat_cube
@@ -21,6 +21,8 @@ from spectra_app.project_io import read_project, workspace_digest, write_project
 from spectra_app.workbook_state import (add_curve, create_comparison, create_workbook,
                                        ensure_dataset_sheet, register_xy_sheet)
 from spectra_app.xy_plot_page import XYPlotPage, draw_comparison
+
+from tests.xy_helpers import set_xy_draft, xy_value, select_xy_rows
 
 APP = QApplication.instance() or QApplication([])
 LONG_NAME = 'WSe2_device_2026_10_13_temperature_4K_power_10uW_polarization_scan_repeat_001.dat'
@@ -46,10 +48,10 @@ def xy_sheet(workspace, source=None, columns=('X', 'Signal'), name='Original'):
         list(columns), source_path=source, allow_duplicate=True)
 
 
-def render(workspace, graph):
+def render(workspace, graph, *, preview=False):
     figure = Figure(figsize=(7, 5), dpi=150)
     FigureCanvasAgg(figure)
-    axes = draw_comparison(figure, workspace, graph)
+    axes = draw_comparison(figure, workspace, graph, preview=preview)
     figure.canvas.draw()
     return axes
 
@@ -182,7 +184,7 @@ class CompactLegendTests(unittest.TestCase):
         # Deliberately long custom text is preserved, even if the user makes it overflow.
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message='Tight layout not applied.*')
-            axes = render(workspace, graph)
+            axes = render(workspace, graph, preview=True)
         self.assertEqual(labels(axes), ['_gain $x$', *custom_labels[:3]])
         texts = axes.get_legend().get_texts()
         self.assertFalse(texts[0].get_parse_math())
@@ -201,15 +203,15 @@ class CompactLegendTests(unittest.TestCase):
         page.resize(1100, 760)
         page.show()
         APP.processEvents()
-        page.curve_list.setCurrentRow(3)
+        select_xy_rows(page, [3])
         raw = curves[3].label
-        self.assertEqual(page.label_edit.text(), raw)
-        page.width_spin.setValue(2.5)
+        self.assertEqual(xy_value(page, 'label'), raw)
+        set_xy_draft(page, 'width', 2.5, commit=True)
         self.assertEqual(curves[3].label, raw)
         page.canvas.draw()
         self.assertEqual(labels(page.axes), ['_Signal', 'same', 'same'])
         for selected in (3, 5):
-            page.curve_list.setCurrentRow(selected)
+            select_xy_rows(page, [selected])
             legend = page.axes.get_legend()
             for index, (handle, text) in enumerate(zip(legend.legend_handles, legend.get_texts())):
                 expected_id = curves[index + 3].curve_id
@@ -220,6 +222,115 @@ class CompactLegendTests(unittest.TestCase):
         bounds = page.axes.get_legend().get_window_extent(page.canvas.get_renderer())
         self.assertTrue(page.axes.bbox.contains(bounds.x0, bounds.y0))
         self.assertTrue(page.axes.bbox.contains(bounds.x1, bounds.y1))
+
+
+from tests.test_curve_manager import curve_role, quick_curve_list, quick_curve_row
+from PySide6.QtGui import QAccessible
+from PySide6.QtQml import QQmlExpression, qmlContext
+
+
+class CompactCurveListTests(unittest.TestCase):
+    def make_page(self, workspace, graph):
+        page = XYPlotPage(workspace, graph.comparison_id)
+        self.addCleanup(dispose_page, page)
+        page.resize(1000, 760)
+        page.show()
+        APP.processEvents()
+        return page
+
+    def test_single_source_rows_show_gate_and_retain_full_provenance(self):
+        with TemporaryDirectory() as folder:
+            workspace, graph, sheet, curves = dat_comparison(folder)
+            before = workspace_digest(workspace)
+            page = self.make_page(workspace, graph)
+            self.assertEqual([curve_role(page, row, 'caption') for row in range(3)],
+                             ['Gate = -5', 'Gate = -4', 'Gate = -3'])
+            for row, curve in enumerate(curves):
+                description = curve_role(page, row, 'sourceDescription')
+                accessible = QAccessible.queryAccessibleInterface(quick_curve_row(page, row))
+                self.assertIn(curve.label, description)
+                for detail in (str(sheet.source_path), 'Sheet: Original', 'Gate =', 'Energy'):
+                    self.assertIn(detail, description)
+                    self.assertIn(detail, accessible.text(QAccessible.Description))
+                self.assertEqual(curve_role(page, row, 'curveColor'), curve.color)
+                self.assertTrue(curve_role(page, row, 'shown'))
+            self.assertIn(str(sheet.source_path), page.inspector_bridge.source)
+            self.assertEqual(workspace_digest(workspace), before)
+            self.assertEqual(labels(page.axes), ['Gate = -5', 'Gate = -4', 'Gate = -3'])
+
+    def test_source_numbers_stay_near_quantity_and_stable_across_reordering(self):
+        workspace = Workspace()
+        graph = create_comparison(workspace)
+        stem = 'measurement_' + 'A' * 50 + '_scan_repeat'
+        sources = [Path('folder-b') / f'{stem}.csv', Path('folder-a') / f'{stem}.csv',
+                   Path('folder-c') / f'{stem[:-1]}2.csv']
+        curves = [add_curve(workspace, graph.comparison_id,
+                           xy_sheet(workspace, source).sheet_id, 0, 1) for source in sources]
+        page = self.make_page(workspace, graph)
+        displayed = {curve.curve_id: curve_role(page, row, 'caption') for row, curve in enumerate(curves)}
+        numbers = []
+        for row, curve in enumerate(curves):
+            caption = displayed[curve.curve_id]
+            self.assertTrue(caption.startswith('Signal · ['))
+            numbers.append(caption.split(' · ')[1])
+            self.assertIn('…', caption)
+            self.assertNotIn('\n', caption)
+            self.assertIn(str(sources[row]), curve_role(page, row, 'sourceDescription'))
+        self.assertEqual(len(set(numbers)), 3)
+        legend_before = labels(page.axes)
+        page.controller._set_curve_order(list(reversed(list(graph.curves))))
+        self.assertEqual({curve_role(page, row, 'curveId'): curve_role(page, row, 'caption')
+                          for row in range(page.inspector_bridge.curves.rowCount())}, displayed)
+        self.assertEqual(labels(page.axes), legend_before[::-1])
+
+    def test_sheet_qualifiers_refresh_for_add_remove_and_pending_source_refresh(self):
+        with TemporaryDirectory() as folder:
+            workspace, graph, sheet, curves = dat_comparison(folder)
+            page = self.make_page(workspace, graph)
+            processed = add_curve(workspace, graph.comparison_id, sheet.sheet_id, 0, 1, mode='processed')
+            page.refresh()
+            self.assertEqual(curve_role(page, 0, 'caption'), 'Gate = -5 · Original')
+            self.assertEqual(curve_role(page, 3, 'caption'), 'Gate = -5 · Processed')
+            set_xy_draft(page, 'label', 'Pending custom name')
+            del graph.curves[processed.curve_id]
+            page.refresh_sources()
+            self.assertEqual(page.inspector_bridge.curves.rowCount(), 3)
+            self.assertEqual(curve_role(page, 0, 'caption'), 'Gate = -5')
+            self.assertEqual(xy_value(page, 'label'), 'Pending custom name')
+            page.finish_editor()
+            self.assertEqual(curve_role(page, 0, 'caption'), 'Pending custom name')
+            self.assertEqual(curves[0].label, 'Pending custom name')
+
+    def test_long_custom_text_elides_within_viewport_at_narrow_and_wide_widths(self):
+        workspace = Workspace()
+        graph = create_comparison(workspace)
+        sheet = xy_sheet(workspace, Path(LONG_NAME))
+        custom = 'Custom curve ' + 'long name ' * 30
+        add_curve(workspace, graph.comparison_id, sheet.sheet_id, 0, 1, label=custom)
+        graph.legend_visible = False
+        page = self.make_page(workspace, graph)
+        view = quick_curve_list(page)
+        for width in (210, 380):
+            page.inspector.setFixedWidth(width)
+            APP.processEvents()
+            row = quick_curve_row(page, 0)
+            self.assertEqual(curve_role(page, 0, 'caption'), custom)
+            self.assertIn(custom, curve_role(page, 0, 'sourceDescription'))
+            accessible = QAccessible.queryAccessibleInterface(row)
+            self.assertIn(custom, accessible.text(QAccessible.Name))
+            pending = list(row.childItems())
+            labels = []
+            while pending:
+                item = pending.pop()
+                if item.property('text') == custom:
+                    labels.append(item)
+                pending.extend(item.childItems())
+            self.assertEqual(len(labels), 1)
+            label = labels[0]
+            self.assertTrue(QQmlExpression(qmlContext(label), label, 'wrapMode === Text.NoWrap').evaluate()[0])
+            self.assertTrue(QQmlExpression(qmlContext(label), label, 'elide === Text.ElideRight').evaluate()[0])
+            self.assertLessEqual(row.width(), view.width())
+            self.assertEqual(row.height(), 42)
 
 
 if __name__ == '__main__':

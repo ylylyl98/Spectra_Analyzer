@@ -1,3 +1,6 @@
+from tests import source_navigation_helpers as sn
+from tests import ordinary_analysis_quick_helpers as oa
+from tests.quick_helpers import set_processing_window
 import csv
 import os
 import threading
@@ -8,27 +11,28 @@ from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import numpy as np
-from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl, QThread
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QObject, QCoreApplication, QMimeData, QPointF, Qt, QUrl, QThread
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QGuiApplication
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog
 from spectra_app import background_jobs
-from spectra_app.main_window import MainWindow
+from tests.dat_properties_quick_helpers import (
+    edit_label, state,
+    set_choice, set_flag, setup_number)
 from spectra_app.xy_import_dialog import XYImportDialog
-from tests.settings_helpers import isolate_settings
 from tests.background_helpers import wait_jobs
-from tests.test_workflow import _fit_result
+from tests.scientific_fixtures import workflow_fit_result as _fit_result
+from tests.quick_migration_case import QuickMigrationCase
+from tests.quick_application_helpers import pump
+from tests.formal_quick_helpers import item
 
-APP = QApplication.instance() or QApplication([])
 
-
-class DatasetImportTests(unittest.TestCase):
+class DatasetImportTests(QuickMigrationCase):
     def setUp(self):
-        self.directory = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
-        review = patch.object(XYImportDialog, 'exec', return_value=QDialog.Accepted)
+        super().setUp()
+        self.directory = self.folder
+        self.window = self.controller
+        self.errors = self.quick_errors
+        review = patch.object(XYImportDialog, 'exec', return_value=XYImportDialog.Accepted)
         review.start()
         self.addCleanup(review.stop)
         self.release = threading.Event()
@@ -43,11 +47,16 @@ class DatasetImportTests(unittest.TestCase):
             self.paths.append(path)
         self.invalid = self.directory / 'invalid.dat'
         self.invalid.write_text('not a spectrum matrix', encoding='utf-8')
+        self.assertTrue(self.window.request_outer_view('analysis'))
+        self.window.dat_details_action.setChecked(True)
+        self.window.request_task(0)
+        pump()
 
     def tearDown(self):
         self.release.set()
         wait_jobs(self.window)
-        self.window.close()
+        self.assertEqual(self.quick_errors, [])
+        super().tearDown()
 
     def import_paths(self, paths):
         self.window._import_dat_files(paths)
@@ -67,12 +76,13 @@ class DatasetImportTests(unittest.TestCase):
                          [self.paths[1], self.paths[0]])
         self.assertEqual(activations, [w.workspace.active_dataset_id])
         self.assertEqual(w.current_dat_path, self.paths[1])
-        self.assertEqual(w.imported_dataset_list.count(), 2)
+        self.assertEqual(len(w.source_navigation.datasetRows), 2)
         self.assertEqual(len(self.errors), 1)
         self.assertIn(str(self.invalid), self.errors[0])
         self.assertIn(str(missing), self.errors[0])
+        self.errors.clear()
         self.assertFalse(w._dat_import_pending)
-        self.assertTrue(w.import_dats_btn.isEnabled())
+        self.assertTrue(w.source_navigation.importEnabled)
 
     def test_all_fail_and_infrastructure_failure_preserve_existing_cube_and_results(self):
         w = self.window
@@ -80,12 +90,16 @@ class DatasetImportTests(unittest.TestCase):
         owner, cube = w.workspace.active_dataset_id, w.current_cube
         result = _fit_result(2)
         w.fit_result = result
-        w.analysis_text.setPlainText('committed results')
+        oa.set_summary(w, 'committed results')
         self.import_paths([self.invalid, self.directory / 'absent.dat'])
         self.assertEqual(w.workspace.active_dataset_id, owner)
         self.assertIs(w.current_cube, cube)
         self.assertIs(w.fit_result, result)
-        self.assertEqual(w.analysis_text.toPlainText(), 'committed results')
+        self.assertEqual(oa.summary(w), 'committed results')
+        self.assertEqual(len(self.errors), 1)
+        self.assertIn(str(self.invalid), self.errors[0])
+        self.assertIn('absent.dat', self.errors[0])
+        self.errors.clear()
         original = background_jobs.prepare_dat
         def infrastructure(request, context):
             if request.path == self.paths[2]:
@@ -96,9 +110,11 @@ class DatasetImportTests(unittest.TestCase):
         self.assertEqual(len(w.workspace.datasets), 1)
         self.assertEqual(w.workspace.active_dataset_id, owner)
         self.assertIs(w.fit_result, result)
+        self.assertEqual(len(self.errors), 1)
         self.assertIn('infrastructure failure', self.errors[-1])
+        self.errors.clear()
         self.assertFalse(w._dat_import_pending)
-        self.assertTrue(w.import_dats_btn.isEnabled())
+        self.assertTrue(w.source_navigation.importEnabled)
 
     def test_normalized_duplicates_reuse_results_and_same_basename_labels_distinguish(self):
         w = self.window
@@ -112,17 +128,18 @@ class DatasetImportTests(unittest.TestCase):
         self.assertEqual(w.workspace.active_dataset_id, owner)
         self.assertIs(w.fit_result, result)
         self.assertEqual(len(w.workspace.datasets), 2)
-        self.assertEqual(w.imported_dataset_list.count(), 2)
-        labels = [w.imported_dataset_list.item(i).text() for i in range(2)]
+        self.assertEqual(len(w.source_navigation.datasetRows), 2)
+        labels = [row['label'] for row in w.source_navigation.datasetRows]
         self.assertNotEqual(*labels)
         self.assertIn('first', labels[0])
         self.assertIn('second', labels[1])
         for i, path in enumerate(self.paths[:2]):
-            item = w.imported_dataset_list.item(i)
-            self.assertEqual(item.toolTip(), str(path))
-            self.assertEqual(w.workspace.datasets[item.data(Qt.UserRole)].source_path, path)
-        w.imported_dataset_list.setFocus()
-        QTest.keyClick(w.imported_dataset_list, Qt.Key_Down)
+            row = w.source_navigation.datasetRows[i]
+            self.assertEqual(row['path'], str(path))
+            self.assertEqual(w.workspace.datasets[row['datasetId']].source_path, path)
+        self.assertTrue(w.request_outer_view('analysis'))
+        pump()
+        sn.key(w, 'sourceDatasets', Qt.Key_Down)
         self.assertEqual(w.current_dat_path, self.paths[1])
 
     def test_duplicate_names_use_the_shortest_distinguishing_folder_suffix(self):
@@ -138,72 +155,73 @@ class DatasetImportTests(unittest.TestCase):
         unique.write_bytes(self.paths[0].read_bytes())
         self.import_paths([*paths, self.paths[2], unique])
 
-        labels = [w.imported_dataset_list.item(i).text() for i in range(4)]
+        labels = [row['label'] for row in w.source_navigation.datasetRows]
         self.assertEqual(labels, [f'Sample.DAT — {Path("Group A") / "data"}',
                                   f'sample.dat — {Path("Group B") / "DATA"}',
                                   'sample.dat — third', 'reference.dat'])
         for i, path in enumerate([*paths, self.paths[2], unique]):
-            item = w.imported_dataset_list.item(i)
-            self.assertEqual(item.toolTip(), str(path.resolve()))
-            self.assertEqual(w.workspace.datasets[item.data(Qt.UserRole)].source_path, path)
+            row = w.source_navigation.datasetRows[i]
+            self.assertEqual(row['path'], str(path.resolve()))
+            self.assertEqual(w.workspace.datasets[row['datasetId']].source_path, path)
 
     def test_search_keeps_active_results_and_clear_restores_import_order(self):
         w = self.window
         self.import_paths(self.paths)
-        self.assertTrue(hasattr(w, 'imported_dataset_search'), 'Imported datasets need a search control')
+        self.assertTrue(w.request_outer_view('analysis'))
+        pump()
+        self.assertIsNotNone(sn.control(w, 'sourceSearch'), 'Imported datasets need a search control')
         owner, cube = w.workspace.active_dataset_id, w.current_cube
         result = _fit_result(2)
         w.fit_result = result
-        w.analysis_text.setPlainText('active results remain available')
+        oa.set_summary(w, 'active results remain available')
         notice = 'One invalid DAT could not be imported.'
-        w.dat_import_status_label.setText(notice)
+        w.source_navigation.set_import_status(notice)
 
         with patch.object(w, 'activate_dataset', side_effect=AssertionError('search activated a dataset')), \
                 patch('spectra_app.main_window.load_dat_cube', side_effect=AssertionError('search reread a DAT')):
-            w.imported_dataset_search.setText('  SECoND  ')
-            self.assertEqual([w.imported_dataset_list.item(i).isHidden() for i in range(3)],
-                             [True, False, True])
-            self.assertIn('1 / 3', w.imported_dataset_label.text())
+            w.source_navigation.setSearchText('  SECoND  ')
+            self.assertEqual([row['datasetId'] for row in w.source_navigation.datasetRows],
+                             [w.workspace.dataset_for_path(self.paths[1]).dataset_id])
+            self.assertIn('1 / 3', w.source_navigation.countText)
             self.assertEqual(w.workspace.active_dataset_id, owner)
-            self.assertEqual(w.imported_dataset_list.currentItem().data(Qt.UserRole), owner)
+            self.assertEqual(w.source_navigation.activeDatasetId, owner)
             self.assertIs(w.current_cube, cube)
             self.assertIs(w.fit_result, result)
-            self.assertEqual(w.analysis_text.toPlainText(), 'active results remain available')
-            self.assertEqual(w.dat_import_status_label.text(), notice)
-            w.imported_dataset_search.setFocus()
-            QTest.keyClick(w.imported_dataset_search, Qt.Key_A, Qt.ControlModifier)
-            QTest.keyClick(w.imported_dataset_search, Qt.Key_Backspace)
-            self.assertEqual([w.imported_dataset_list.item(i).isHidden() for i in range(3)],
-                             [False, False, False])
-            self.assertEqual([w.workspace.datasets[w.imported_dataset_list.item(i).data(Qt.UserRole)].source_path
-                              for i in range(3)], self.paths)
-            self.assertEqual(w.imported_dataset_list.currentItem().data(Qt.UserRole), owner)
-            self.assertEqual(w.dat_import_status_label.text(), notice)
+            self.assertEqual(oa.summary(w), 'active results remain available')
+            self.assertEqual(w.source_navigation.importStatus, notice)
+            sn.key(w, 'sourceSearch', Qt.Key_A, Qt.ControlModifier)
+            sn.key(w, 'sourceSearch', Qt.Key_Backspace)
+            self.assertEqual(len(w.source_navigation.datasetRows), 3)
+            self.assertEqual([w.workspace.datasets[row['datasetId']].source_path
+                              for row in w.source_navigation.datasetRows], self.paths)
+            self.assertEqual(w.source_navigation.activeDatasetId, owner)
+            self.assertEqual(w.source_navigation.importStatus, notice)
 
     def test_search_keyboard_navigation_skips_hidden_files_and_preserves_no_match_owner(self):
         w = self.window
         self.import_paths(self.paths)
-        self.assertTrue(hasattr(w, 'imported_dataset_search'), 'Imported datasets need a search control')
-        w.imported_dataset_search.setText('sAMple.DAT')
-        self.assertTrue(all(not w.imported_dataset_list.item(i).isHidden() for i in range(3)))
-        w.imported_dataset_search.setText(f'  {str(self.paths[2].parent).upper()}  ')
-        w.imported_dataset_list.setFocus()
-        QTest.keyClick(w.imported_dataset_list, Qt.Key_Down)
+        self.assertTrue(w.request_outer_view('analysis'))
+        pump()
+        self.assertIsNotNone(sn.control(w, 'sourceSearch'), 'Imported datasets need a search control')
+        w.source_navigation.setSearchText('sAMple.DAT')
+        self.assertEqual(len(w.source_navigation.datasetRows), 3)
+        w.source_navigation.setSearchText(f'  {str(self.paths[2].parent).upper()}  ')
+        sn.key(w, 'sourceDatasets', Qt.Key_Down)
         self.assertEqual(w.current_dat_path, self.paths[2])
-        self.assertEqual(w.imported_dataset_search.text(), f'  {str(self.paths[2].parent).upper()}  ')
-        self.assertEqual([w.imported_dataset_list.item(i).isHidden() for i in range(3)],
-                         [True, True, False])
+        self.assertEqual(w.source_navigation.searchText, f'  {str(self.paths[2].parent).upper()}  ')
+        self.assertEqual([row['datasetId'] for row in w.source_navigation.datasetRows],
+                         [w.workspace.dataset_for_path(self.paths[2]).dataset_id])
         owner, cube = w.workspace.active_dataset_id, w.current_cube
-        w.imported_dataset_search.setText('no matching experiment')
-        self.assertTrue(all(w.imported_dataset_list.item(i).isHidden() for i in range(3)))
-        self.assertIn('0 / 3', w.imported_dataset_label.text())
-        self.assertFalse(w.imported_dataset_filter_status_label.isHidden())
-        self.assertIn('No matches', w.imported_dataset_filter_status_label.text())
-        QTest.keyClick(w.imported_dataset_list, Qt.Key_Down)
-        QTest.keyClick(w.imported_dataset_list, Qt.Key_Up)
+        w.source_navigation.setSearchText('no matching experiment')
+        self.assertEqual(w.source_navigation.datasetRows, [])
+        self.assertIn('0 / 3', w.source_navigation.countText)
+        self.assertTrue(w.source_navigation.noMatches)
+        self.assertIn('No matches', sn.control(w, 'sourceNoMatches').property('text'))
+        sn.key(w, 'sourceDatasets', Qt.Key_Down)
+        sn.key(w, 'sourceDatasets', Qt.Key_Up)
         self.assertEqual(w.workspace.active_dataset_id, owner)
         self.assertIs(w.current_cube, cube)
-        self.assertEqual(w.imported_dataset_list.count(), 3)
+        self.assertEqual(len(w.workspace.datasets), 3)
 
     def test_cancel_discards_whole_batch_unlocks_before_thread_ends_and_rejects_late_callbacks(self):
         w = self.window
@@ -216,22 +234,27 @@ class DatasetImportTests(unittest.TestCase):
                 started.set()
                 self.release.wait(5)
             return original(request, context)
+        w.request_task(1)
+        pump()
         with patch.object(background_jobs, 'prepare_dat', side_effect=blocked):
             w._import_dat_files(self.paths[1:])
             self.assertTrue(started.wait(2))
             token = w._dat_import_token
             self.assertTrue(w._dat_import_pending)
             self.assertEqual(len(w.workspace.datasets), 1)
-            self.assertFalse(w.import_dats_btn.isEnabled())
-            self.assertFalse(w.imported_dataset_list.isEnabled())
-            self.assertFalse(w.imported_dataset_search.isEnabled())
-            self.assertFalse(w.generate_heatmap_btn.isEnabled())
-            self.assertFalse(w.x_axis_override_combo.isEnabled())
-            self.assertFalse(w.load_seeds_csv_btn.isEnabled())
-            self.assertTrue(w._job_cancel_button.isEnabled())
-            w.plot_title_edit.setText('edited during cancelled import')
+            self.assertFalse(w.source_navigation.importEnabled)
+            self.assertFalse(sn.control(w, 'sourceDatasets').isEnabled())
+            self.assertFalse(sn.control(w, 'sourceSearch').isEnabled())
+            self.assertFalse(w.processing.applyEnabled)
+            self.assertFalse(state(w)['source_axis_enabled'])
+            self.assertFalse(oa.command_enabled(w, 'loadCsv'))
+            self.assertTrue(w.cancelVisible)
+            cancel = next(control for control in self.host.window.findChildren(QObject)
+                          if control.property('text') == 'Cancel' and control.property('visible'))
+            self.assertTrue(cancel.isEnabled())
+            edit_label(w, 'plot_title', 'edited during cancelled import')
             w._set_current_gate_from_index(1, update_plot=True)
-            self.assertFalse(w.fit_btn.isEnabled())
+            self.assertFalse(oa.command_enabled(w, 'fit'))
             committed = _fit_result(2)
             w.fit_result, w._fit_gate_idx = committed, 1
             w.peak_indices = np.array([4, 17])
@@ -239,7 +262,7 @@ class DatasetImportTests(unittest.TestCase):
             w.batch_peak_map = {1: w.peak_indices.copy()}
             with patch.object(w._background_jobs, 'start', side_effect=AssertionError('superseded batch')), \
                     patch('spectra_app.main_window.load_dat_cube', side_effect=AssertionError('locked read')), \
-                    patch('spectra_app.main_window.QFileDialog.getExistingDirectory', side_effect=AssertionError('locked dialog')):
+                    patch('spectra_app.main_window.FilePicker.getExistingDirectory', side_effect=AssertionError('locked dialog')):
                 w._on_browse_root()
                 w._on_folder_changed()
                 w._import_dat_files([self.paths[0]])
@@ -271,18 +294,18 @@ class DatasetImportTests(unittest.TestCase):
             w._cancel_background_job()
             self.assertTrue(w._background_jobs.busy)
             self.assertFalse(w._dat_import_pending)
-            self.assertTrue(w.import_dats_btn.isEnabled())
-            self.assertTrue(w.imported_dataset_search.isEnabled())
-            message = w.statusBar().currentMessage()
+            self.assertTrue(w.source_navigation.importEnabled)
+            self.assertTrue(w.source_navigation.navigationEnabled)
+            message = w.statusText
             w._dat_import_progress(token, 'late progress')
             w._dat_import_failed(token, RuntimeError('late error'))
             w._accept_dat_import(token, [], [], [])
-            self.assertEqual(w.statusBar().currentMessage(), message)
+            self.assertEqual(w.statusText, message)
             self.release.set()
             wait_jobs(w)
         self.assertEqual(len(w.workspace.datasets), 1)
         self.assertEqual(w.workspace.active_dataset_id, owner)
-        self.assertEqual(w.plot_title_edit.text(), 'edited during cancelled import')
+        self.assertEqual(state(w)['plot_title'], 'edited during cancelled import')
         self.assertEqual(w.current_gate, 1)
         self.assertFalse(self.errors)
         # A retained cancelled worker does not own the next import lock.
@@ -293,7 +316,10 @@ class DatasetImportTests(unittest.TestCase):
         w = self.window
         w._load_dat_file_direct(self.paths[0])
         owner = w.workspace.active_dataset_id
-        w.plot_title_edit.setText('request defaults')
+        self.host.window.resize(1500, 920)
+        self.host.show()
+        w.open_graph_document()
+        edit_label(w, 'plot_title', 'request defaults')
         w._save_plot_annotation('plot_title', 'request defaults')
         started = threading.Event()
         original = background_jobs.prepare_dat
@@ -304,13 +330,15 @@ class DatasetImportTests(unittest.TestCase):
             self.release.wait(5)
             return original(request, context)
         def initialize(*args, **kwargs):
-            threads.append(QThread.currentThread() == APP.thread())
+            threads.append(QThread.currentThread() == QGuiApplication.instance().thread())
             return initializer(*args, **kwargs)
         with patch.object(background_jobs, 'prepare_dat', side_effect=blocked), \
                 patch.object(w, 'initialize_dataset', side_effect=initialize):
             w._import_dat_files(self.paths[1:])
             self.assertTrue(started.wait(2))
-            w.plot_title_edit.setText('latest outgoing edit')
+            self.assertTrue(w.dat_properties.enabled)
+            self.assertFalse(state(w)['source_axis_enabled'])
+            edit_label(w, 'plot_title', 'latest outgoing edit')
             w._save_plot_annotation('plot_title', 'latest outgoing edit')
             w._heat_ax.set_xlim(1.35, 3.65)
             self.release.set()
@@ -319,17 +347,17 @@ class DatasetImportTests(unittest.TestCase):
         for session in list(w.workspace.datasets.values())[1:]:
             self.assertEqual(session.view.annotations['plot_title'], 'request defaults')
         w.activate_dataset(owner)
-        self.assertEqual(w.plot_title_edit.text(), 'latest outgoing edit')
+        self.assertEqual(state(w)['plot_title'], 'latest outgoing edit')
         np.testing.assert_allclose(w._heat_ax.get_xlim(), [1.35, 3.65])
 
     def test_multiselect_folder_and_real_qt_multiple_dat_drop_share_registry(self):
         w = self.window
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileNames',
+        with patch('spectra_app.main_window.FilePicker.getOpenFileNames',
                    return_value=([str(self.paths[0]), str(self.paths[1])], '')):
-            w.import_dats_btn.click()
+            sn.click(w, 'sourceImport')
             wait_jobs(w)
         w.current_folder = str(self.paths[2].parent)
-        w._apply_dat_files([self.paths[2].name])
+        w._apply_dat_files(w.source_navigation.begin_folder(self.paths[2].parent), [self.paths[2].name])
         w._on_load_selected_file()
         wait_jobs(w)
         self.assertEqual(len(w.workspace.datasets), 3)
@@ -338,18 +366,19 @@ class DatasetImportTests(unittest.TestCase):
             path.write_text(self.paths[0].read_text(encoding='utf-8'), encoding='utf-8')
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(str(path)) for path in dropped_paths])
-        enter = QDragEnterEvent(QPointF(20, 20).toPoint(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
-        w.dragEnterEvent(enter)
+        enter = QDragEnterEvent(QPointF(self.host.window.width() / 2, self.host.window.height() / 2).toPoint(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QCoreApplication.sendEvent(self.host.window, enter)
         self.assertTrue(enter.isAccepted())
-        drop = QDropEvent(QPointF(20, 20), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
-        w.dropEvent(drop)
+        drop = QDropEvent(QPointF(self.host.window.width() / 2, self.host.window.height() / 2), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QCoreApplication.sendEvent(self.host.window, drop)
         self.assertTrue(drop.isAccepted())
         wait_jobs(w)
         self.assertEqual(len(w.workspace.datasets), 5)
         self.assertEqual([session.source_path for session in list(w.workspace.datasets.values())[-2:]], dropped_paths)
         sheet = next(s for s in w.workspace.sheets.values() if s.source_path == dropped_paths[0] and s.role == 'original')
-        self.assertEqual(w.graph_documents._active_key, ('workbook', w._sheet_owner(sheet.sheet_id).workbook_id, ''))
-        self.assertIs(w.plot_tabs.currentWidget(), w.graph_documents)
+        self.assertEqual(w.graph_documents.registry.active_key, ('workbook', w._sheet_owner(sheet.sheet_id).workbook_id, ''))
+        self.assertEqual(w.outerView, 'workspace')
+        self.assertIsNotNone(w.graph_documents.content_item(w.graph_documents.registry.active_key))
 
     def test_csv_drop_is_data_mixed_numeric_drop_imports_and_explicit_seeds_still_works(self):
         w = self.window
@@ -358,18 +387,24 @@ class DatasetImportTests(unittest.TestCase):
         csv_path.write_text('gate,peak_energy\n0,2\n', encoding='utf-8')
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(str(csv_path))])
-        drop = QDropEvent(QPointF(20, 20), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
-        w.dropEvent(drop)
+        enter = QDragEnterEvent(QPointF(self.host.window.width() / 2, self.host.window.height() / 2).toPoint(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QCoreApplication.sendEvent(self.host.window, enter)
+        self.assertTrue(enter.isAccepted())
+        drop = QDropEvent(QPointF(self.host.window.width() / 2, self.host.window.height() / 2), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QCoreApplication.sendEvent(self.host.window, drop)
         self.assertTrue(drop.isAccepted())
         wait_jobs(w)
         self.assertNotEqual(w._csv_seeds_path, str(csv_path))
         self.assertTrue(any(s.source_path == csv_path and s.kind == 'xy' for s in w.workspace.sheets.values()))
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileName', return_value=(str(csv_path), '')):
+        with patch('spectra_app.main_window.FilePicker.getOpenFileName', return_value=(str(csv_path), '')):
             w._on_load_seeds_csv()
         self.assertEqual(w._csv_seeds_path, str(csv_path))
         mime.setUrls([QUrl.fromLocalFile(str(self.paths[1])), QUrl.fromLocalFile(str(csv_path))])
-        mixed = QDropEvent(QPointF(20, 20), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
-        w.dropEvent(mixed)
+        enter = QDragEnterEvent(QPointF(self.host.window.width() / 2, self.host.window.height() / 2).toPoint(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QCoreApplication.sendEvent(self.host.window, enter)
+        self.assertTrue(enter.isAccepted())
+        mixed = QDropEvent(QPointF(self.host.window.width() / 2, self.host.window.height() / 2), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QCoreApplication.sendEvent(self.host.window, mixed)
         self.assertTrue(mixed.isAccepted())
         wait_jobs(w)
         self.assertEqual(len(w.workspace.datasets), 2)
@@ -377,14 +412,16 @@ class DatasetImportTests(unittest.TestCase):
 
     def test_folder_inventory_keeps_its_source_after_same_basename_import_from_other_folder(self):
         w = self.window
-        with patch('spectra_app.main_window.QFileDialog.getExistingDirectory',
+        with patch('spectra_app.main_window.FilePicker.getExistingDirectory',
                    return_value=str(self.paths[0].parent)):
             w._on_browse_root()
             wait_jobs(w)
-        self.assertEqual(w.file_list.currentItem().text(), self.paths[0].name)
-        with patch('spectra_app.main_window.QFileDialog.getOpenFileNames',
+        self.assertEqual(Path(w.source_navigation.selectedFile).name, self.paths[0].name)
+        self.assertTrue(w.request_outer_view('analysis'))
+        pump()
+        with patch('spectra_app.main_window.FilePicker.getOpenFileNames',
                    return_value=([str(self.paths[1])], '')):
-            w.import_dats_btn.click()
+            sn.click(w, 'sourceImport')
             wait_jobs(w)
         b_id = w.workspace.dataset_for_path(self.paths[1]).dataset_id
         w.activate_dataset(b_id)
@@ -392,23 +429,25 @@ class DatasetImportTests(unittest.TestCase):
         b_result = _fit_result(2)
         w.fit_result = b_result
         self.assertEqual(w.current_dat_path, self.paths[1])
-        self.assertEqual(w.file_list.currentItem().text(), self.paths[0].name)
-        w.load_btn.click()
+        self.assertEqual(Path(w.source_navigation.selectedFile).name, self.paths[0].name)
+        self.assertTrue(w.request_outer_view('analysis'))
+        pump()
+        sn.click(w, 'sourceLoad')
         wait_jobs(w)
         source = next(s for s in w.workspace.sheets.values() if s.source_path == self.paths[0] and s.role == 'original')
-        self.assertEqual(w.graph_documents._active_key, ('workbook', w._sheet_owner(source.sheet_id).workbook_id, ''))
+        self.assertEqual(w.graph_documents.registry.active_key, ('workbook', w._sheet_owner(source.sheet_id).workbook_id, ''))
         self.assertEqual(len(w.workspace.datasets), 2)
         self.assertIs(w.workspace.datasets[b_id].current_cube, b_cube)
         self.assertIs(w.workspace.datasets[b_id].fit_result, b_result)
         self.assertFalse(self.errors)
 
 
-class DatasetActivationTests(unittest.TestCase):
+class DatasetActivationTests(QuickMigrationCase):
     def setUp(self):
-        self.directory = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.errors = []
-        self.window._show_error = self.errors.append
+        super().setUp()
+        self.directory = self.folder
+        self.window = self.controller
+        self.errors = self.quick_errors
         self.release = threading.Event()
         self.paths = []
         for name, scale in [('a', 1), ('b', 3)]:
@@ -421,10 +460,14 @@ class DatasetActivationTests(unittest.TestCase):
     def tearDown(self):
         self.release.set()
         wait_jobs(self.window)
-        self.window.close()
+        self.assertEqual(self.quick_errors, [])
+        super().tearDown()
 
     def load(self, index):
         self.window._load_dat_file_direct(self.paths[index])
+        self.window.open_graph_document()
+        self.assertTrue(self.window.request_outer_view('analysis'))
+        pump()
         self.assertTrue(hasattr(self.window, 'workspace'), 'Loads must register dataset sessions')
         return self.window.workspace.active_dataset_id
 
@@ -444,16 +487,16 @@ class DatasetActivationTests(unittest.TestCase):
     def assert_new_file_single_color_fix(self, bound, fixed, expected_limits):
         w = self.window
         self.load(0)
-        getattr(w, f'{bound}_lock').setChecked(True)
-        getattr(w, f'{bound}_spin').setValue(fixed)
+        set_flag(w, f'{bound}_lock', True)
+        setup_number(w, bound, fixed)
         # The new file's entire intensity range crosses the fixed bound.
         self.paths[1].write_text(
             'Energy(eV) 0 1\n1 1 2\n2 3 4\n3 5 6\n', encoding='utf-8')
         self.load(1)
-        self.assertTrue(getattr(w, f'{bound}_lock').isChecked())
-        self.assertEqual(getattr(w, f'{bound}_spin').value(), fixed)
+        self.assertTrue(state(w)[f'{bound}_lock'])
+        self.assertEqual(float(state(w)[bound]), fixed)
         np.testing.assert_allclose(
-            (w.vmin_spin.value(), w.vmax_spin.value()), expected_limits, atol=1e-10)
+            (float(state(w)['vmin']), float(state(w)['vmax'])), expected_limits, atol=1e-10)
         np.testing.assert_allclose(w._heat_mesh.get_clim(), expected_limits, atol=1e-10)
 
     def test_new_file_keeps_fixed_minimum_below_auto_maximum(self):
@@ -465,34 +508,38 @@ class DatasetActivationTests(unittest.TestCase):
     def test_new_file_with_fixed_empty_view_keeps_previous_color_bounds(self):
         w = self.window
         self.load(0)
-        w.xmin_lock.setChecked(True)
-        w.xmax_lock.setChecked(True)
-        previous = (w.vmin_spin.value(), w.vmax_spin.value())
+        set_flag(w, 'xmin_lock', True)
+        set_flag(w, 'xmax_lock', True)
+        previous = (float(state(w)['vmin']), float(state(w)['vmax']))
+        previous_mesh = w._heat_mesh.get_clim()
+        previous_bounds = tuple(w._dat_view().bounds[key] for key in ('vmin', 'vmax'))
         self.paths[1].write_text(
             'Energy(eV) 0 1\n20 1 2\n21 3 4\n22 5 6\n', encoding='utf-8')
         self.load(1)
-        np.testing.assert_allclose((w.vmin_spin.value(), w.vmax_spin.value()), previous)
-        np.testing.assert_allclose(w._heat_mesh.get_clim(), previous)
+        np.testing.assert_allclose((float(state(w)['vmin']), float(state(w)['vmax'])), previous)
+        np.testing.assert_allclose(w._heat_mesh.get_clim(), previous_mesh)
+        np.testing.assert_allclose(
+            tuple(w._dat_view().bounds[key] for key in ('vmin', 'vmax')), previous_bounds)
 
     def test_cached_round_trip_restores_owner_controls_results_and_csv_without_reads(self):
         w = self.window
         a = self.load(0)
         cube = w.current_cube
         w._set_current_gate_from_index(2, update_plot=True)
-        w.fit_xmin_spin.setValue(1.2)
-        w.fit_xmax_spin.setValue(3.8)
-        w.fit_xmin_lock.setChecked(True)
-        w.maxfev_spin.setValue(4321)
-        w._d2_radio.setChecked(True)
-        w.d2_mode_combo.setCurrentText('Both')
-        w.d2_sg_win_spin.setValue(9)
-        w.d2_prom_spin.setValue(0.12)
-        w.fit_model_combo.setCurrentText('Gaussian')
-        w.fit_smooth_chk.setChecked(True)
-        w.fit_smooth_win_spin.setValue(7)
-        w.lw_min_spin.setValue(2)
-        w.lw_max_spin.setValue(9)
-        w.peak_move_limit_spin.setValue(4)
+        oa.set_number(w, 'fit_xmin', 1.2)
+        oa.set_number(w, 'fit_xmax', 3.8)
+        oa.set_value(w, 'fit_xmin_fixed', True)
+        oa.set_number(w, 'maxfev', 4321)
+        oa.set_value(w, 'derivative_detection', True)
+        oa.set_value(w, 'd2_mode', 'Both')
+        oa.set_number(w, 'd2_window', 9)
+        oa.set_number(w, 'd2_prominence', 0.12)
+        oa.set_value(w, 'fit_model', 'Gaussian')
+        oa.set_value(w, 'fit_smooth', True)
+        oa.set_number(w, 'fit_smooth_window', 7)
+        oa.set_number(w, 'linewidth_min', 2)
+        oa.set_number(w, 'linewidth_max', 9)
+        oa.set_number(w, 'peak_move_limit', 4)
         w.peak_indices = np.array([4, 17])
         w._peak_gate_idx = 2
         w.peak_label_lookup = {(2, 4): 8}
@@ -500,14 +547,14 @@ class DatasetActivationTests(unittest.TestCase):
         seeds = self.directory / 'a.csv'
         seeds.write_text('gate,peak_energy\n2,1.4\n2,2.7\n', encoding='utf-8')
         w._load_seeds_csv_file(seeds)
-        w._seeds_from_csv_radio.setChecked(True)
+        oa.set_value(w, 'csv_source', True)
         result = self.commit(2.7)
-        w.analysis_text.setPlainText('A committed summary')
-        w.plot_title_edit.setText('A title')
+        oa.set_summary(w, 'A committed summary')
+        edit_label(w, 'plot_title', 'A title')
         w._save_plot_annotation('plot_title', 'A title')
-        w.processing_mode_combo.setCurrentIndex(1)  # pending, no Generate
-        w.processing_smooth_chk.setChecked(False)
-        w.processing_window_spin.setValue(9)
+        w.processing.setMode('energy_second_derivative')  # pending, no Generate
+        w.processing.setSmoothing(False)
+        set_processing_window(w.processing, 9)
         w._heat_ax.set_xlim(1.35, 3.65)
         a_limits = w._heat_ax.get_xlim()
         a_generation = w._data_generation
@@ -515,10 +562,10 @@ class DatasetActivationTests(unittest.TestCase):
         w.batch_peak_map[0] = np.array([9])
         w._csv_seeds_map = {0: [3.2]}
         self.commit(3.2)
-        w.analysis_text.setPlainText('B summary')
-        w.maxfev_spin.setValue(9876)
-        w._orig_radio.setChecked(True)
-        w.fit_model_combo.setCurrentText('Lorentzian')
+        oa.set_summary(w, 'B summary')
+        oa.set_number(w, 'maxfev', 9876)
+        oa.set_value(w, 'derivative_detection', False)
+        oa.set_value(w, 'fit_model', 'Lorentzian')
         self.paths[0].rename(self.paths[0].with_suffix('.hidden'))
         settings_value = w._annotation_settings.value
         def cached_settings_value(key, *args, **kwargs):
@@ -537,30 +584,31 @@ class DatasetActivationTests(unittest.TestCase):
         self.assertIs(w.fit_result, result)
         self.assertEqual(w._csv_seeds_map, {2: [1.4, 2.7]})
         self.assertEqual(w._csv_seeds_path, str(seeds))
-        self.assertTrue(w._seeds_from_csv_radio.isChecked())
-        self.assertEqual(w.analysis_text.toPlainText(), 'A committed summary')
-        self.assertEqual(w.plot_title_edit.text(), 'A title')
-        self.assertEqual(w.maxfev_spin.value(), 4321)
-        self.assertTrue(w._d2_radio.isChecked())
-        self.assertEqual(w.d2_mode_combo.currentText(), 'Both')
-        self.assertEqual(w.d2_sg_win_spin.value(), 9)
-        self.assertAlmostEqual(w.d2_prom_spin.value(), 0.12)
-        self.assertEqual(w.fit_model_combo.currentText(), 'Gaussian')
-        self.assertTrue(w.fit_smooth_chk.isChecked())
-        self.assertEqual(w.fit_smooth_win_spin.value(), 7)
-        self.assertEqual(w.lw_min_spin.value(), 2)
-        self.assertEqual(w.lw_max_spin.value(), 9)
-        self.assertEqual(w.peak_move_limit_spin.value(), 4)
-        self.assertTrue(w.fit_xmin_lock.isChecked())
-        self.assertEqual(w.processing_mode_combo.currentData(), 'energy_second_derivative')
+        self.assertTrue(oa.value(w, 'csv_source'))
+        self.assertEqual(oa.summary(w), 'A committed summary')
+        self.assertEqual(state(w)['plot_title'], 'A title')
+        self.assertEqual(oa.value(w, 'maxfev'), 4321)
+        self.assertTrue(oa.value(w, 'derivative_detection'))
+        self.assertEqual(oa.value(w, 'd2_mode'), 'Both')
+        self.assertEqual(oa.value(w, 'd2_window'), 9)
+        self.assertAlmostEqual(oa.value(w, 'd2_prominence'), 0.12)
+        self.assertEqual(oa.value(w, 'fit_model'), 'Gaussian')
+        self.assertTrue(oa.value(w, 'fit_smooth'))
+        self.assertEqual(oa.value(w, 'fit_smooth_window'), 7)
+        self.assertEqual(oa.value(w, 'linewidth_min'), 2)
+        self.assertEqual(oa.value(w, 'linewidth_max'), 9)
+        self.assertEqual(oa.value(w, 'peak_move_limit'), 4)
+        self.assertTrue(oa.value(w, 'fit_xmin_fixed'))
+        self.assertEqual(w.processing.mode, 'energy_second_derivative')
         self.assertEqual(w._processing_mode, 'original')
-        self.assertFalse(w.processing_smooth_chk.isChecked())
-        self.assertEqual(w.processing_window_spin.value(), 9)
+        self.assertFalse(w.processing.smoothing)
+        self.assertEqual(w.processing.windowLength, 9)
         np.testing.assert_allclose(w._heat_ax.get_xlim(), a_limits)
         self.assertGreater(w._data_generation, a_generation)
-        self.assertTrue(w.export_all_fit_btn.isEnabled())
+        oa.reveal(w, tab=1)
+        self.assertTrue(oa.command_enabled(w, 'exportAllFit'))
         output = self.directory / 'owner.csv'
-        with patch('spectra_app.main_window.QFileDialog.getSaveFileName', return_value=(str(output), '')):
+        with patch('spectra_app.main_window.FilePicker.getSaveFileName', return_value=(str(output), '')):
             w._on_export_all_fit_csv()
         with output.open(encoding='utf-8-sig') as stream:
             rows = list(csv.DictReader(stream))
@@ -568,31 +616,31 @@ class DatasetActivationTests(unittest.TestCase):
         self.assertEqual(rows[0]['gate'], '2')
         self.assertEqual(rows[0]['peak_1_center'], '2.7')
         w.activate_dataset(b)
-        self.assertEqual(w.maxfev_spin.value(), 9876)
-        self.assertEqual(w.analysis_text.toPlainText(), 'B summary')
+        self.assertEqual(oa.value(w, 'maxfev'), 9876)
+        self.assertEqual(oa.summary(w), 'B summary')
 
     def test_cached_fixed_recipes_survive_other_owner_defaults_and_later_replot(self):
         w = self.window
         a = self.load(0)
-        w.color_scale_combo.setCurrentIndex(1)
-        w.region_boundary_spins[0].setValue(1.65)
-        w.fix_region_edges_chk.setChecked(True)
+        set_choice(w, 'color_scale', '2')
+        setup_number(w, 'edge0', 1.65)
+        set_flag(w, 'fix_region_edges', True)
         edge = w._color_region_boundaries[0]
-        w.plot_title_edit.setText('A fixed title')
+        edit_label(w, 'plot_title', 'A fixed title')
         w._save_plot_annotation('plot_title', 'A fixed title')
         self.load(1)
-        w.region_boundary_spins[0].setValue(3.15)
-        w.fix_region_edges_chk.setChecked(True)
-        w.plot_title_edit.setText('B default title')
+        setup_number(w, 'edge0', 3.15)
+        set_flag(w, 'fix_region_edges', True)
+        edit_label(w, 'plot_title', 'B default title')
         w._save_plot_annotation('plot_title', 'B default title')
         settings_before = w._annotation_settings.value('fixed_region_edges/recipe')
         w.activate_dataset(a)
         self.assertEqual(w._annotation_settings.value('fixed_region_edges/recipe'), settings_before)
         w._plot_cube()
-        w.color_scale_combo.setCurrentIndex(2)
-        w.color_scale_combo.setCurrentIndex(1)
+        set_choice(w, 'color_scale', '3')
+        set_choice(w, 'color_scale', '2')
         self.assertAlmostEqual(w._color_region_boundaries[0], edge)
-        self.assertEqual(w.plot_title_edit.text(), 'A fixed title')
+        self.assertEqual(state(w)['plot_title'], 'A fixed title')
 
     def test_processing_and_explicit_reread_invalidate_only_owner_and_preserve_id(self):
         w = self.window
@@ -600,14 +648,6 @@ class DatasetActivationTests(unittest.TestCase):
         self.commit(1.8)
         b = self.load(1)
         b_cube, b_fit = w.current_cube, self.commit(3.1)
-        w.activate_dataset(a)
-        w.processing_mode_combo.setCurrentIndex(1)
-        w._on_generate_heatmap()
-        wait_jobs(w)
-        self.assertEqual(w.batch_fit_result_map, {})
-        w.activate_dataset(b)
-        self.assertIs(w.current_cube, b_cube)
-        self.assertIs(w.fit_result, b_fit)
         w.activate_dataset(a)
         old_fingerprint = w._loaded_source_fingerprint
         self.paths[0].write_text(self.paths[0].read_text().replace('1 1 1 1', '1 20 30 40'), encoding='utf-8')
@@ -617,22 +657,81 @@ class DatasetActivationTests(unittest.TestCase):
         self.assertEqual(w._base_cube.z[0, 0], 20)
         self.assertEqual(len(w.workspace.datasets), 2)
         w.activate_dataset(b)
+        self.assertIs(w.current_cube, b_cube)
+        self.assertIs(w.fit_result, b_fit)
+        w.activate_dataset(a)
+        w.processing.setMode('energy_second_derivative')
+        w._on_generate_heatmap()
+        wait_jobs(w)
+        self.assertEqual(w.batch_fit_result_map, {})
+        retained_session, retained_cube = w.workspace.active, w.current_cube
+        retained_results = dict(retained_session.processing_results)
+        self.assertTrue(retained_results)
+        retained_fit = self.commit(2.1)
+        retained_fingerprint = w._loaded_source_fingerprint
+        self.paths[0].write_text(self.paths[0].read_text().replace('1 20 30 40', '1 21 31 41'), encoding='utf-8')
+        # Retained processing runs bind the original source values and axes.
+        # A changed reread must retain that owner; explicit new-copy import is
+        # the supported route for the changed source.
+        w._load_dat_file_direct(self.paths[0])
+        self.assertEqual(len(self.errors), 1)
+        self.assertIn('Import this changed DAT as a new copy', self.errors.pop())
+        self.assertIs(w.workspace.active, retained_session)
+        self.assertIs(w.current_cube, retained_cube)
+        self.assertIs(w.fit_result, retained_fit)
+        self.assertEqual(w._loaded_source_fingerprint, retained_fingerprint)
+        self.assertEqual(w._base_cube.z[0, 0], 20)
+        self.assertEqual(retained_session.processing_results, retained_results)
+        w._import_data_files([self.paths[0]], new_copy=True)
+        wait_jobs(w)
+        copied = next(session for session in w.workspace.datasets.values()
+                      if session.source_path == self.paths[0] and session.dataset_id != a)
+        self.assertNotEqual(copied.dataset_id, a)
+        self.assertEqual(copied.base_cube.z[0, 0], 21)
+        self.assertIs(w.workspace.datasets[a], retained_session)
+        self.assertIs(retained_session.current_cube, retained_cube)
+        self.assertIs(retained_session.fit_result, retained_fit)
+        self.assertEqual(len(w.workspace.datasets), 3)
+        w.activate_dataset(b)
+        self.assertIs(w.current_cube, b_cube)
         self.assertIs(w.fit_result, b_fit)
 
     def test_applied_derivative_and_axis_change_preserve_other_owner(self):
         w = self.window
         a = self.load(0)
-        w.y_axis_name_edit.setText('A Gate')
-        w.processing_mode_combo.setCurrentIndex(1)
-        w.processing_smooth_chk.setChecked(False)
-        w.processing_window_spin.setValue(9)
+        edit_label(w, 'y_axis_name', 'A Gate')
+        self.commit(2.1)
+        b = self.load(1)
+        edit_label(w, 'y_axis_name', 'B default Gate')
+        b_cube, b_fit = w.current_cube, self.commit(3.1)
+        w.activate_dataset(a)
+        # Axis interpretation remains editable before a processing run is retained.
+        w.dat_properties._axis_override = 'pixel'
+        with patch.object(w._annotation_settings, 'value', side_effect=AssertionError('runtime defaults read')):
+            w._on_x_axis_override_changed()
+        self.assertEqual(w.current_cube.x_override, 'pixel')
+        self.assertEqual(state(w)['y_axis_name'], 'A Gate')
+        self.assertIsNone(w.fit_result)
+        w.activate_dataset(b)
+        self.assertIs(w.current_cube, b_cube)
+        self.assertIs(w.fit_result, b_fit)
+        w.activate_dataset(a)
+        # Return to photon energy before requesting an energy derivative.
+        w.dat_properties._axis_override = 'ev'
+        with patch.object(w._annotation_settings, 'value', side_effect=AssertionError('runtime defaults read')):
+            w._on_x_axis_override_changed()
+        self.assertEqual(w.current_cube.x_override, 'ev')
+        w.processing.setMode('energy_second_derivative')
+        w.processing.setSmoothing(False)
+        set_processing_window(w.processing, 9)
         w._on_generate_heatmap()
         wait_jobs(w)
-        a_processed = w.current_cube
+        a_session, a_processed = w.workspace.active, w.current_cube
+        a_source = w._base_cube
+        a_results = dict(a_session.processing_results)
+        self.assertTrue(a_results)
         a_fit = self.commit(2.1)
-        b = self.load(1)
-        w.y_axis_name_edit.setText('B default Gate')
-        b_cube, b_fit = w.current_cube, self.commit(3.1)
+        w.activate_dataset(b)
         w.activate_dataset(a)
         self.assertIs(w.current_cube, a_processed)
         self.assertIs(w.fit_result, a_fit)
@@ -640,15 +739,19 @@ class DatasetActivationTests(unittest.TestCase):
         with patch('spectra_app.main_window.energy_second_derivative', side_effect=AssertionError('recompute')):
             w.activate_dataset(b)
             w.activate_dataset(a)
-        # Exercise the explicit synchronous axis interpretation helper.
-        w.x_axis_override_combo.blockSignals(True)
-        w.x_axis_override_combo.setCurrentIndex(w.x_axis_override_combo.findData('pixel'))
-        w.x_axis_override_combo.blockSignals(False)
+        # A retained run protects its source interpretation and keeps its own
+        # scientific and fit identities while restoring the rejected choice.
+        w.dat_properties._axis_override = 'pixel'
         with patch.object(w._annotation_settings, 'value', side_effect=AssertionError('runtime defaults read')):
             w._on_x_axis_override_changed()
-        self.assertEqual(w.current_cube.x_override, 'pixel')
-        self.assertEqual(w.y_axis_name_edit.text(), 'A Gate')
-        self.assertIsNone(w.fit_result)
+        self.assertEqual(w.dat_properties._axis_override, 'ev')
+        self.assertEqual(w.current_cube.x_override, 'ev')
+        self.assertIs(w.current_cube, a_processed)
+        self.assertIs(w._base_cube, a_source)
+        self.assertIs(w.fit_result, a_fit)
+        self.assertEqual(a_session.processing_results, a_results)
+        self.assertEqual(state(w)['y_axis_name'], 'A Gate')
+        self.assertIn('new project', w.statusText)
         w.activate_dataset(b)
         self.assertIs(w.current_cube, b_cube)
         self.assertIs(w.fit_result, b_fit)
@@ -656,17 +759,17 @@ class DatasetActivationTests(unittest.TestCase):
     def test_staged_initialization_uses_detached_defaults_and_sidecar_failure_does_not_block_switch(self):
         w = self.window
         a = self.load(0)
-        w.plot_title_edit.setText('request title')
+        edit_label(w, 'plot_title', 'request title')
         fingerprint = w._loaded_source_fingerprint
         defaults = w.snapshot_dataset_defaults()
         # A batch can construct candidates without changing the visible owner.
         from spectra_app.dat_io import load_dat_cube
         from spectra_app.plot_state import source_fingerprint
         prepared = (load_dat_cube(self.paths[1]), source_fingerprint(self.paths[1]), None, '')
-        w.plot_title_edit.setText('later outgoing edit')
+        edit_label(w, 'plot_title', 'later outgoing edit')
         candidate = w.initialize_dataset(self.paths[1], prepared, defaults)
         self.assertEqual(w.workspace.active_dataset_id, a)
-        self.assertEqual(w.plot_title_edit.text(), 'later outgoing edit')
+        self.assertEqual(state(w)['plot_title'], 'later outgoing edit')
         self.assertEqual(candidate.view.annotations['plot_title'], 'request title')
         w.register_dataset(candidate)
         self.paths[0].write_text(self.paths[0].read_text() + '\n', encoding='utf-8')
@@ -678,16 +781,16 @@ class DatasetActivationTests(unittest.TestCase):
             w.activate_dataset(candidate.dataset_id)
         self.assertEqual(calls, [(self.paths[0], fingerprint)])
         self.assertEqual(w.workspace.active_dataset_id, candidate.dataset_id)
-        self.assertIn('sidecar is read-only', w.statusBar().currentMessage())
+        self.assertIn('sidecar is read-only', w.statusText)
         w.activate_dataset(a)
-        self.assertEqual(w.plot_title_edit.text(), 'later outgoing edit')
+        self.assertEqual(state(w)['plot_title'], 'later outgoing edit')
 
     def test_switch_flushes_annotations_and_discards_transient_interactions(self):
         w = self.window
         a = self.load(0)
         b = self.load(1)
         w.activate_dataset(a)
-        w.plot_title_edit.setText('last keystroke')
+        edit_label(w, 'plot_title', 'last keystroke')
         w._save_plot_annotation('plot_title', 'last keystroke')
         self.assertTrue(w._annotation_edit_pending)
         w._schedule_view_layout()
@@ -707,7 +810,7 @@ class DatasetActivationTests(unittest.TestCase):
         self.assertIsNone(w._cached_d2)
         self.assertFalse(w.toolbar._nav_stack())
         w.activate_dataset(a)
-        self.assertEqual(w.plot_title_edit.text(), 'last keystroke')
+        self.assertEqual(state(w)['plot_title'], 'last keystroke')
 
     def test_returning_to_same_owner_rejects_blocked_old_result_and_error(self):
         w = self.window
@@ -717,7 +820,7 @@ class DatasetActivationTests(unittest.TestCase):
             w.activate_dataset(a)
             committed = self.commit(1.8)
             w._csv_seeds_map = {w._current_gate_index(): [2.0]}
-            w._seeds_from_csv_radio.setChecked(True)
+            oa.set_value(w, 'csv_source', True)
             started = threading.Event()
             self.release.clear()
             def solver(*args, **kwargs):

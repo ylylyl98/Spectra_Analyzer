@@ -1,18 +1,23 @@
 """One-click fit graphs are ordinary, detached, editable workspace documents."""
 import json
+from tests import ordinary_analysis_quick_helpers as oa
 from dataclasses import replace
-from unittest import TestCase
+from tests.quick_migration_case import QuickMigrationCase
+from PySide6.QtGui import QGuiApplication
+from tests.xy_analysis_quick_helpers import analysis_command, choose_analysis
 from unittest.mock import patch
 import numpy as np
 from PySide6.QtGui import QImage
 from tests import test_xy_analysis_workflow as xy_workflow
 APP = xy_workflow.APP
 from tests.settings_helpers import wait_for_background_jobs
+from tests.xy_helpers import set_xy_draft, xy_value
+from tests.formal_quick_helpers import item, pump, click_item
 from spectra_app.fitting import fit_multi_peak
 from spectra_app.workbook_state import remove_comparison, remove_workbook, remove_sheet, resolve_curve
 
 
-class FitGraphCreationTests(TestCase):
+class FitGraphCreationTests(QuickMigrationCase):
     setUp = xy_workflow.XYAnalysisWorkflowTests.setUp
     dispose = xy_workflow.XYAnalysisWorkflowTests.dispose
     analyze = xy_workflow.XYAnalysisWorkflowTests.analyze
@@ -31,17 +36,22 @@ class FitGraphCreationTests(TestCase):
         curve.y_offset = 4
         self.page.refresh()
         self.analyze()
-        self.panel.find_btn.click(); wait_for_background_jobs(self.w)
-        self.panel.fit_btn.click(); wait_for_background_jobs(self.w)
+        analysis_command(self.panel, 'find'); wait_for_background_jobs(self.w)
+        analysis_command(self.panel, 'fit'); wait_for_background_jobs(self.w)
         self.assertIsNotNone(self.panel.fit_result)
         self.assertEqual(len(self.panel.fit_result.centers), 2)
         self.source_values = source.data[:, :2].copy()
 
     def create_xy(self):
-        self.assertTrue(hasattr(self.panel, 'create_graph_btn'), 'Missing Create fit graph action')
-        self.assertTrue(self.panel.create_graph_btn.isEnabled())
-        self.panel.create_graph_btn.click(); APP.processEvents()
-        page = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        self.w.open_xy_comparison(self.page.comparison_id)
+        self.w.dat_details_action.setChecked(True)
+        self.w.request_task(1)
+        pump()
+        self.panel.sync()
+        self.assertIsNotNone(item(self.w, 'xy-analysis-graph'), 'Missing Create fit graph action')
+        self.assertTrue(item(self.w, 'xy-analysis-graph').isEnabled())
+        click_item(self.w, 'xy-analysis-graph'); APP.processEvents()
+        page = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         self.assertIsNot(page, self.page)
         self.assertTrue(hasattr(page, 'comparison'))
         return page
@@ -81,20 +91,20 @@ class FitGraphCreationTests(TestCase):
         for curve in curves:
             color = np.array([int(curve.color[i:i+2], 16) for i in (1, 3, 5)])
             self.assertGreater(np.count_nonzero(np.all(np.abs(pixels.astype(int)-color) < 3, axis=2)), 2)
-        # Release the offscreen platform's QMimeData before QApplication teardown.
-        self.addCleanup(APP.clipboard().clear)
+        # Release the offscreen platform's QMimeData before QGuiApplication teardown.
+        self.addCleanup(QGuiApplication.clipboard().clear)
         self.w.copy_graph_svg()
-        clipboard = bytes(APP.clipboard().mimeData().data('image/svg+xml'))
+        clipboard = bytes(QGuiApplication.clipboard().mimeData().data('image/svg+xml'))
         for curve in curves: self.assertIn(curve.curve_id.encode(), clipboard)
 
     def test_save_create_order_reopen_styles_and_recreate_removed_records(self):
         self.multi_fit()
         initial_books = len(self.w.workspace.workbooks)
-        self.panel.save_btn.click()
+        analysis_command(self.panel, 'save')
         graph = self.create_xy()
         self.assertEqual(len(self.w.workspace.workbooks), initial_books+1)
         curve = next(iter(graph.comparison.curves.values()))
-        graph.color_edit.setText('#123456'); graph.width_spin.setValue(3.25)
+        set_xy_draft(graph, 'color', '#123456'); set_xy_draft(graph, 'width', 3.25, commit=True)
         graph.finish_editor()
         identity = graph.comparison_id
         same = self.create_xy()
@@ -122,7 +132,7 @@ class FitGraphCreationTests(TestCase):
         self.assertEqual(len(self.w.workspace.workbooks), initial_books+1)
         data = resolve_curve(self.w.workspace, list(first.comparison.curves.values())[1])[1].copy()
         self.w.open_xy_comparison(self.page.comparison_id)
-        self.panel.fit_btn.click(); wait_for_background_jobs(self.w)
+        analysis_command(self.panel, 'fit'); wait_for_background_jobs(self.w)
         second = self.create_xy()
         self.assertNotEqual(first.comparison_id, second.comparison_id)
         self.assertEqual(len(self.w.workspace.workbooks), initial_books+2)
@@ -130,25 +140,26 @@ class FitGraphCreationTests(TestCase):
 
     def test_create_guards_no_fit_busy_invalid_draft_and_stale_source(self):
         self.analyze()
-        self.assertTrue(hasattr(self.panel, 'create_graph_btn'), 'Missing Create fit graph action')
-        self.assertFalse(self.panel.create_graph_btn.isEnabled())
+        self.assertIsNotNone(item(self.w, 'xy-analysis-graph'), 'Missing Create fit graph action')
+        self.assertFalse(self.panel.bridge.state['graphEnabled'])
         self.fit()
         counts = (len(self.w.workspace.workbooks), len(self.w.workspace.comparisons))
-        self.page.stack_step_edit.setText('invalid')
-        self.panel.create_graph_btn.click()
+        set_xy_draft(self.page, 'stack_step', 'invalid')
+        analysis_command(self.panel, 'graph')
         self.assertEqual((len(self.w.workspace.workbooks), len(self.w.workspace.comparisons)), counts)
-        self.assertEqual(self.page.stack_step_edit.text(), 'invalid')
-        self.page.stack_step_edit.setText('0')
-        with patch.object(self.w, '_project_busy', return_value=True):
+        self.assertEqual(xy_value(self.page, 'stack_step'), 'invalid')
+        set_xy_draft(self.page, 'stack_step', '0')
+        # Services retain the real bound busy predicate; arrange its import state.
+        with patch.object(self.w, '_dat_import_pending', True):
             self.panel.sync()
-            self.assertFalse(self.panel.create_graph_btn.isEnabled())
+            self.assertFalse(self.panel.bridge.state['graphEnabled'])
             self.panel.create_analysis_graph()
         self.assertEqual((len(self.w.workspace.workbooks), len(self.w.workspace.comparisons)), counts)
         source = self.w.workspace.sheets[next(iter(self.page.comparison.curves.values())).sheet_id]
         source.data[:, 1] += 3
         self.panel.create_analysis_graph()
         self.assertIsNone(self.panel.fit_result)
-        self.assertFalse(self.panel.create_graph_btn.isEnabled())
+        self.assertFalse(self.panel.bridge.state['graphEnabled'])
         self.assertEqual((len(self.w.workspace.workbooks), len(self.w.workspace.comparisons)), counts)
 
     def test_project_reopen_retains_graph_after_all_source_records_removed(self):
@@ -178,6 +189,8 @@ class FitGraphCreationTests(TestCase):
         path.write_text('Energy(eV) 0 1\n'+'\n'.join(f'{a} {b} {c}' for a,b,c in zip(x, first, second)), encoding='utf-8')
         self.w._load_dat_file_direct(path)
         session = self.w.workspace.active
+        self.w.open_graph_document(session.dataset_id)
+        oa.reveal(self.w)
         result = fit_multi_peak(x, first, centers_hint=np.array([2., 4.]), model='Gaussian', mode='Peaks')
         session.fit_result = result; session.fit_gate_idx = 0
         self.w._set_current_gate_from_index(0)
@@ -186,12 +199,12 @@ class FitGraphCreationTests(TestCase):
 
     def test_dat_uses_current_gate_fit_and_actual_applied_source_not_current_controls(self):
         session, x, first, second, result = self.dat_fixture()
-        self.assertTrue(hasattr(self.w, 'create_analysis_graph_btn'), 'Missing DAT Create fit graph action')
-        self.w.fit_model_combo.setCurrentText('Lorentzian')
-        self.w.fit_xmin_spin.setValue(2.5); self.w.fit_xmax_spin.setValue(3.5)
-        self.w.fit_smooth_chk.setChecked(True)
-        self.w.create_analysis_graph_btn.click(); APP.processEvents()
-        graph = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        self.assertIsNotNone(item(self.w, 'ordinaryCommand_createAnalysis'))
+        oa.set_value(self.w, 'fit_model', 'Lorentzian')
+        oa.set_number(self.w, 'fit_xmin', 2.5); oa.set_number(self.w, 'fit_xmax', 3.5)
+        oa.set_value(self.w, 'fit_smooth', True)
+        oa.click(self.w, 'createAnalysis'); APP.processEvents()
+        graph = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         self.assertEqual(len(graph.comparison.curves), 4)
         sheet = self.w.workspace.sheets[next(iter(graph.comparison.curves.values())).sheet_id]
         np.testing.assert_allclose(sheet.data[:, 1], first)
@@ -202,39 +215,43 @@ class FitGraphCreationTests(TestCase):
         self.assertEqual(note['gate_index'], 0)
         self.assertIn('before fit-only smoothing', note['source_values'])
         self.assertEqual(next(iter(graph.comparison.curves.values())).label, 'Source data (applied)')
+        self.w.open_graph_document(session.dataset_id)
+        oa.reveal(self.w)
         self.w._set_current_gate_from_index(1)
         self.w._refresh_export_actions()
-        self.assertFalse(self.w.create_analysis_graph_btn.isEnabled())
+        self.assertFalse(oa.command_enabled(self.w, 'createAnalysis'))
         # Retained batch fit for Gate 1 is used even when the single-fit field is Gate 0.
         session.batch_fit_result_map[1] = fit_multi_peak(x, second, centers_hint=np.array([2., 4.]), model='Gaussian', mode='Peaks')
-        self.w._refresh_export_actions(); self.assertTrue(self.w.create_analysis_graph_btn.isEnabled())
-        self.w.create_analysis_graph_btn.click(); APP.processEvents()
-        current = self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        self.w._refresh_export_actions(); self.assertTrue(oa.command_enabled(self.w, 'createAnalysis'))
+        oa.click(self.w, 'createAnalysis'); APP.processEvents()
+        current = self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         self.assertNotEqual(current.comparison_id, graph.comparison_id)
         selected_sheet = self.w.workspace.sheets[next(iter(current.comparison.curves.values())).sheet_id]
         np.testing.assert_allclose(selected_sheet.data[:, 1], second)
         self.assertEqual(json.loads(selected_sheet.snapshot_note)['gate_index'], 1)
-        current.color_edit.setText('#abcdef'); current.finish_editor()
-        self.w.create_analysis_graph_btn.click()
+        set_xy_draft(current, 'color', '#abcdef'); current.finish_editor()
+        self.w.open_graph_document(session.dataset_id)
+        oa.click(self.w, 'createAnalysis')
         self.assertEqual(len(self.w.workspace.comparisons), 3)
         self.assertEqual(next(iter(current.comparison.curves.values())).color, '#abcdef')
 
     def test_dat_busy_invalid_draft_mismatched_coordinates_and_no_fit_do_not_create(self):
         session, x, first, second, result = self.dat_fixture()
-        self.assertTrue(hasattr(self.w, 'create_analysis_graph_btn'), 'Missing DAT Create fit graph action')
+        self.assertIsNotNone(item(self.w, 'ordinaryCommand_createAnalysis'))
         before = (len(self.w.workspace.workbooks), len(self.w.workspace.comparisons))
         with patch.object(self.w, '_project_busy', return_value=True):
             self.w._refresh_export_actions()
-            self.assertFalse(self.w.create_analysis_graph_btn.isEnabled())
+            self.assertFalse(oa.command_enabled(self.w, 'createAnalysis'))
         self.w._refresh_export_actions()
-        self.assertTrue(self.w.create_analysis_graph_btn.isEnabled())
-        self.w.fit_xmin_spin.lineEdit().setText('invalid')
-        with patch.object(self.w, '_show_error') as error:
-            self.w.create_analysis_graph_btn.click()
-            self.assertIn('numeric editor', error.call_args.args[0])
+        self.assertTrue(oa.command_enabled(self.w, 'createAnalysis'))
+        oa.draft(self.w, 'fit_xmin', 'invalid')
+        oa.click(self.w, 'createAnalysis')
+        self.assertIn('numeric editor', self.w.ordinary_analysis.errorText)
+        pump(80)
+        self.assertTrue(oa.control(self.w, 'fit_xmin').hasActiveFocus())
         self.assertEqual((len(self.w.workspace.workbooks), len(self.w.workspace.comparisons)), before)
-        self.w.fit_xmin_spin.lineEdit().setText('1.0')
-        self.w.fit_xmin_spin.interpretText()
+        oa.draft(self.w, 'fit_xmin', '1.0')
+        oa.commit(self.w)
         session.fit_result = replace(result, x=result.x+.001)
         with patch.object(self.w, '_show_error') as error:
             self.w._on_create_analysis_graph()
@@ -242,26 +259,27 @@ class FitGraphCreationTests(TestCase):
         self.assertEqual((len(self.w.workspace.workbooks), len(self.w.workspace.comparisons)), before)
         session.fit_result = None
         self.w._refresh_export_actions()
-        self.assertFalse(self.w.create_analysis_graph_btn.isEnabled())
+        self.assertFalse(oa.command_enabled(self.w, 'createAnalysis'))
 
     def test_open_failure_rolls_back_new_entities_and_preserves_saved_results(self):
         self.fit()
         for saved_first in (False, True):
-            if saved_first: self.panel.save_btn.click()
+            if saved_first: analysis_command(self.panel, 'save')
+            self.w.open_xy_comparison(self.page.comparison_id)
             before = (set(self.w.workspace.workbooks), set(self.w.workspace.sheets),
                       set(self.w.workspace.comparisons))
             with patch.object(self.w, 'open_xy_comparison', side_effect=ValueError('Cannot open test graph')):
-                self.panel.create_graph_btn.click()
+                analysis_command(self.panel, 'graph')
             self.assertEqual((set(self.w.workspace.workbooks), set(self.w.workspace.sheets),
                               set(self.w.workspace.comparisons)), before)
-            self.assertIn('Cannot open test graph', self.panel.status.text())
-            self.assertTrue(self.panel.create_graph_btn.isEnabled())
+            self.assertIn('Cannot open test graph', self.panel.bridge.state['status'])
+            self.assertTrue(self.panel.bridge.state['graphEnabled'])
         graph = self.create_xy()
         self.assertEqual(len(graph.comparison.curves), 3)
 
     def test_saved_sheet_rename_and_default_roles_do_not_change_fit_graph_mapping(self):
         self.multi_fit()
-        self.panel.save_btn.click()
+        analysis_command(self.panel, 'save')
         book_id, sheet_ids = self.panel._result_ids
         sheet = self.w.workspace.sheets[sheet_ids[-1]]
         sheet.name = 'Renamed fit table'
@@ -281,12 +299,12 @@ class FitGraphCreationTests(TestCase):
         x = source.data[:, 0]
         source.data[:, 1] = 2+4*np.exp(-.5*((x+1.52)/.35)**2)-3*np.exp(-.5*((x-1.52)/.45)**2)
         expected = source.data[:, :2].copy()
-        self.analyze();self.panel.mode_combo.setCurrentText('Both')
-        self.panel.find_btn.click();wait_for_background_jobs(self.w)
+        self.analyze();choose_analysis(self.panel, 'mode', 'Both')
+        analysis_command(self.panel, 'find');wait_for_background_jobs(self.w)
         self.assertIsNone(self.panel.fit_result)
         np.testing.assert_equal(self.panel.peaks.indices, [112, 188])
-        self.assertTrue(self.panel.create_graph_btn.isEnabled(), 'Find-only results must be graphable')
-        self.panel.save_btn.click()
+        self.assertTrue(self.panel.bridge.state['graphEnabled'], 'Find-only results must be graphable')
+        analysis_command(self.panel, 'save')
         graph = self.create_xy()
         self.assertEqual([c.label for c in graph.comparison.curves.values()], ['Source data', 'Peaks', 'Dips'])
         curves = list(graph.comparison.curves.values())
@@ -318,27 +336,31 @@ class FitGraphCreationTests(TestCase):
         path.write_text('Energy(eV) 0 1\n'+'\n'.join(f'{a} {b} 2' for a,b in zip(x,y)),encoding='utf-8')
         self.w._load_dat_file_direct(path)
         session=self.w.workspace.active
+        self.w.open_graph_document(session.dataset_id)
+        oa.reveal(self.w)
         self.w._set_current_gate_from_index(0)
-        self.w.peak_mode_combo.setCurrentText('Both')
-        self.w.find_btn.click()
+        oa.set_value(self.w, 'peak_mode', 'Both')
+        oa.click(self.w, 'find')
         self.assertIsNone(self.w._active_fit_result())
         np.testing.assert_equal(self.w._current_trace_peak_indices(),[112,188])
-        self.assertTrue(self.w.create_analysis_graph_btn.isEnabled(), 'DAT Find-only results must be graphable')
-        self.w.create_analysis_graph_btn.click();APP.processEvents()
-        graph=self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        self.assertTrue(oa.command_enabled(self.w, 'createAnalysis'), 'DAT Find-only results must be graphable')
+        oa.click(self.w, 'createAnalysis');APP.processEvents()
+        graph=self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         curves=list(graph.comparison.curves.values())
         self.assertEqual([c.label for c in curves], ['Source data (applied)', 'Peaks', 'Dips'])
         sheet=self.w.workspace.sheets[curves[0].sheet_id]
         np.testing.assert_allclose(sheet.data[:,1],y)
         np.testing.assert_equal(np.flatnonzero(np.isfinite(sheet.data[:,2])),[112])
         np.testing.assert_equal(np.flatnonzero(np.isfinite(sheet.data[:,3])),[188])
+        self.w.open_graph_document(session.dataset_id)
+        oa.reveal(self.w)
         self.w._set_current_gate_from_index(1)
-        self.assertFalse(self.w.create_analysis_graph_btn.isEnabled())
-        self.w.find_btn.click();self.assertFalse(self.w.create_analysis_graph_btn.isEnabled())
+        self.assertFalse(oa.command_enabled(self.w, 'createAnalysis'))
+        oa.click(self.w, 'find');self.assertFalse(oa.command_enabled(self.w, 'createAnalysis'))
         self.w._set_current_gate_from_index(0)
         session.current_cube=replace(session.current_cube,z=session.current_cube.z+10)
-        self.w._refresh_export_actions();self.w.create_analysis_graph_btn.click()
-        changed=self.w.graph_documents.page_for(self.w.graph_documents._active_key)
+        self.w._refresh_export_actions();oa.click(self.w, 'createAnalysis')
+        changed=self.w.graph_documents.document_for(self.w.graph_documents.registry.active_key)
         self.assertNotEqual(changed.comparison_id,graph.comparison_id)
         changed_sheet=self.w.workspace.sheets[next(iter(changed.comparison.curves.values())).sheet_id]
         np.testing.assert_allclose(changed_sheet.data[:,1],y+10)
@@ -348,7 +370,7 @@ class FitGraphCreationTests(TestCase):
         session, x, first, second, result = self.dat_fixture()
         session.batch_fit_result_map[0]=result
         session.batch_fit_result_map[1]=result
-        self.w.find_btn.click()
+        oa.click(self.w, 'find')
         self.assertTrue(self.w._active_fit_result() is None, 'New detected seeds must not publish an older retained fit')
         self.assertIs(session.batch_fit_result_map[1],result)
 
@@ -357,7 +379,7 @@ class FitGraphCreationTests(TestCase):
         session.batch_peak_map={0:np.array([50,150]),1:np.array([50,150])}
         session.batch_fit_result_map={0:result,1:result}
         session.peak_indices=np.array([50,150]);session.peak_gate_idx=0
-        self.w.batch_find_btn.click();wait_for_background_jobs(self.w)
+        oa.click(self.w, 'batchFind');wait_for_background_jobs(self.w)
         np.testing.assert_equal(session.batch_peak_map[0],[50,150])
         self.assertTrue(self.w._active_fit_result() is None)
         self.assertEqual(session.batch_fit_result_map,{})

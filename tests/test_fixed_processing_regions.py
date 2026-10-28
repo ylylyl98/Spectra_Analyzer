@@ -1,43 +1,57 @@
+from tests.quick_helpers import set_processing_window
 import os
-import tempfile
 import unittest
-from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
-from PySide6.QtWidgets import QApplication
-from spectra_app.main_window import MainWindow
+from unittest.mock import patch
+from tests.quick_migration_case import QuickMigrationCase
 from spectra_app.processing import energy_second_derivative
 from tests.background_helpers import wait_jobs
-from tests.settings_helpers import isolate_settings
+from tests.dat_properties_quick_helpers import (state, setup_number, set_choice, set_flag)
 
-_APP = QApplication.instance() or QApplication([])
-
-
-class FixedProcessingRegionsTests(unittest.TestCase):
+class FixedProcessingRegionsTests(QuickMigrationCase):
     def setUp(self):
-        isolate_settings(self)
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
+        super().setUp()
         self.windows = []
-        self.addCleanup(lambda: [w.close() for w in self.windows])
 
     def window(self):
-        w = MainWindow()
-        self.windows.append(w)
-        return w
+        if not self.windows:
+            window = self.controller
+        else:
+            # Keep the first settings context alive while a distinct host reopens its profile.
+            from contextlib import nullcontext
+            from tests.quick_application_helpers import application
+            with patch('tests.quick_application_helpers.isolated_settings',
+                       lambda: nullcontext(self.folder)):
+                host, _folder, errors = self.enterContext(application())
+            self.addCleanup(lambda: self.assertFalse(errors))
+            window = host.controller
+            self.assertTrue(all(window is not previous for previous in self.windows))
+        self.windows.append(window)
+        return window
+
+    def close_window(self, window):
+        from tests.quick_application_helpers import wait_until
+        with patch.object(window, '_confirm_project_discard_async', lambda callback: callback()):
+            window.close()
+            wait_until(lambda: window._closing)
+
+    def tearDown(self):
+        self.assertFalse(self.quick_errors)
+        super().tearDown()
 
     def source(self, name, low=1, high=4, scale=1, label="Energy(eV)"):
-        path = Path(self.tmp.name) / (name + ".dat")
+        path = self.folder / (name + ".dat")
         x = np.linspace(low, high, 31)
         path.write_text(label + " 0 1\n" + "\n".join(
             f"{v:.12g} {scale * (v-2)**3:.12g} {scale * (v-2)**2:.12g}" for v in x), encoding="utf-8")
         return path
 
     def derivative(self, w):
-        w.processing_mode_combo.setCurrentIndex(1)
-        w.processing_smooth_chk.setChecked(False)
-        w.processing_window_spin.setValue(9)
+        w.processing.setMode('energy_second_derivative')
+        w.processing.setSmoothing(False)
+        set_processing_window(w.processing, 9)
         w._on_generate_heatmap()
         wait_jobs(w)
 
@@ -45,29 +59,29 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         a, b = self.source("a"), self.source("b", scale=4)
         w = self.window()
         w._load_dat_file_direct(b)
-        w.vmin_lock.setChecked(True)
-        w.vmax_lock.setChecked(True)
-        w.vmin_spin.setValue(-999)
-        w.vmax_spin.setValue(999)
+        set_flag(w, 'vmin_lock', True)
+        set_flag(w, 'vmax_lock', True)
+        setup_number(w, 'vmin', -999)
+        setup_number(w, 'vmax', 999)
         w._load_dat_file_direct(a)
         self.derivative(w)
-        w.fix_processing_chk.setChecked(True)
+        w.processing.setFixed(True)
         for path in (b, a, b):
             w._load_dat_file_direct(path)
             expected = energy_second_derivative(w._base_cube.photon_energy, w._base_cube.z,
                                                 smooth=False, window_length=9)
             np.testing.assert_allclose(w.current_cube.z, expected)
-            self.assertEqual(w.processing_window_spin.value(), 9)
-            self.assertFalse(w.vmin_lock.isChecked())
-            self.assertFalse(w.vmax_lock.isChecked())
+            self.assertEqual(w.processing.windowLength, 9)
+            self.assertFalse(w._dat_view().locks['vmin'])
+            self.assertFalse(w._dat_view().locks['vmax'])
             self.assertNotEqual(w._heat_mesh.get_clim(), (-999, 999))
-        w.close()
+        self.close_window(w)
         restored = self.window()
-        self.assertEqual(restored.processing_mode_combo.currentData(), "energy_second_derivative")
+        self.assertEqual(restored.processing.mode, "energy_second_derivative")
         restored._load_dat_file_direct(a)
-        self.assertTrue(restored.fix_processing_chk.isChecked())
+        self.assertTrue(restored.processing.fixed)
         self.assertEqual(restored._processing_mode, "energy_second_derivative")
-        restored.fix_processing_chk.setChecked(False)
+        restored.processing.setFixed(False)
         restored._load_dat_file_direct(self.source("new"))
         self.assertEqual(restored._processing_mode, "original")
 
@@ -75,19 +89,19 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         a, b = self.source("a"), self.source("b", 6, 9, 30)
         w = self.window()
         w._load_dat_file_direct(b)
-        w.vmin_lock.setChecked(True)
-        w.vmax_lock.setChecked(True)
-        w.vmin_spin.setValue(-999)
-        w.vmax_spin.setValue(999)
+        set_flag(w, 'vmin_lock', True)
+        set_flag(w, 'vmax_lock', True)
+        setup_number(w, 'vmin', -999)
+        setup_number(w, 'vmax', 999)
         w._load_dat_file_direct(a)
-        w.color_scale_combo.setCurrentIndex(2)
+        set_choice(w, 'color_scale', '3')
         original_edges = list(w._color_region_boundaries)
-        w.fix_regions_chk.setChecked(True)
-        w.fix_region_edges_chk.setChecked(True)
+        set_flag(w, 'fix_regions', True)
+        set_flag(w, 'fix_region_edges', True)
         old_ranges = [mesh.get_clim() for mesh in w._heat_meshes]
         w._load_dat_file_direct(b)
         self.assertEqual(w._color_scale_mode, "3")
-        self.assertFalse(w.vmin_lock.isChecked())
+        self.assertFalse(w._dat_view().locks['vmin'])
         self.assertTrue(all(end > start for start, end in w._region_layout()[1]))
         np.testing.assert_allclose(
             w._fixed_recipe("region_edges")["boundaries"], original_edges)
@@ -95,34 +109,34 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         self.assertEqual(w._processing_mode, "original")
         w._load_dat_file_direct(a)
         np.testing.assert_allclose(w._color_region_boundaries, original_edges)
-        w.close()
+        self.close_window(w)
         restored = self.window()
         restored._load_dat_file_direct(a)
-        self.assertTrue(restored.fix_regions_chk.isChecked())
-        self.assertTrue(restored.fix_region_edges_chk.isChecked())
+        self.assertTrue(state(restored)['fix_regions'])
+        self.assertTrue(state(restored)['fix_region_edges'])
         np.testing.assert_allclose(restored._color_region_boundaries, original_edges)
-        restored.fix_regions_chk.setChecked(False)
+        set_flag(restored, 'fix_regions', False)
         restored._load_dat_file_direct(self.source("new"))
         self.assertEqual(restored._color_scale_mode, "global")
 
     def test_fixed_live_choices_update_independently(self):
         w = self.window()
         w._load_dat_file_direct(self.source("a"))
-        w.fix_processing_chk.setChecked(True)
-        w.processing_mode_combo.setCurrentIndex(1)
-        w.processing_smooth_chk.setChecked(False)
-        w.processing_window_spin.setValue(11)
-        w.color_scale_combo.setCurrentIndex(1)
-        w.fix_regions_chk.setChecked(True)
-        w.fix_region_edges_chk.setChecked(True)
-        w.region_boundary_spins[0].setValue(2.15)
+        w.processing.setFixed(True)
+        w.processing.setMode('energy_second_derivative')
+        w.processing.setSmoothing(False)
+        set_processing_window(w.processing, 11)
+        set_choice(w, 'color_scale', '2')
+        set_flag(w, 'fix_regions', True)
+        set_flag(w, 'fix_region_edges', True)
+        setup_number(w, 'edge0', 2.15)
         edge = w._color_region_boundaries[0]
         w._load_dat_file_direct(self.source("b"))
         self.assertEqual(w._processing_mode, "energy_second_derivative")
         self.assertEqual(w._processing_window_length, 11)
         self.assertFalse(w._processing_smooth)
         self.assertAlmostEqual(w._color_region_boundaries[0], edge)
-        w.fix_processing_chk.setChecked(False)
+        w.processing.setFixed(False)
         w._load_dat_file_direct(self.source("c"))
         self.assertEqual(w._processing_mode, "original")
         self.assertEqual(w._color_scale_mode, "2")
@@ -132,8 +146,8 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         regional = self.source('regional')
         w._load_dat_file_direct(regional)
         w.open_graph_document()
-        w.color_scale_combo.setCurrentIndex(w.color_scale_combo.findData('3'))
-        w.fix_regions_chk.setChecked(False)
+        set_choice(w, 'color_scale', '3')
+        set_flag(w, 'fix_regions', False)
         saved_edges = list(w._color_region_boundaries)
         saved_limits = [mesh.get_clim() for mesh in w._heat_meshes]
         self.assertEqual(w._save_current_plot_state(), '')
@@ -141,10 +155,10 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         self.assertEqual(w._color_scale_mode, 'global')
         self.assertEqual(len(w._heat_colorbars), 1)
         self.assertEqual(w._color_region_boundaries, [])
-        w.close()
+        self.close_window(w)
         restored = self.window()
         restored._load_dat_file_direct(regional)
-        self.assertFalse(restored.fix_regions_chk.isChecked())
+        self.assertFalse(state(restored)['fix_regions'])
         self.assertEqual(restored._color_scale_mode, '3')
         self.assertEqual(len(restored._heat_colorbars), 3)
         np.testing.assert_allclose(restored._color_region_boundaries, saved_edges)
@@ -153,10 +167,10 @@ class FixedProcessingRegionsTests(unittest.TestCase):
     def test_count_fix_does_not_carry_edges(self):
         w = self.window()
         w._load_dat_file_direct(self.source("a"))
-        w.color_scale_combo.setCurrentIndex(1)
-        w.region_boundary_spins[0].setValue(1.55)
-        w.fix_regions_chk.setChecked(True)
-        self.assertFalse(w.fix_region_edges_chk.isChecked())
+        set_choice(w, 'color_scale', '2')
+        setup_number(w, 'edge0', 1.55)
+        set_flag(w, 'fix_regions', True)
+        self.assertFalse(state(w)['fix_region_edges'])
         w._load_dat_file_direct(self.source("b"))
         self.assertEqual(w._color_scale_mode, "2")
         self.assertGreater(w._color_region_boundaries[0], 2)
@@ -164,29 +178,29 @@ class FixedProcessingRegionsTests(unittest.TestCase):
     def test_edge_fix_preserves_count_and_recovers_after_count_changes(self):
         w = self.window()
         w._load_dat_file_direct(self.source("a"))
-        w.color_scale_combo.setCurrentIndex(1)
-        w.region_boundary_spins[0].setValue(1.55)
-        w.fix_region_edges_chk.setChecked(True)
+        set_choice(w, 'color_scale', '2')
+        setup_number(w, 'edge0', 1.55)
+        set_flag(w, 'fix_region_edges', True)
         edge = w._color_region_boundaries[0]
-        w.color_scale_combo.setCurrentIndex(2)
+        set_choice(w, 'color_scale', '3')
         self.assertEqual(len(w._color_region_boundaries), 2)
-        w.color_scale_combo.setCurrentIndex(1)
+        set_choice(w, 'color_scale', '2')
         self.assertAlmostEqual(w._color_region_boundaries[0], edge)
         w._load_dat_file_direct(self.source("b"))
         self.assertEqual(w._color_scale_mode, "global")
-        w.color_scale_combo.setCurrentIndex(1)
+        set_choice(w, 'color_scale', '2')
         self.assertAlmostEqual(w._color_region_boundaries[0], edge)
-        w.close()
+        self.close_window(w)
         restored = self.window()
         restored._load_dat_file_direct(self.source("c"))
         self.assertEqual(restored._color_scale_mode, "global")
-        restored.color_scale_combo.setCurrentIndex(1)
+        set_choice(restored, 'color_scale', '2')
         self.assertAlmostEqual(restored._color_region_boundaries[0], edge)
-        restored.fix_region_edges_chk.setChecked(False)
-        restored.region_boundary_spins[0].setValue(3.15)
+        set_flag(restored, 'fix_region_edges', False)
+        setup_number(restored, 'edge0', 3.15)
         self.assertAlmostEqual(restored._fixed_recipe("region_edges")["boundaries"][0], edge)
         restored._load_dat_file_direct(self.source("d"))
-        restored.color_scale_combo.setCurrentIndex(1)
+        set_choice(restored, 'color_scale', '2')
         self.assertGreater(restored._color_region_boundaries[0], 2)
 
     def test_legacy_combined_fix_migrates_edges_once(self):
@@ -198,20 +212,20 @@ class FixedProcessingRegionsTests(unittest.TestCase):
         settings.sync()
         restored = self.window()
         restored._load_dat_file_direct(self.source("a"))
-        self.assertTrue(restored.fix_region_edges_chk.isChecked())
+        self.assertTrue(state(restored)['fix_region_edges'])
         self.assertAlmostEqual(restored._color_region_boundaries[0], 1.55)
-        restored.fix_region_edges_chk.setChecked(False)
+        set_flag(restored, 'fix_region_edges', False)
         restarted = self.window()
-        self.assertFalse(restarted.fix_region_edges_chk.isChecked())
+        self.assertFalse(state(restarted)['fix_region_edges'])
 
     def test_incompatible_axis_keeps_preference_for_next_compatible_file(self):
         w = self.window()
         w._load_dat_file_direct(self.source("a"))
         self.derivative(w)
-        w.fix_processing_chk.setChecked(True)
+        w.processing.setFixed(True)
         w._load_dat_file_direct(self.source("pixels", 10, 40, label="Pixel"))
         self.assertEqual(w._processing_mode, "original")
-        self.assertEqual(w.processing_mode_combo.currentData(), "original")
-        self.assertIn("photon energy", w.statusBar().currentMessage())
+        self.assertEqual(w.processing.mode, "original")
+        self.assertIn("photon energy", w.statusText)
         w._load_dat_file_direct(self.source("b"))
         self.assertEqual(w._processing_mode, "energy_second_derivative")

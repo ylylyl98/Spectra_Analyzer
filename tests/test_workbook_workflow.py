@@ -3,29 +3,26 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import unittest
 from unittest.mock import patch
 import numpy as np
-from PySide6.QtCore import Qt, QItemSelection, QItemSelectionModel, QEvent
-from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtTest import QTest
+from PySide6.QtCore import Qt, QItemSelection, QItemSelectionModel
+from PySide6.QtGui import QGuiApplication
 from dataclasses import replace
-from spectra_app.main_window import MainWindow
-from tests.settings_helpers import isolate_settings
+from spectra_app.common_prompts import PromptAction
+from tests.quick_migration_case import QuickMigrationCase
+from tests.quick_application_helpers import pump
+from tests.formal_quick_helpers import item
 
-APP = QApplication.instance() or QApplication([])
-REAL_DISCARD = MainWindow._confirm_project_discard
+from tests.xy_helpers import set_xy_draft, xy_value, select_xy_rows
+from tests.workbook_quick_helpers import table_key
 
 
-class WorkbookWorkflowTests(unittest.TestCase):
+class WorkbookWorkflowTests(QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.window = MainWindow()
-        self.window._show_error = lambda message: self.fail(message)
-        self.addCleanup(self.dispose)
+        super().setUp()
+        self.window = self.controller
 
-    def dispose(self):
-        self.window.close()
-        self.window.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
-        APP.processEvents()
+    def tearDown(self):
+        self.assertEqual(self.quick_errors, [])
+        super().tearDown()
 
     def import_three(self):
         texts = ('signal,time\n10,1\n20,2\n30,3\n',
@@ -42,12 +39,14 @@ class WorkbookWorkflowTests(unittest.TestCase):
         paths, book = self.import_three()
         page = self.window.open_workbook(book.workbook_id)
         for index, (x, y) in enumerate(((1, 0), (1, 2), (2, 0))):
+            self.window.open_workbook(book.workbook_id, book.sheet_ids[index])
+            pump()
             sheet_page = page.sheet_pages[book.sheet_ids[index]]
-            page.tabs.setCurrentWidget(sheet_page)
-            sheet_page.x_combo.setCurrentIndex(x)
-            for row in range(sheet_page.y_list.count()):
-                sheet_page.y_list.item(row).setCheckState(Qt.Checked if row == y else Qt.Unchecked)
-            (sheet_page.new_comparison_btn if index == 0 else sheet_page.add_comparison_btn).click()
+            page.select_sheet(sheet_page.sheet_id)
+            sheet_page.set_mapping(x, [y])
+            sheet_page.request_plot('line', None if index == 0 else comparison.comparison_id)
+            if index == 0:
+                comparison = next(iter(self.window.workspace.comparisons.values()))
         comparison = next(iter(self.window.workspace.comparisons.values()))
         graph = self.window.open_xy_comparison(comparison.comparison_id)
         self.assertEqual(len(graph.axes.lines), 3)
@@ -55,21 +54,25 @@ class WorkbookWorkflowTests(unittest.TestCase):
                               ([10,20,30], [40,80], [5,15,25,35])):
             np.testing.assert_array_equal(line.get_xdata(), x)
             np.testing.assert_array_equal(line.get_ydata(), y)
+        self.window.open_workbook(book.workbook_id, book.sheet_ids[0])
+        pump()
         sheet_page = page.sheet_pages[book.sheet_ids[0]]
         model = sheet_page.model
         self.assertFalse(model.flags(model.index(0,0)) & Qt.ItemIsEditable)
         selection = QItemSelection(model.index(0,0), model.index(1,1))
-        sheet_page.table.selectionModel().select(selection, QItemSelectionModel.ClearAndSelect)
+        sheet_page.selection_model.select(selection, QItemSelectionModel.ClearAndSelect)
         sheet_page.copy_selection()
-        self.assertEqual(APP.clipboard().text(), '10\t1\n20\t2')
+        self.assertEqual(QGuiApplication.clipboard().text(), '10\t1\n20\t2')
         self.window._refresh_project_modified()
-        self.assertTrue(self.window.isWindowModified())
+        self.assertTrue(self.window.projectModified)
 
     def test_xy_only_save_without_sources_and_failed_install_restores_same_pages(self):
         paths, book = self.import_three()
         workbook_page = self.window.open_workbook(book.workbook_id)
+        self.host.show()
+        pump()
         sheet_page = workbook_page.sheet_pages[book.sheet_ids[0]]
-        sheet_page.new_comparison_btn.click()
+        sheet_page.request_plot('line')
         comparison = next(iter(self.window.workspace.comparisons.values()))
         graph = self.window.open_xy_comparison(comparison.comparison_id)
         saved = self.window.save_project(self.folder / 'tables.spectra')
@@ -78,13 +81,13 @@ class WorkbookWorkflowTests(unittest.TestCase):
         with patch.object(self.window, '_project_installed_workspace', side_effect=ValueError('injected')):
             with self.assertRaisesRegex(ValueError, 'injected'):
                 self.window.open_project(saved)
-        self.assertIs(self.window.graph_documents.page_for(('workbook', book.workbook_id, '')), workbook_page)
-        self.assertIs(self.window.graph_documents.page_for(('xy', comparison.comparison_id, '')), graph)
+        self.assertIs(self.window.graph_documents.document_for(('workbook', book.workbook_id, '')), workbook_page)
+        self.assertIs(self.window.graph_documents.document_for(('xy', comparison.comparison_id, '')), graph)
         self.assertTrue(self.window.open_project(saved))
         self.assertEqual(len(self.window.workspace.sheets), 3)
-        self.assertEqual(self.window.graph_documents._active_key, ('xy', comparison.comparison_id, ''))
+        self.assertEqual(self.window.graph_documents.registry.active_key, ('xy', comparison.comparison_id, ''))
         self.window._refresh_project_modified()
-        self.assertFalse(self.window.isWindowModified())
+        self.assertFalse(self.window.projectModified)
 
     def test_table_shortcut_is_scoped_and_copies_full_precision_rows_and_columns(self):
         paths, first = self.import_three()
@@ -92,48 +95,52 @@ class WorkbookWorkflowTests(unittest.TestCase):
         path.write_text('x,y\n1.2345678901234567,8\n2.3456789012345678,9\n', encoding='utf-8')
         second = self.window.import_xy_files([path])
         page = self.window.open_workbook(second.workbook_id).sheet_pages[second.sheet_ids[0]]
-        self.window.show()
-        self.window.graph_documents.tile_graphs()
-        APP.processEvents()
-        page.table.selectRow(0)
-        page.table.setFocus()
-        QTest.keyClick(page.table, Qt.Key_C, Qt.ControlModifier)
-        self.assertEqual(APP.clipboard().text(), '1.2345678901234567\t8')
-        page.table.clearSelection()
-        page.table.selectColumn(1)
-        QTest.keyClick(page.table, Qt.Key_C, Qt.ControlModifier)
-        self.assertEqual(APP.clipboard().text(), '8\n9')
+        self.host.show()
+        self.window.graph_documents.tile()
+        pump()
+        page.selectRow(0)
+        table_key(page, Qt.Key_C, Qt.ControlModifier)
+        self.assertEqual(QGuiApplication.clipboard().text(), '1.2345678901234567\t8')
+        page.clearSelection()
+        page.selectColumn(1)
+        table_key(page, Qt.Key_C, Qt.ControlModifier)
+        self.assertEqual(QGuiApplication.clipboard().text(), '8\n9')
         duplicate = self.window.import_xy_files([path])
         self.assertEqual(duplicate.workbook_id, second.workbook_id)
         self.assertEqual(len(self.window.workspace.workbooks), 2)
 
     def test_invalid_xy_drafts_block_save_switch_and_close_until_corrected(self):
+        self.host.show()
+        pump()
         paths, book = self.import_three()
         workbook = self.window.open_workbook(book.workbook_id)
-        workbook.sheet_pages[book.sheet_ids[0]].new_comparison_btn.click()
+        workbook.sheet_pages[book.sheet_ids[0]].request_plot('line')
         comparison = next(iter(self.window.workspace.comparisons.values()))
         page = self.window.open_xy_comparison(comparison.comparison_id)
-        page.name_edit.setText(' ')
+        set_xy_draft(page, 'name', ' ')
         with self.assertRaisesRegex(ValueError, 'nonempty'):
             self.window.save_project(self.folder / 'invalid.spectra')
         with self.assertRaisesRegex(ValueError, 'nonempty'):
             self.window.open_workbook(book.workbook_id)
         self.assertFalse(self.window.graph_documents.close_document())
         self.assertEqual(comparison.name, 'Comparison 1')
-        page.name_edit.setText('Measurements')
-        page.color_edit.setText('red')
+        set_xy_draft(page, 'name', 'Measurements')
+        set_xy_draft(page, 'color', 'red')
         with self.assertRaisesRegex(ValueError, 'six-digit'):
             self.window.save_project(self.folder / 'invalid.spectra')
         self.window._refresh_project_modified()
-        self.assertTrue(self.window.isWindowModified())
-        page.color_edit.setText('#123456')
+        self.assertTrue(self.window.projectModified)
+        set_xy_draft(page, 'color', '#123456')
         self.window.save_project(self.folder / 'valid.spectra')
         self.assertEqual(comparison.name, 'Measurements')
         self.assertEqual(next(iter(comparison.curves.values())).color, '#123456')
         self.window._refresh_comparison_targets()
-        self.assertEqual(workbook.sheet_pages[book.sheet_ids[0]].target_combo.currentText(), 'Measurements')
+        self.window.workbook_commands.bind(workbook.sheet_pages[book.sheet_ids[0]])
+        self.assertEqual(self.window.workbook_commands.targetLabel, 'Measurements')
 
     def test_outer_analysis_transition_rejects_invalid_xy_then_processing_preserves_edit(self):
+        self.host.show()
+        pump()
         from tests.background_helpers import wait_jobs
         w = self.window
         path = self.folder / 'science.dat'
@@ -141,29 +148,35 @@ class WorkbookWorkflowTests(unittest.TestCase):
         w._load_dat_file_direct(path)
         book = next(iter(w.workspace.workbooks.values()))
         workbook = w.open_workbook(book.workbook_id)
-        workbook.sheet_pages[book.sheet_ids[0]].new_comparison_btn.click()
+        workbook.sheet_pages[book.sheet_ids[0]].request_plot('line')
         comparison = next(iter(w.workspace.comparisons.values()))
         page = w.open_xy_comparison(comparison.comparison_id)
-        page.color_edit.setText('red')
-        page.color_edit.editingFinished.emit()
-        w.plot_tabs.setCurrentIndex(0)
-        self.assertIs(w.plot_tabs.currentWidget(), w.graph_documents)
-        self.assertEqual(page.color_edit.text(), 'red')
-        page.color_edit.setText('#567890')
-        page.label_edit.setText('Committed before processing')
-        w.plot_tabs.setCurrentIndex(0)
-        self.assertEqual(w.plot_tabs.currentIndex(), 0)
-        w.processing_mode_combo.setCurrentIndex(w.processing_mode_combo.findData('energy_second_derivative'))
+        set_xy_draft(page, 'color', 'red')
+        page.inspector_bridge.commitField('color')
+        self.assertFalse(w.request_outer_view('analysis'))
+        self.assertEqual(w.outerView, 'workspace')
+        self.assertEqual(w.graph_documents.registry.active_key, ('xy', comparison.comparison_id, ''))
+        self.assertEqual(xy_value(page, 'color'), 'red')
+        set_xy_draft(page, 'color', '#567890')
+        set_xy_draft(page, 'label', 'Committed before processing')
+        self.assertTrue(w.request_outer_view('analysis'))
+        self.assertEqual(w.outerView, 'analysis')
+        w.processing.setMode('energy_second_derivative')
         w._on_generate_heatmap()
         wait_jobs(w)
         self.assertEqual(w.workspace.active.applied.mode, 'energy_second_derivative')
         curve = next(iter(comparison.curves.values()))
         self.assertEqual((curve.label, curve.color), ('Committed before processing', '#567890'))
+        # Return to the real XY scene before starting another user edit.
+        w.open_xy_comparison(comparison.comparison_id)
+        pump()
         # External source refresh also must not overwrite a pending editor.
-        page.color_edit.setText('invalid')
+        set_xy_draft(page, 'color', 'invalid')
         w._load_dat_file_direct(path)
-        self.assertEqual(page.color_edit.text(), 'invalid')
-        page.color_edit.setText('#567890')
+        self.assertEqual(xy_value(page, 'color'), 'invalid')
+        w.open_xy_comparison(comparison.comparison_id)
+        pump()
+        set_xy_draft(page, 'color', '#567890')
 
     def test_dat_gate_link_live_processing_and_visible_document_routing(self):
         w = self.window
@@ -184,15 +197,17 @@ class WorkbookWorkflowTests(unittest.TestCase):
         page = workbook.sheet_pages[sheet.sheet_id]
         np.testing.assert_array_equal(page.model.values[0], first.base_cube.energy)
         np.testing.assert_array_equal(page.model.values[2], first.base_cube.z[1])
-        page.table.setCurrentIndex(page.model.index(0, 2))
+        page.setCurrentCell(0, 2)
         self.assertEqual(w.workspace.active_dataset_id, first.dataset_id)
         self.assertEqual(w._current_gate_index(), 1)
-        self.assertEqual(w.graph_documents._active_key, ('workbook', book.workbook_id, ''))
-        self.assertFalse(w.graph_command_host.isVisible())
-        w.plot_tabs.setCurrentIndex(0)
-        w.plot_tabs.setCurrentWidget(w.graph_documents)
-        self.assertEqual(w.graph_documents._active_key, ('workbook', book.workbook_id, ''))
-        page.new_comparison_btn.click()
+        self.assertEqual(w.graph_documents.registry.active_key, ('workbook', book.workbook_id, ''))
+        self.assertEqual(w.contextKind, 'workbook')
+        self.assertIs(w.commandController, workbook)
+        self.assertFalse(item(w, 'applicationDatCanvas').isVisible())
+        self.assertTrue(w.request_outer_view('analysis'))
+        self.assertTrue(w.request_outer_view('workspace'))
+        self.assertEqual(w.graph_documents.registry.active_key, ('workbook', book.workbook_id, ''))
+        page.request_plot('line')
         comparison = next(iter(w.workspace.comparisons.values()))
         w.open_workbook(book.workbook_id)
         from spectra_app.workbook_state import ensure_dataset_sheet
@@ -200,49 +215,51 @@ class WorkbookWorkflowTests(unittest.TestCase):
         processed.y_columns = [1]
         w._refresh_auxiliary_documents()
         page = w.open_workbook(book.workbook_id, processed.sheet_id).sheet_pages[processed.sheet_id]
-        page.add_comparison_btn.click()
+        page.request_plot('line', comparison.comparison_id)
         xy = w.open_xy_comparison(comparison.comparison_id)
         raw = first.base_cube.z[0].copy()
         w._replace_current_data(replace(first.current_cube, z=first.current_cube.z * 3),
                                 mode='energy_second_derivative', smooth=False, window_length=5)
         np.testing.assert_array_equal(xy.axes.lines[0].get_ydata(), raw)
         np.testing.assert_array_equal(xy.axes.lines[1].get_ydata(), raw * 3)
+        self.assertIsNotNone(first.active_graph.result_id)
+        self.assertEqual(w.graph_documents.registry.active_key, (first.dataset_id, first.active_graph_id))
+        w.open_xy_comparison(comparison.comparison_id)
         w._set_current_gate_from_index(2)
         self.assertEqual(page.model.gate_column, 3)
-        self.assertEqual(w.graph_documents._active_key, ('xy', comparison.comparison_id, ''))
+        self.assertEqual(w.graph_documents.registry.active_key, ('xy', comparison.comparison_id, ''))
         self.assertFalse(w._graph_command_actions['undo'].isEnabled())
         w.open_workbook(book.workbook_id)
         with self.assertRaisesRegex(ValueError, 'table cells'):
             w.copy_graph_svg()
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Yes):
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.YES):
             w.remove_dataset(first.dataset_id)
         self.assertEqual(len(comparison.curves), 0)
         self.assertNotIn(sheet.sheet_id, w.workspace.sheets)
-        self.assertIsNone(w.graph_documents.page_for(('workbook', book.workbook_id, '')))
+        self.assertIsNone(w.graph_documents.document_for(('workbook', book.workbook_id, '')))
 
     def test_navigator_rename_remove_and_curve_selection_preserve_invalid_drafts(self):
         paths, book = self.import_three()
         workbook = self.window.open_workbook(book.workbook_id)
-        workbook.sheet_pages[book.sheet_ids[0]].new_comparison_btn.click()
+        workbook.sheet_pages[book.sheet_ids[0]].request_plot('line')
         comparison = next(iter(self.window.workspace.comparisons.values()))
         self.window._add_sheet_comparison(book.sheet_ids[1], comparison.comparison_id)
         page = self.window.open_xy_comparison(comparison.comparison_id)
-        page.color_edit.setText('red')
-        page.color_edit.editingFinished.emit()
-        self.window.data_navigator.setCurrentItem(self.window.data_navigator.topLevelItem(0))
+        set_xy_draft(page, 'color', 'red')
+        page.inspector_bridge.commitField('color')
+        self.window.project.select_key(('workbook', book.workbook_id))
         errors = []
-        self.window._show_error = errors.append
-        with patch('spectra_app.main_window.QInputDialog.getText', return_value=('Renamed', True)):
+        with patch.object(self.window, '_show_error', errors.append), patch('spectra_app.main_window.prompt_text', return_value=('Renamed', True)):
             self.window._rename_navigator_item()
-        self.assertEqual(page.color_edit.text(), 'red')
+        self.assertEqual(xy_value(page, 'color'), 'red')
         self.assertNotEqual(book.name, 'Renamed')
         self.assertTrue(errors)
-        page.curve_list.setCurrentRow(1)
-        self.assertEqual(page.curve_list.currentRow(), 0)
-        self.assertEqual(page.color_edit.text(), 'red')
-        page.color_edit.setText('#123456')
-        page.label_edit.setText('First only')
-        page.curve_list.setCurrentRow(1)
+        select_xy_rows(page, [1])
+        self.assertEqual(list(page.comparison.curves).index(page._active_curve_id), 0)
+        self.assertEqual(xy_value(page, 'color'), 'red')
+        set_xy_draft(page, 'color', '#123456')
+        set_xy_draft(page, 'label', 'First only')
+        select_xy_rows(page, [1])
         curves = list(comparison.curves.values())
         self.assertEqual((curves[0].label, curves[0].color), ('First only', '#123456'))
         self.assertNotEqual(curves[1].label, 'First only')
@@ -254,12 +271,12 @@ class WorkbookWorkflowTests(unittest.TestCase):
         w._load_dat_file_direct(path)
         book = next(iter(w.workspace.workbooks.values()))
         workbook = w.open_workbook(book.workbook_id)
-        workbook.sheet_pages[book.sheet_ids[0]].new_comparison_btn.click()
-        item = next(item for item in w._navigator_items() if item.data(0, Qt.UserRole)[0] == 'xy')
-        w.data_navigator.setCurrentItem(item)
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Yes):
+        workbook.sheet_pages[book.sheet_ids[0]].request_plot('line')
+        row = next(row for row in w.project.all_rows() if row.key[0] == 'xy')
+        w.project.select_key(row.key)
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.YES):
             w._remove_navigator_item()
-        self.assertEqual(w.graph_documents._active_key, ('workbook', book.workbook_id, ''))
+        self.assertEqual(w.graph_documents.registry.active_key, ('workbook', book.workbook_id, ''))
         self.assertFalse(w._graph_command_actions['copy_graph'].isEnabled())
         with patch.object(w, '_capture_formal_source', side_effect=AssertionError('hidden DAT')):
             with self.assertRaises(ValueError):
@@ -276,7 +293,7 @@ class WorkbookWorkflowTests(unittest.TestCase):
         paths, xy_book = self.import_three()
         xy_book.name = 'Retained numeric tables'
         workbook = w.open_workbook(xy_book.workbook_id)
-        workbook.sheet_pages[xy_book.sheet_ids[0]].new_comparison_btn.click()
+        workbook.sheet_pages[xy_book.sheet_ids[0]].request_plot('line')
         comparison = next(iter(w.workspace.comparisons.values()))
         dat_key = ('workbook', dat_book.workbook_id, '')
         self.assertTrue(w.graph_documents.close_document(dat_key))
@@ -284,25 +301,26 @@ class WorkbookWorkflowTests(unittest.TestCase):
         for path in [dat, *paths]:
             path.unlink()
         self.assertTrue(w.open_project(saved))
-        self.assertIsNone(w.graph_documents.window_for(dat_key))
-        self.assertEqual(w.graph_documents._active_key, ('xy', comparison.comparison_id, ''))
+        self.assertNotIn(dat_key, w.graph_documents.registry.open_keys())
+        self.assertIsNone(w.graph_documents.content_item(dat_key))
+        self.assertEqual(w.graph_documents.registry.active_key, ('xy', comparison.comparison_id, ''))
         self.assertEqual(w.workspace.workbooks[xy_book.workbook_id].name, 'Retained numeric tables')
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Yes):
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.YES):
             w.remove_dataset(session.dataset_id)
         self.assertEqual(len(w.workspace.datasets), 0)
-        self.assertIsNotNone(w.graph_documents.page_for(('xy', comparison.comparison_id, '')))
+        self.assertIsNotNone(w.graph_documents.document_for(('xy', comparison.comparison_id, '')))
         self.assertEqual(len(w.workspace.comparisons[comparison.comparison_id].curves), 1)
-        for key in tuple(w.graph_documents.visible_keys()):
+        for key in tuple(w.graph_documents.registry.open_keys()):
             w.graph_documents.close_document(key)
         closed = w.save_project(self.folder / 'all-closed.spectra')
         self.assertTrue(w.open_project(closed))
-        w.plot_tabs.setCurrentWidget(w.graph_documents)
-        self.assertEqual(w.graph_documents.subWindowList(), [])
+        self.assertTrue(w.request_outer_view('workspace'))
+        self.assertEqual(w.graph_documents.registry.open_keys(), ())
         self.assertFalse(w._graph_command_actions['copy_graph'].isEnabled())
         self.assertEqual(len(w.workspace.sheets), 3)
 
     def test_unsaved_xy_only_workspace_runs_real_discard_guard(self):
         self.import_three()
-        with patch('spectra_app.main_window.QMessageBox.warning', return_value=QMessageBox.Cancel) as warning:
-            self.assertFalse(REAL_DISCARD(self.window))
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.CANCEL) as warning:
+            self.assertFalse(self.window._confirm_project_discard())
         warning.assert_called_once()

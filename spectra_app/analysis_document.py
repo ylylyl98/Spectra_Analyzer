@@ -284,12 +284,13 @@ def _next_name(session, prefix):
 
 def _bound_science(session, source, mode):
     from .dataset_state import DatasetSession, GraphState, ProcessingState
-    cube = session.base_cube if mode == 'raw' else session.current_cube
+    result = session.processing_results.get(source.result_id)
+    cube = session.base_cube if mode == 'raw' else result.cube if result is not None else session.current_cube
     if cube is None:
         raise ValueError('Load a source before creating an Analysis Graph.')
     cube = deepcopy(cube)
     graph = GraphState(name='Bound analysis input', view=deepcopy(source.view), presentation=deepcopy(source.presentation))
-    applied = deepcopy(session.applied) if mode == 'processed' else ProcessingState()
+    applied = deepcopy(result.processing if result is not None else session.applied) if mode == 'processed' else ProcessingState()
     return DatasetSession(source_path=session.source_path, loaded_fingerprint=session.loaded_fingerprint,
         base_cube=cube, current_cube=cube, graphs={'default': graph},
         applied=applied, pending=deepcopy(applied), analysis_controls=deepcopy(session.analysis_controls),
@@ -354,9 +355,10 @@ def analysis_input_changed(session, graph=None, *, source_mode=None, gate_indice
     doc = graph.analysis
     mode = doc.source_mode if source_mode is None else source_mode
     selected = graph.gate_indices if gate_indices is _KEEP_GATES else gate_indices
-    cube = session.base_cube if mode == 'raw' else session.current_cube
+    result = session.processing_results.get(source.result_id)
+    cube = session.base_cube if mode == 'raw' else result.cube if result is not None else session.current_cube
     validate_graph_source(mode, selected, cube.gate.size)
-    applied = ProcessingState() if mode == 'raw' else session.applied
+    applied = ProcessingState() if mode == 'raw' else result.processing if result is not None else session.applied
     if (mode != doc.source_mode or selected != graph.gate_indices
             or applied.recipe() != doc.science.applied.recipe()
             or session.loaded_fingerprint != doc.science.loaded_fingerprint):

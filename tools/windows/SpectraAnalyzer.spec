@@ -20,6 +20,10 @@ data = [(str(icon), "spectra_app/resources"),
         (str(root / "tools/windows/licenses/LGPL-3.0.txt"), "licenses"),
         (str(root / "tools/windows/licenses/GPL-3.0.txt"), "licenses"),
         (str(Path(sys.base_prefix) / "LICENSE.txt"), "licenses/python")]
+# Local QML imports and their assets need the same relative layout when frozen.
+for resource in sorted((root / "spectra_app/qml").rglob("*")):
+    if resource.is_file():
+        data.append((str(resource), resource.parent.relative_to(root).as_posix()))
 runtime_distributions = ["contourpy", "cycler", "fonttools", "kiwisolver",
                          "matplotlib", "numpy", "packaging", "pillow",
                          "pyparsing", "PySide6", "PySide6_Addons",
@@ -36,7 +40,8 @@ analysis = Analysis(
     hookspath=[],
     hooksconfig={"matplotlib": {"backends": ["QtAgg", "Agg", "svg", "pdf"]}},
     runtime_hooks=[],
-    excludes=["tkinter", "PyQt5", "PyQt6", "PySide2"],
+    # Prevent PyInstaller's automatic append from invalidating Analysis every run.
+    excludes=["tkinter", "PyQt5", "PyQt6", "PySide2", "__main__"],
     noarchive=False,
 )
 pyz = PYZ(analysis.pure)

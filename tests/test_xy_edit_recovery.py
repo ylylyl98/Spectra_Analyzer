@@ -7,35 +7,53 @@ import unittest
 from copy import deepcopy
 
 import numpy as np
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+
 
 from spectra_app.dataset_state import Workspace
 from spectra_app.project_io import workspace_digest, write_project, read_project
 from spectra_app.workbook_state import create_workbook, register_xy_sheet, create_comparison, add_curve, remove_sheet
-from spectra_app.xy_plot_page import XYPlotPage
+from spectra_app.xy_plot_controller import XYPlotController
+from tests.quick_migration_case import QuickMigrationCase
+from tests import test_xy_analysis_workflow as workflow_fixture
+from tests import formal_quick_helpers as formal
 
-APP = QApplication.instance() or QApplication([])
+from tests.xy_helpers import set_xy_draft, xy_value, select_xy_rows, xy_field
+from tests.xy_canvas_quick_helpers import command as canvas_command, key as canvas_key
+from tests.xy_analysis_quick_helpers import analysis_command
+
+APP = QCoreApplication
+
+def quick_curve_list(page):
+    from tests.xy_helpers import inspector_host
+    return formal.ensure_visible(formal.item(inspector_host(page), 'xyCurveList'))
 
 
-class XYEditRecoveryTests(unittest.TestCase):
+def inspector_key(page, key):
+    QTest.keyClick(page.parent().root_window, key)
+    formal.pump()
+
+
+class XYEditRecoveryTests(QuickMigrationCase):
     def setUp(self):
-        self.workspace = Workspace()
+        QuickMigrationCase.setUp(self)
+        self.workspace = self.controller.workspace
         book = create_workbook(self.workspace)
         self.sheet = register_xy_sheet(self.workspace, book.workbook_id, 'Source',
             np.column_stack((np.arange(10.), np.arange(10.) ** 2)), ['X', 'Y'])
         self.graph = create_comparison(self.workspace)
         self.curves = [add_curve(self.workspace, self.graph.comparison_id, self.sheet.sheet_id, 0, 1,
                                  label=f'Curve {i}') for i in range(3)]
-        self.page = XYPlotPage(self.workspace, self.graph.comparison_id)
+        self.page = self.controller.open_xy_comparison(self.graph.comparison_id)
+        select_xy_rows(self.page, [0])
         self.addCleanup(self.dispose)
+        self.host.window.resize(1000, 720)
+        self.host.show()
+        APP.processEvents()
 
     def dispose(self):
-        self.page.close()
-        self.page.dispose()
-        self.page.deleteLater()
-        APP.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(self.quick_errors, [])
 
     def test_bulk_style_reorder_remove_undo_redo_keep_identity_and_source(self):
         page, graph = self.page, self.graph
@@ -66,12 +84,12 @@ class XYEditRecoveryTests(unittest.TestCase):
 
     def test_graph_curve_display_reset_and_reopen_history(self):
         page = self.page
-        page.plot_title_edit.setText('A title')
-        page.plot_title_edit.editingFinished.emit()
-        page.color_edit.setText('#123456')
-        page.color_edit.editingFinished.emit()
-        page.stack_step_edit.setText('3')
-        page.stack_step_edit.editingFinished.emit()
+        set_xy_draft(page, 'plot_title', 'A title')
+        page.inspector_bridge.commitField('plot_title')
+        set_xy_draft(page, 'color', '#123456')
+        page.inspector_bridge.commitField('color')
+        set_xy_draft(page, 'stack_step', '3')
+        page.inspector_bridge.commitField('stack_step')
         page._reset_display()
         self.assertEqual(self.graph.stack_step, 0.)
         self.assertTrue(page.undo())
@@ -80,7 +98,7 @@ class XYEditRecoveryTests(unittest.TestCase):
         self.assertEqual(self.graph.stack_step, 0.)
         self.assertTrue(page.undo())
         self.assertEqual(self.curves[0].color, '#1f77b4')
-        other = XYPlotPage(self.workspace, self.graph.comparison_id)
+        other = XYPlotController(self.workspace, self.graph.comparison_id)
         try:
             self.assertTrue(other.can_undo())
             self.assertTrue(other.undo())
@@ -96,27 +114,27 @@ class XYEditRecoveryTests(unittest.TestCase):
 
     def test_invalid_color_escape_and_visible_revert_restore_committed_values(self):
         page = self.page
-        page.resize(1000, 700); page.show(); APP.processEvents()
+        self.host.window.resize(1000, 700); self.host.show(); APP.processEvents()
         before = workspace_digest(self.workspace)
-        page.color_edit.setFocus()
-        page.color_edit.setText('invalid color')
-        page.name_edit.setText('unfinished name')
-        page.color_edit.editingFinished.emit()
-        self.assertIn('color', page.status.text().lower())
+        xy_field(page, 'color')[1].forceActiveFocus()
+        set_xy_draft(page, 'color', 'invalid color')
+        set_xy_draft(page, 'name', 'unfinished name')
+        page.inspector_bridge.commitField('color')
+        self.assertIn('color', page.inspector_bridge.message.lower())
         with self.assertRaises(ValueError):
             page.finish_editor()
-        page.curve_list.setCurrentRow(1)
-        self.assertEqual(page.curve_list.currentRow(), 0)
-        QTest.keyClick(page.color_edit, Qt.Key_Escape)
-        self.assertEqual(page.color_edit.text(), self.curves[0].color)
-        self.assertEqual(page.name_edit.text(), self.graph.name)
+        select_xy_rows(page, [1])
+        self.assertEqual(list(page.comparison.curves).index(page._active_curve_id), 0)
+        inspector_key(page, Qt.Key_Escape)
+        self.assertEqual(xy_value(page, 'color'), self.curves[0].color)
+        self.assertEqual(xy_value(page, 'name'), self.graph.name)
         self.assertFalse(page.has_pending_project_edits())
         self.assertEqual(workspace_digest(self.workspace), before)
         self.assertFalse(page.can_undo())
-        page.curve_list.setCurrentRow(1)
-        self.assertEqual(page.curve_list.currentRow(), 1)
-        page.y_offset_edit.setText('nan')
-        page.revert_edits_btn.click()
+        select_xy_rows(page, [1])
+        self.assertEqual(list(page.comparison.curves).index(page._active_curve_id), 1)
+        set_xy_draft(page, 'y_offset', 'nan')
+        page.inspector_bridge.revert()
         self.assertFalse(page.has_pending_project_edits())
         self.assertEqual(workspace_digest(self.workspace), before)
 
@@ -138,42 +156,42 @@ class XYEditRecoveryTests(unittest.TestCase):
 
     def test_visible_revert_cancels_valid_focus_draft_without_committing_it(self):
         page = self.page
-        page.resize(1000, 700); page.show(); APP.processEvents()
+        self.host.window.resize(1000, 700); self.host.show(); APP.processEvents()
         before = workspace_digest(self.workspace)
-        page.label_edit.setFocus()
-        page.label_edit.setText('Pending valid label')
-        QTest.mouseClick(page.revert_edits_btn, Qt.LeftButton)
-        self.assertEqual(page.label_edit.text(), self.curves[0].label)
+        xy_field(page, 'label')[1].forceActiveFocus()
+        set_xy_draft(page, 'label', 'Pending valid label')
+        formal.click_item(self.controller, 'xyRevertEdits')
+        self.assertEqual(xy_value(page, 'label'), self.curves[0].label)
         self.assertEqual(workspace_digest(self.workspace), before)
         self.assertFalse(page.can_undo())
 
     def test_delete_keys_remove_only_with_valid_drafts_and_editor_delete_is_text(self):
         page = self.page
-        page.resize(1000, 700); page.show(); APP.processEvents()
+        self.host.window.resize(1000, 700); self.host.show(); APP.processEvents()
         curve_id = self.curves[0].curve_id
-        page.color_edit.setText('invalid')
-        QTest.keyClick(page.curve_list, Qt.Key_Delete)
-        QTest.keyClick(page.canvas, Qt.Key_Delete)
+        set_xy_draft(page, 'color', 'invalid')
+        quick_curve_list(page).forceActiveFocus(); inspector_key(page, Qt.Key_Delete)
+        canvas_key(page, Qt.Key_Delete)
         self.assertIn(curve_id, self.graph.curves)
-        QTest.keyClick(page.color_edit, Qt.Key_Escape)
-        page.label_edit.setFocus(); page.label_edit.selectAll()
-        QTest.keyClick(page.label_edit, Qt.Key_Delete)
-        self.assertEqual(page.label_edit.text(), '')
+        xy_field(page, 'color')[1].forceActiveFocus()
+        inspector_key(page, Qt.Key_Escape)
+        xy_field(page, 'label')[1].forceActiveFocus(); xy_field(page, 'label')[1].selectAll()
+        inspector_key(page, Qt.Key_Delete)
+        self.assertEqual(xy_value(page, 'label'), '')
         self.assertIn(curve_id, self.graph.curves)
         page.revert_editor()
-        QTest.keyClick(page.canvas, Qt.Key_Delete)
+        canvas_key(page, Qt.Key_Delete)
         self.assertNotIn(curve_id, self.graph.curves)
         self.assertTrue(page.undo())
-        QTest.keyClick(page.curve_list, Qt.Key_Delete)
+        quick_curve_list(page).forceActiveFocus(); inspector_key(page, Qt.Key_Delete)
         self.assertNotIn(curve_id, self.graph.curves)
 
 
-class XYAnalysisRecoveryTests(unittest.TestCase):
-    from tests.test_xy_analysis_workflow import XYAnalysisWorkflowTests as _fixture
-    setUp = _fixture.setUp
-    dispose = _fixture.dispose
-    fit = _fixture.fit
-    analyze = _fixture.analyze
+class XYAnalysisRecoveryTests(QuickMigrationCase):
+    setUp = workflow_fixture.XYAnalysisWorkflowTests.setUp
+    dispose = workflow_fixture.XYAnalysisWorkflowTests.dispose
+    fit = workflow_fixture.XYAnalysisWorkflowTests.fit
+    analyze = workflow_fixture.XYAnalysisWorkflowTests.analyze
 
     def test_remove_undo_retains_fit_by_reference_and_rechecks_source_before_restore(self):
         self.fit()
@@ -211,7 +229,7 @@ class XYAnalysisRecoveryTests(unittest.TestCase):
         with patch('spectra_app.xy_analysis.prepare_comparison', side_effect=record):
             page._apply_batch_style({curve_id}, 'color', '#abcdef')
             self.assertTrue(page.undo())
-            page.width_spin.setValue(4.)
+            set_xy_draft(page, 'width', 4., commit=True)
         self.assertEqual(len(prepared), 0, '\n'.join(prepared))
         self.assertIs(self.panel.fit_result, fit)
         self.assertIs(next(line for line in page.axes.lines if line.get_gid() == 'xy-analysis-fit'), overlay)
@@ -221,9 +239,9 @@ class XYAnalysisRecoveryTests(unittest.TestCase):
         self.fit()
         removed_id = self.panel.captured.curve_id
         self.page._remove_selected()
-        self.page.analyze_btn.click()
-        self.panel.find_btn.click(); wait_for_background_jobs(self.w)
-        self.panel.fit_btn.click(); wait_for_background_jobs(self.w)
+        canvas_command(self.page, 'analyze')
+        analysis_command(self.panel, 'find'); wait_for_background_jobs(self.w)
+        analysis_command(self.panel, 'fit'); wait_for_background_jobs(self.w)
         newer_fit = self.panel.fit_result
         newer_input = self.panel.captured
         newer_payload = self.page.comparison.analysis_state

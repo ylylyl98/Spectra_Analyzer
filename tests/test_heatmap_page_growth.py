@@ -1,4 +1,5 @@
 """Measured page growth must retain physical frames and graph ownership."""
+from tests import dat_properties_quick_helpers as dat
 import json
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -10,22 +11,40 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image
-from PySide6.QtWidgets import QApplication
 
 from spectra_app import svg_export
-from spectra_app.main_window import MainWindow
+from spectra_app.common_prompts import PromptAction
+from tests import quick_migration_case as migration
+from tests.quick_application_helpers import application, pump, wait_until
+from tests.formal_quick_helpers import edit_field
 from spectra_app.plot_presentation import AxisPresentation, ColorRegion, HeatmapSnapshot, PlotPresentation
 from spectra_app.plot_state import active_plot_recipe
-from tests.settings_helpers import isolate_settings
 
-APP = QApplication.instance() or QApplication([])
-
-
-class HeatmapPageGrowthTests(unittest.TestCase):
+class HeatmapPageGrowthTests(migration.QuickMigrationCase):
     def setUp(self):
-        self.folder = isolate_settings(self).parent
-        self.w = MainWindow()
-        self.addCleanup(self.w.close)
+        super().setUp()
+        self.w = self.controller
+        self.window_errors = [self.quick_errors]
+
+    def tearDown(self):
+        for errors in self.window_errors:
+            self.assertEqual(errors, [], 'Unexpected production Quick error')
+
+    def restart(self):
+        with patch('spectra_app.main_window.prompt_message', return_value=PromptAction.DISCARD):
+            self.w.close()
+            wait_until(lambda: self.w._closing)
+        self.assertFalse(self.w.root_window.isVisible())
+        host, folder, errors = self.enterContext(application())
+        self.window_errors.append(errors)
+        self.w = host.controller
+
+    def inject_draft(self, target, field, text):
+        # Arrange already-pending state for stale-result tests. Native inactive
+        # and busy editor input is rejected by production ownership guards.
+        target.formal._drafts[field] = text
+        target.formal.draftChanged.emit()
+        target.formal.sync()
 
     def load(self, name, extent):
         path = self.folder / (name + '.dat')
@@ -37,8 +56,8 @@ class HeatmapPageGrowthTests(unittest.TestCase):
 
     def render(self, key=None):
         self.w._render_plot_page(key)
-        target = self.w.graph_documents.page_for(key) if key else self.w.plot_page
-        self.assertIsNotNone(target.rendered_page, target.status_label.text())
+        target = self.w.graph_documents.document_for(key) if key else self.w.plot_page
+        self.assertIsNotNone(target.rendered_page, target.status_text)
         return target.rendered_page
 
     def test_fresh_dat_wide_and_scientific_gate_labels_expand_only_paper(self):
@@ -63,8 +82,8 @@ class HeatmapPageGrowthTests(unittest.TestCase):
                 self.assertEqual(self.w.plot_page.presentation, resolved)
                 self.assertEqual(self.w.plot_page.preview.presentation, resolved)
                 self.assertEqual(page.owner_token, self.w._plot_owner_token())
-                self.assertIn('actual', self.w.plot_page.dimensions_label.text())
-                self.assertAlmostEqual(self.w.plot_page.width_spin.value(), resolved.width_in, delta=.00051)
+                self.assertIn('actual', self.w.plot_page.dimensions_text)
+                self.assertAlmostEqual(float(self.w.plot_page.formal.state['fields']['width_in']), resolved.width_in, delta=.00051)
                 np.testing.assert_array_equal(session.current_cube.z, data)
                 self.assertEqual((session.view.x_limits, session.view.y_limits), limits)
                 root = ET.fromstring(page.svg_bytes)
@@ -85,9 +104,7 @@ class HeatmapPageGrowthTests(unittest.TestCase):
             self.assertEqual(json.loads(image.info['SpectraAnalyzer'])['presentation'], resolved.to_dict())
         sidecar = json.loads(self.w._plot_state_store.path_for(path).read_text(encoding='utf-8'))
         self.assertEqual(active_plot_recipe(sidecar['plot'])['presentation'], resolved.to_dict())
-        self.w.close()
-        self.w = MainWindow()
-        self.addCleanup(self.w.close)
+        self.restart()
         self.w._load_dat_file_direct(path)
         self.assertEqual(self.w.workspace.active.presentation, resolved)
         self.assertEqual(self.render().figure_size_in, page.figure_size_in)
@@ -111,12 +128,12 @@ class HeatmapPageGrowthTests(unittest.TestCase):
         _, session = self.load('draft', 1000)
         target = self.w.plot_page
         original = session.presentation
-        target.width_spin.lineEdit().setText('-')
+        edit_field(self.w, 'width_in', '-')
         self.w._render_plot_page()
-        self.assertEqual(target.width_spin.lineEdit().text(), '-')
+        self.assertEqual(target.formal.state['fields']['width_in'], '-')
         self.assertEqual(session.presentation, original)
         self.assertIsNone(target.rendered_page)
-        self.assertFalse(target.export_svg_btn.isEnabled())
+        self.assertFalse(target.command_enabled('export_svg'))
 
     def test_batch_growth_updates_frozen_job_metadata_and_saved_owner(self):
         path, session = self.load('batch', 100000)
@@ -142,11 +159,14 @@ class HeatmapPageGrowthTests(unittest.TestCase):
         self.w._plot_batch_timer.stop()
         newer = replace(session.presentation, numeric_pt=11.)
         self.w.set_plot_presentation(newer)
-        self.w.plot_page.width_spin.lineEdit().setText('-')
+        # Inject a newer draft after job capture to exercise stale-result safety.
+        # Actual busy UI edits remain rejected by the normal mutation guard.
+        self.inject_draft(self.w.plot_page, 'width_in', '-')
+        self.assertEqual(self.w.plot_page.formal.state['fields']['width_in'], '-')
         self.w._step_plot_batch()
         self.assertTrue(self.w.plot_batch_summary.success, self.w.plot_batch_report)
         self.assertEqual(session.presentation, newer)
-        self.assertEqual(self.w.plot_page.width_spin.lineEdit().text(), '-')
+        self.assertEqual(self.w.plot_page.formal.state['fields']['width_in'], '-')
         self.assertIsNone(self.w.plot_page.rendered_page)
         job = self.w._plot_batch._jobs[0]
         self.assertEqual(job.presentation.numeric_pt, 10.)
@@ -160,9 +180,9 @@ class HeatmapPageGrowthTests(unittest.TestCase):
         target = self.w.plot_page
         _, active = self.load('other-owner', 1)
         original = first.presentation
-        target.width_spin.lineEdit().setText('-')
+        self.inject_draft(target, 'width_in', '-')
         self.w._render_plot_page(key)
-        self.assertEqual(target.width_spin.lineEdit().text(), '-')
+        self.assertEqual(target.formal.state['fields']['width_in'], '-')
         self.assertEqual(first.presentation, original)
         self.assertIsNone(target.rendered_page)
         self.w.start_plot_batch(graph_targets=[key], formats=('svg',), common_folder=self.folder)
@@ -186,7 +206,7 @@ class HeatmapPageGrowthTests(unittest.TestCase):
 
     def test_scientific_gate_overlap_warns_without_moving_fixed_regional_bars(self):
         self.load('regional-offset', 100000)
-        self.w.color_scale_combo.setCurrentIndex(self.w.color_scale_combo.findData('3'))
+        dat.set_choice(self.w, 'color_scale', '3')
         p = self.w.workspace.active.presentation
         self.w.set_plot_presentation(replace(p, colorbar=replace(p.colorbar, alignment='left', frame_gap_in=0.)))
         audit = svg_export._audit_layout
