@@ -30,6 +30,7 @@ def main():
     try:
         from PySide6.QtCore import QEvent, QObject, QSettings, QTimer
         from PySide6.QtGui import QGuiApplication
+        from PySide6.QtQml import QQmlEngine, QQmlExpression
         import numpy as np
         import spectra_app.main_window as owner_module
         from spectra_app.quick_root import QuickApplication
@@ -88,8 +89,13 @@ def main():
                         if item is None or item.width() < 1 or item.height() < 1:
                             return False
                         image_item = item.findChild(QObject, 'XYCanvasImage')
+                        if image_item is None:
+                            return False
+                        expression = QQmlExpression(QQmlEngine.contextForObject(image_item),
+                                                    image_item, 'status === Image.Ready')
+                        ready, undefined = expression.evaluate()
                         images = scene.provider.images
-                        return (image_item is not None and image_item.property('status') == 1
+                        return (not undefined and not expression.hasError() and ready
                                 and bool(images) and not list(images.values())[-1].isNull())
 
                     wait(xy_ready, 'visible XY frame loaded')
