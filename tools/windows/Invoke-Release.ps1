@@ -56,7 +56,7 @@ print(next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Ass
     Assert-Exit 'Create isolated build Python'
     $python = "$env:RUNNER_TEMP/release-python/Scripts/python.exe"
     $innoInstaller = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
-    Invoke-WebRequest 'https://files.jrsoftware.org/is/6/innosetup-6.7.3.exe' -OutFile $innoInstaller -UseBasicParsing
+    Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $innoInstaller -UseBasicParsing
     $innoHash = (Get-FileHash -LiteralPath $innoInstaller -Algorithm SHA256).Hash
     if ($innoHash -cne '9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732') { throw 'Inno Setup installer checksum mismatch.' }
     $signature = Get-AuthenticodeSignature -LiteralPath $innoInstaller
