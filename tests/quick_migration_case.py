@@ -17,6 +17,11 @@ import unittest
 
 
 _CHILD_CASE = 'SPECTRA_QUICK_MIGRATION_CASE'
+_FONT_CACHE_NOTICE = 'Matplotlib is building the font cache; this may take a moment.'
+
+
+def _has_unexpected_stderr(stderr):
+    return any(line != _FONT_CACHE_NOTICE for line in stderr.splitlines())
 
 
 class QuickMigrationCase(unittest.TestCase):
@@ -72,7 +77,7 @@ class QuickMigrationCase(unittest.TestCase):
                     error = RuntimeError('Quick child failed after test cleanup.\n' + diagnostics)
                     result.addError(self, (RuntimeError, error, None))
                     reported = True
-                if completed.stderr:
+                if _has_unexpected_stderr(completed.stderr):
                     error = self.failureException('Quick child emitted diagnostics.\n' + diagnostics)
                     result.addFailure(self, (self.failureException, error, None))
                     reported = True

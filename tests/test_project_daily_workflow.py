@@ -436,12 +436,23 @@ print(json.dumps(dict(observed, exit=result), ensure_ascii=True))
     def test_rows_search_navigation_and_annotation_selection_stay_clean(self):
         w, path = self.saved()
         sn.reveal(w)
+        datasets = item(w, 'sourceDatasets')
+        row_height = item(w, 'sourceNavigation').property('datasetRowHeight')
+
+        def wait_for_rows(rows):
+            expected = rows * row_height
+            deadline = time.monotonic() + 3
+            while abs(datasets.height() - expected) > 0.5 and time.monotonic() < deadline:
+                sn.pump(10)
+            self.assertAlmostEqual(datasets.height(), expected, delta=0.5,
+                                   msg=f'dataset layout did not settle for {rows} rows')
+
         w.source_navigation.setVisibleRows(12)
-        sn.pump()
-        taller = item(w, 'sourceDatasets').height()
+        wait_for_rows(12)
+        taller = datasets.height()
         w.source_navigation.setVisibleRows(4)
-        sn.pump()
-        self.assertLess(item(w, 'sourceDatasets').height(), taller)
+        wait_for_rows(4)
+        self.assertLess(datasets.height(), taller)
         w.source_navigation.setSearchText('no match')
         self.assertTrue(w.request_task(1))
         self.assertTrue(w.request_task(0))

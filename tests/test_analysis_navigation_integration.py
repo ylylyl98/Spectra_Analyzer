@@ -20,6 +20,7 @@ from tests.quick_migration_case import QuickMigrationCase
 from tests.formal_quick_helpers import item, input_receiver, replace_text
 from tests.settings_helpers import wait_for_background_jobs
 from tests.scientific_fixtures import workflow_fit_result as _fit_result
+from spectra_app.plot_templates import FormatApplicationOptions
 
 
 APP = QCoreApplication
@@ -191,8 +192,13 @@ class AnalysisNavigationIntegrationTests(QuickMigrationCase):
                    'copy_png': w._graph_copy_png_action,
                    'settings_copy': w._settings_copy_action,
                    'settings_paste': w._settings_paste_action,
+                   'settings_paste_to': w._settings_paste_to_action,
+                   'settings_paste_options': w._settings_paste_options_action,
+                   'settings_adjust': w._settings_adjust_action,
+                   'settings_undo_paste': w._settings_undo_paste_action,
                    'settings_copy_to': w._settings_copy_to_action,
                    'comparison': w._comparison_action}
+        self.assertEqual({row['key'] for row in bridge.actions}, set(actions))
         for row in bridge.actions:
             action = actions[row['key']]
             self.assertEqual(row['enabled'], action.isEnabled())
@@ -211,13 +217,31 @@ class AnalysisNavigationIntegrationTests(QuickMigrationCase):
         self.assertIsNotNone(w._plot_settings_clipboard)
         self.assertTrue(w._settings_paste_action.isEnabled())
         self.assertTrue(next(row for row in bridge.actions if row['key'] == 'settings_paste')['enabled'])
-        for key, current_only in [('settings_paste', True), ('settings_copy_to', False)]:
+        # First-use Paste asks for options; explicit options and graph routes
+        # always open their respective dialog through the authoritative action.
+        for key, current_only in [('settings_paste', True),
+                                  ('settings_paste_options', True),
+                                  ('settings_paste_to', False),
+                                  ('settings_copy_to', False)]:
             self.assertTrue(actions[key].isEnabled())
             # Keep the authoritative QAction and handler; stop at the dialog
             # boundary, where independent format-dialog tests own editing.
-            with patch.object(w, '_show_paste_settings_dialog') as show:
+            with patch.object(w, '_has_paste_options', return_value=False), \
+                 patch.object(w, '_show_paste_settings_dialog') as show:
                 self.invoke(key)
             show.assert_called_once_with(current_only=current_only)
+        # With saved options, ordinary Paste applies directly without opening
+        # an options dialog. The workflow tests own the resulting format edits.
+        with patch.object(w, '_has_paste_options', return_value=True), \
+             patch.object(w, '_paste_options', return_value=FormatApplicationOptions()), \
+             patch.object(w, 'paste_plot_settings', return_value=[]) as paste, \
+             patch.object(w, '_show_paste_settings_dialog') as show:
+            self.invoke('settings_paste')
+        paste.assert_called_once_with()
+        show.assert_not_called()
+        for key in ('settings_adjust', 'settings_undo_paste'):
+            self.assertFalse(actions[key].isEnabled())
+            self.assertFalse(bridge.invoke(key, captured))
         self.assertTrue(w._comparison_action.isEnabled())
         before = len(w._plot_comparison_windows)
         self.invoke('comparison')
