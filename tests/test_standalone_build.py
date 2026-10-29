@@ -91,9 +91,11 @@ class StandaloneBuildRouteTests(unittest.TestCase):
         self.state = self.root / 'environment.json'
         self.set_environment()
         self.python.write_text(r'''$global:LASTEXITCODE=0
-if ($args[0] -eq '-c') {
-    if ($args[1] -like '*import ast*') { '0.1.2' }
-    else { @{version='3.14.0';bits=64;prefix=$env:FAKE_TOOLS;base_prefix=($env:FAKE_TOOLS + '\base')} | ConvertTo-Json -Compress }
+if ($args[0] -eq '-') {
+    $source = $input -join "`n"
+    if ($source -like '*import ast*') { '0.1.2' }
+    elseif ($source -like '*import json, platform, struct, sys*') { @{version='3.14.0';bits=64;prefix=$env:FAKE_TOOLS;base_prefix=($env:FAKE_TOOLS + '\base')} | ConvertTo-Json -Compress }
+    else { throw 'Unexpected Python stdin source.' }
 } else { Get-Content -Raw -LiteralPath $env:FAKE_STATE }
 ''', encoding='utf-8')
         self.driver = self.root / 'driver.ps1'

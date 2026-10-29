@@ -197,6 +197,10 @@ Rectangle {
         background: Rectangle { color: colors.surface; border.color: colors.border; radius: 4 }
         MenuCommand { objectName: "analysisNavSettingsCopy"; command: "settings_copy" }
         MenuCommand { objectName: "analysisNavSettingsPaste"; command: "settings_paste" }
+        MenuCommand { objectName: "analysisNavsettings_paste_to"; command: "settings_paste_to" }
+        MenuCommand { objectName: "analysisNavsettings_paste_options"; command: "settings_paste_options" }
+        MenuCommand { objectName: "analysisNavsettings_adjust"; command: "settings_adjust" }
+        MenuCommand { objectName: "analysisNavsettings_undo_paste"; command: "settings_undo_paste" }
         MenuCommand { objectName: "analysisNavSettingsCopyTo"; command: "settings_copy_to" }
         MenuCommand { objectName: "analysisNavComparison"; command: "comparison" }
         Controls.MenuSeparator { contentItem: Rectangle { implicitHeight: 1; color: colors.border } }

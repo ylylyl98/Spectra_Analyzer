@@ -1,5 +1,6 @@
 """Typed presentation models for target selection and isolated format previews."""
 from dataclasses import replace
+from copy import copy
 import os
 from pathlib import Path
 
@@ -63,7 +64,7 @@ class FormatOption(QObject):
     def __init__(self, key, label, available, checked, parent):
         super().__init__(parent)
         self._key, self._label, self._available = key, label, available
-        self._checked = checked and available
+        self._checked = bool(checked)
 
     key = Property(str, lambda self: self._key, constant=True)
     label = Property(str, lambda self: self._label + ('' if self._available else ' — unavailable in source'), constant=True)
@@ -72,7 +73,7 @@ class FormatOption(QObject):
 
     @Slot(bool)
     def setChecked(self, checked):
-        checked = checked and self._available
+        checked = bool(checked)
         if self._checked != checked:
             self._checked = checked
             self.changed.emit()
@@ -92,6 +93,7 @@ class AnnotationPair(QObject):
         self._index = 0
 
     datasetId = Property(str, lambda self: self.dataset_id, constant=True)
+    graphId = Property(str, lambda self: self.graph_id, constant=True)
     sourceId = Property(str, lambda self: self.source_id, constant=True)
     targetLabel = Property(str, lambda self: self._target_label, constant=True)
     label = Property(str, lambda self: self._label, constant=True)
@@ -176,23 +178,54 @@ class ApplyFormatBridge(PlotTargetsBridge):
                  ('color_limits', 'Color limits (V)'), ('mapping', 'Color mapping'),
                  ('title_position', 'Title position'), ('annotation_positions', 'Annotation positions')]
 
-    def __init__(self, sessions, active_id, template, source_label=None):
+    def __init__(self, sessions, active_id, template, source_label=None, *, initial_options=None,
+                 graph_targets=None, selected_targets=None, baseline_sessions=None,
+                 adjustment=False, initial_annotation_pairs=None):
         super().__init__(sessions, active_id)
+        self._graph_mode = graph_targets is not None
+        self._adjustment = bool(adjustment)
+        self._baselines = dict(baseline_sessions or {})
+        self.groups = []
+        if self._graph_mode:
+            allowed = set(map(tuple, graph_targets))
+            selected = set(map(tuple, selected_targets)) if selected_targets is not None else {(active_id, self.sessions[active_id].active_graph_id)} if active_id in self.sessions else set()
+            labels = dataset_display_labels(self.sessions.values())
+            self.targets, self._target_labels = [], {}
+            for session in self.sessions.values():
+                tooltip = str(session.source_path.resolve()) if session.source_path else 'Untitled dataset'
+                children = []
+                for graph in session.graphs.values():
+                    key = (session.dataset_id, graph.graph_id)
+                    if key not in allowed or not graph.published and not (adjustment and key in self._baselines):
+                        continue
+                    target = TargetChoice(*key, graph.name, tooltip, key in selected)
+                    target.changed.connect(self._selection_changed)
+                    children.append(target)
+                    self.targets.append(target)
+                    self._target_labels[key] = labels[session.dataset_id] + ' — Graph: ' + graph.name
+                if children:
+                    self.groups.append(TargetGroup(labels[session.dataset_id], tooltip, children, self))
         self.template = template
         self._source_label = source_label or template.name
         self.option_items = {}
         for key, label in self._basic + self._optional:
             available = (getattr(template, key) is not None if key in ('x_limits', 'y_limits', 'title_position')
                          else bool(template.annotation_layout) if key == 'annotation_positions' else True)
-            option = FormatOption(key, label, available, key in dict(self._basic), self)
+            option = FormatOption(key, label, available, getattr(initial_options, key) if initial_options is not None else key in dict(self._basic), self)
             option.changed.connect(self._selection_changed)
             self.option_items[key] = option
-        self._lock_ranges = True
+        self._lock_ranges = initial_options.lock_copied_ranges if initial_options is not None else True
         self.pairs = []
-        for dataset_id, session in self.sessions.items():
+        for key in self._all_target_keys():
+            session = self._target_session(key)
+            dataset_id = key[0] if self._graph_mode else key
             for entry in template.annotation_layout:
-                pair = AnnotationPair(dataset_id, self._target_labels[dataset_id], entry,
-                                      session.presentation.annotations, self)
+                pair = AnnotationPair(dataset_id, self._target_labels[key], entry, session.presentation.annotations, self)
+                pair.target_key = key
+                pair.graph_id = key[1] if self._graph_mode else session.active_graph_id
+                saved = (initial_annotation_pairs or {}).get(key, {}).get(entry.id)
+                if saved in pair.target_ids:
+                    pair._index = pair.target_ids.index(saved)
                 pair.changed.connect(self._selection_changed)
                 self.pairs.append(pair)
         self._preview_text, self._preview_url, self._preview_error = '', '', ''
@@ -205,16 +238,53 @@ class ApplyFormatBridge(PlotTargetsBridge):
         self._preview_timer.timeout.connect(self.render_preview)
         self._selection_changed()
 
+    graphTargetMode = Property(bool, lambda self: self._graph_mode, constant=True)
+    adjustment = Property(bool, lambda self: self._adjustment, constant=True)
+    targetGroups = Property('QVariantList', lambda self: self.groups, constant=True)
+    actionText = Property(str, lambda self: (f'Revise {len(self.selected_graph_targets())} graphs' if self._adjustment else f'Apply to {len(self.selected_graph_targets())} graphs') if self._graph_mode else 'Apply format', notify=previewChanged)
+    selectedCount = Property(int, lambda self: len(self.selected_graph_targets()), notify=PlotTargetsBridge.changed)
+
+    def _all_target_keys(self):
+        return [(t.dataset_id, t.graph_id) if self._graph_mode else t.dataset_id for t in self.targets]
+
+    def _selected_keys(self):
+        return [(t.dataset_id, t.graph_id) if self._graph_mode else t.dataset_id for t in self.targets if t.checked]
+
+    def selected_graph_targets(self):
+        return [(t.dataset_id, t.graph_id) for t in self.targets if t.checked]
+
+    def selected_ids(self):
+        return list(dict.fromkeys(t.dataset_id for t in self.targets if t.checked))
+
+    @Slot(bool)
+    def selectAll(self, checked):
+        if not self._adjustment:
+            super().selectAll(checked)
+
+    def _target_session(self, key):
+        if key in self._baselines:
+            return self._baselines[key]
+        if not self._graph_mode:
+            return self.sessions[key]
+        session = copy(self.sessions[key[0]])
+        session.graphs = dict(session.graphs)
+        session.activate_graph(key[1])
+        return session
+
+    def preference_options(self):
+        return FormatApplicationOptions(**{key: option.checked for key, option in self.option_items.items()},
+                                        lock_copied_ranges=self._lock_ranges)
+
     sourceLabel = Property(str, lambda self: self._source_label, constant=True)
     basicOptions = Property('QVariantList', lambda self: [self.option_items[k] for k, _ in self._basic], constant=True)
     optionalOptions = Property('QVariantList', lambda self: [self.option_items[k] for k, _ in self._optional], constant=True)
-    annotationPairs = Property('QVariantList', lambda self: [p for p in self.pairs if p.dataset_id in self.selected_ids()], notify=previewChanged)
+    annotationPairs = Property('QVariantList', lambda self: [p for p in self.pairs if p.target_key in self._selected_keys()], notify=previewChanged)
     annotationPositions = Property(bool, lambda self: self.option_items['annotation_positions'].checked, notify=previewChanged)
     lockRanges = Property(bool, lambda self: self._lock_ranges, notify=previewChanged)
     previewText = Property(str, lambda self: self._preview_text, notify=previewChanged)
     previewUrl = Property(str, lambda self: self._preview_url, notify=previewChanged)
     previewError = Property(str, lambda self: self._preview_error, notify=previewChanged)
-    previewLabels = Property('QStringList', lambda self: [self._target_labels[key] for key in self.selected_ids()], notify=previewChanged)
+    previewLabels = Property('QStringList', lambda self: [self._target_labels[key] for key in self._selected_keys()], notify=previewChanged)
     previewIndex = Property(int, lambda self: self._preview_index, notify=previewChanged)
 
     def options(self):
@@ -224,8 +294,8 @@ class ApplyFormatBridge(PlotTargetsBridge):
     def annotation_pairs(self):
         result = {}
         for pair in self.pairs:
-            if pair.dataset_id in self.selected_ids() and pair.currentIndex:
-                result.setdefault(pair.dataset_id, {})[pair.source_id] = pair.target_ids[pair.currentIndex]
+            if pair.target_key in self._selected_keys() and pair.currentIndex:
+                result.setdefault(pair.target_key, {})[pair.source_id] = pair.target_ids[pair.currentIndex]
         return result
 
     @Slot(bool)
@@ -245,7 +315,7 @@ class ApplyFormatBridge(PlotTargetsBridge):
 
     @Slot(int)
     def setPreviewIndex(self, index):
-        if 0 <= index < len(self.selected_ids()) and index != self._preview_index:
+        if 0 <= index < len(self._selected_keys()) and index != self._preview_index:
             self._preview_index = index
             self.changed.emit()
             self.previewChanged.emit()
@@ -282,8 +352,8 @@ class ApplyFormatBridge(PlotTargetsBridge):
             return super()._selection_changed()
         options, pair_map = self.options(), self.annotation_pairs()
         lines, candidates = [], []
-        for dataset_id in self.selected_ids():
-            session, pairs = self.sessions[dataset_id], pair_map.get(dataset_id, {})
+        for dataset_id in self._selected_keys():
+            session, pairs = self._target_session(dataset_id), pair_map.get(dataset_id, {})
             effective, notice = options, ''
             if options.annotation_positions and not pairs:
                 effective = replace(options, annotation_positions=False)

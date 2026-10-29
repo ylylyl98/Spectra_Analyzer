@@ -24,6 +24,10 @@ class FormalPlotController(QObject):
     formatApplyRequested = Signal(str)
     settingsCopyRequested = Signal()
     settingsPasteRequested = Signal()
+    settingsPasteToRequested = Signal()
+    settingsPasteOptionsRequested = Signal()
+    settingsAdjustRequested = Signal()
+    settingsUndoPasteRequested = Signal()
     settingsCopyToRequested = Signal()
     comparisonRequested = Signal()
     batchExportRequested = Signal()
@@ -142,6 +146,8 @@ class FormalPlotController(QObject):
         signals = {'analyze': self.analysisRequested, 'copy_svg': self.graphCopyRequested,
             'copy_png': self.graphPngCopyRequested,
             'settings_copy': self.settingsCopyRequested, 'settings_paste': self.settingsPasteRequested,
+            'settings_paste_to': self.settingsPasteToRequested, 'settings_paste_options': self.settingsPasteOptionsRequested,
+            'settings_adjust': self.settingsAdjustRequested, 'settings_undo_paste': self.settingsUndoPasteRequested,
             'settings_copy_to': self.settingsCopyToRequested, 'comparison': self.comparisonRequested,
             'format_save': self.formatSaveRequested, 'batch_export': self.batchExportRequested,
             'batch_cancel': self.batchCancelRequested, 'batch_results': self.batchResultsRequested}
@@ -169,8 +175,9 @@ class FormalPlotController(QObject):
                     'Load a DAT and correct any page editor errors first.')
         for key in ('settings_copy', 'settings_copy_to', 'comparison'):
             self.formal._commands[key].update(enabled=bool(available), tooltip=guidance)
-        self.formal._commands['settings_paste'].update(enabled=bool(available and source_label is not None),
-            tooltip=f'Paste frozen settings from {source_label}' if source_label else 'Copy settings from a valid source page first.')
+        for key in ('settings_paste', 'settings_paste_to', 'settings_paste_options'):
+            self.formal._commands[key].update(enabled=bool(available and source_label is not None),
+                tooltip=f'Paste frozen settings from {source_label}' if source_label else 'Copy settings from a valid source page first.')
         self.formal._commands['comparison']['tooltip'] = ('Open a read-only snapshot of the current DAT; its source and exports stay frozen.' if available else guidance)
         self.formal._clipboard = (f'Copied settings: {source_label} (frozen snapshot)' if source_label else
                                  'No copied settings. Copy a valid source page first.')

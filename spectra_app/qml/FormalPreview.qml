@@ -210,6 +210,30 @@ Rectangle {
             enabled: root.bridge.formatCommands.settings_paste === true
             onTriggered: { formatMenu.choice = "settings_paste"; formatMenu.close() }
         }
+        Controls.MenuItem {
+            objectName: "formalFormat_settings_paste_to"
+            text: "Paste Format to Graphs…"
+            enabled: root.bridge.formatCommands.settings_paste_to === true
+            onTriggered: { formatMenu.choice = "settings_paste_to"; formatMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "formalFormat_settings_paste_options"
+            text: "Paste Format Options…"
+            enabled: root.bridge.formatCommands.settings_paste_options === true
+            onTriggered: { formatMenu.choice = "settings_paste_options"; formatMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "formalFormat_settings_adjust"
+            text: "Adjust Last Paste…"
+            enabled: root.bridge.formatCommands.settings_adjust === true
+            onTriggered: { formatMenu.choice = "settings_adjust"; formatMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "formalFormat_settings_undo_paste"
+            text: "Undo Last Paste"
+            enabled: root.bridge.formatCommands.settings_undo_paste === true
+            onTriggered: { formatMenu.choice = "settings_undo_paste"; formatMenu.close() }
+        }
     }
 
     MouseArea {

@@ -1,0 +1,82 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact 40-character commit with a successful Windows full-suite gate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-stable-release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: windows-2025
+    outputs:
+      run_id: ${{ steps.gate.outputs.run_id }}
+    steps:
+      - name: Require exact-commit full-suite gate before checkout
+        id: gate
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_COMMIT -cnotmatch '^[0-9a-f]{40}$') { throw 'Expected lowercase 40-character source SHA' }
+          $json = gh api "repos/$env:GH_REPO/actions/workflows/tests.yml/runs?head_sha=$env:SOURCE_COMMIT&status=success&per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read full-suite runs' }
+          $run = ($json | ConvertFrom-Json).workflow_runs | Where-Object { $_.head_sha -ceq $env:SOURCE_COMMIT -and $_.head_branch -eq 'main' -and $_.conclusion -eq 'success' -and $_.event -in @('push','workflow_dispatch') } | Select-Object -First 1
+          if (-not $run) { throw 'No successful main full-suite run for this exact commit' }
+          $json = gh api "repos/$env:GH_REPO/actions/runs/$($run.id)/jobs?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read full-suite jobs' }
+          $gate = @(($json | ConvertFrom-Json).jobs | Where-Object { $_.name -eq 'Windows full-suite gate' -and $_.conclusion -eq 'success' })
+          if ($gate.Count -ne 1) { throw 'Required Windows full-suite gate did not pass' }
+          "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
+  release:
+    needs: gate
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      SUITE_RUN_ID: ${{ needs.gate.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14.0'
+          architecture: x64
+      - name: Validate, build, smoke and publish stable release
+        shell: powershell
+        run: |
+          & tools/windows/Invoke-Release.ps1 -SourceCommit $env:SOURCE_COMMIT -FullSuiteRunId $env:SUITE_RUN_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Release pipeline failed' }
+      - name: Retain release evidence and build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-release-${{ inputs.source_commit }}
+          path: |
+            ${{ runner.temp }}/release-evidence
+            ${{ runner.temp }}/release-build/*.log
+            ${{ runner.temp }}/release-build/*.json
+            ${{ runner.temp }}/release-build/*.txt
+            ${{ runner.temp }}/release-build/*.sha256
+          if-no-files-found: warn
+          retention-days: 30

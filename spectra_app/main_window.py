@@ -16,7 +16,7 @@ import json
 import re
 from copy import deepcopy
 from contextlib import ExitStack, contextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event
@@ -89,6 +89,7 @@ from .workbook_state import sheet_values, sheet_columns
 from .sheet_comparison_dialog import SheetComparisonDialog, validate_sheet_comparison
 from .plot_snapshot import region_layout, snapshot_dataset
 from .plot_templates import FormatApplicationOptions, FormatTemplateStore, capture_format, apply_format
+from .plot_paste import PASTE_OPTIONS_KEY, PasteOperation, graph_candidate, effective_paste_options, independently_formatted
 from .plot_comparison import PlotComparisonWindow
 from .plot_batch import BatchExportJob, BatchFileResult, BatchSummary, SerialPlotBatch
 from .plot_dialogs import ApplyFormatDialog, BatchExportDialog
@@ -506,6 +507,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         self._comparison_target_pinned = False
         self._plot_cube_owners = {}
         self._plot_settings_clipboard = None
+        self._latest_paste = None
         self._plot_settings_source_label = None
         self._plot_comparison_windows = []
         self._edit_histories = {}
@@ -995,7 +997,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
 
     def _graph_workspace_snapshot(self):
         keys = [(session.dataset_id, graph_id) for session in self.workspace.datasets.values()
-                for graph_id, graph in session.graphs.items() if graph.published]
+                for graph_id, graph in session.graphs.items() if graph.published and independently_formatted(graph)]
         keys.extend(('workbook', identity, '') for identity in self.workspace.workbooks)
         keys.extend(('xy', identity, '') for identity in self.workspace.comparisons)
         return self.graph_documents.workspace_snapshot(keys)
@@ -2285,15 +2287,24 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             ('_graph_copy_svg_action', 'Copy SVG', self._on_copy_graph_svg),
             ('_graph_copy_png_action', 'Copy PNG', self._on_copy_graph_png),
             ('_settings_copy_action', 'Copy settings', self._on_copy_plot_settings),
-            ('_settings_paste_action', 'Paste settings…', self._on_paste_plot_settings),
-            ('_settings_copy_to_action', 'Copy settings to active graphs…', self._on_copy_settings_to_datasets),
+            ('_settings_paste_action', 'Paste Format', self._on_paste_plot_settings),
+            ('_settings_paste_to_action', 'Paste Format to Graphs…', self._on_paste_settings_to_graphs),
+            ('_settings_paste_options_action', 'Paste Format Options…', self._on_paste_settings_options),
+            ('_settings_adjust_action', 'Adjust Last Paste…', self._on_adjust_last_paste),
+            ('_settings_undo_paste_action', 'Undo Last Paste', self._on_undo_last_paste),
+            ('_settings_copy_to_action', 'Copy Format to Graphs…', self._on_copy_settings_to_datasets),
             ('_comparison_action', 'Open comparison window', self._on_open_plot_comparison)):
             action = QAction(text, self); action.triggered.connect(handler); setattr(self, name, action)
         self.analysis_navigation = AnalysisNavigationBridge(self, self.toolbar, {
             'copy_svg': self._graph_copy_svg_action, 'copy_png': self._graph_copy_png_action,
             'settings_copy': self._settings_copy_action, 'settings_paste': self._settings_paste_action,
-            'settings_copy_to': self._settings_copy_to_action, 'comparison': self._comparison_action})
+            'settings_copy_to': self._settings_copy_to_action, 'comparison': self._comparison_action,
+            'settings_paste_to': self._settings_paste_to_action,
+            'settings_paste_options': self._settings_paste_options_action,
+            'settings_adjust': self._settings_adjust_action, 'settings_undo_paste': self._settings_undo_paste_action})
         self.analysis_header.stateChanged.connect(self.analysis_navigation.refresh)
+        for bridge in (self.dat_properties, self.analysis_header, self.ordinary_analysis, self.processing):
+            bridge.draftChanged.connect(self._refresh_paste_commands)
         self.dat_canvas.bind_navigation(self.analysis_navigation)
         self._refresh_transfer_controls()
 
@@ -2423,7 +2434,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                     items[key] = updated
         heatmaps = {}
         for session in self.workspace.datasets.values():
-            graphs = [graph for graph in session.graphs.values() if graph.published]
+            graphs = [graph for graph in session.graphs.values() if graph.published and independently_formatted(graph)]
             if not graphs:
                 continue
             parent = source_items.get(owners.get(session.dataset_id))
@@ -3789,6 +3800,10 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                 (page.formatApplyRequested, self._on_apply_plot_format),
                 (page.settingsCopyRequested, self._on_copy_plot_settings),
                 (page.settingsPasteRequested, self._on_paste_plot_settings),
+                (page.settingsPasteToRequested, self._on_paste_settings_to_graphs),
+                (page.settingsPasteOptionsRequested, self._on_paste_settings_options),
+                (page.settingsAdjustRequested, self._on_adjust_last_paste),
+                (page.settingsUndoPasteRequested, self._on_undo_last_paste),
                 (page.settingsCopyToRequested, self._on_copy_settings_to_datasets),
                 (page.comparisonRequested, self._on_open_plot_comparison),
                 (page.batchExportRequested, self._on_batch_export_plot),
@@ -3805,6 +3820,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         page.presentationError.connect(lambda message, owner=key, target=page:
             self._owned_plot_error(target, owner, message))
         page.formal.draftChanged.connect(self._schedule_project_modified)
+        page.formal.draftChanged.connect(self._refresh_paste_commands)
         page.formal.focusRequested.connect(lambda section, field, target=page:
             self._reveal_formal_editor(target, section, field))
         return page
@@ -4142,6 +4158,7 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
                 self._graph_command_actions[key].setEnabled(self.source_navigation.importEnabled)
 
     def _refresh_graph_commands(self):
+        self._refresh_paste_commands()
         self.processing.syncFromOwner()
         self._refresh_analysis_context()
         self._refresh_navigator_actions()
@@ -4648,8 +4665,6 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             self._graph_copy_png_action.setEnabled(available)
             self._settings_copy_action.setEnabled(available)
             self._settings_copy_to_action.setEnabled(available)
-            self._settings_paste_action.setEnabled(available and self._plot_settings_clipboard is not None)
-            self._settings_paste_action.setToolTip(self.plot_page.command_tooltip('settings_paste'))
             self._comparison_action.setEnabled(available)
             self._comparison_action.setToolTip(self.plot_page.command_tooltip('comparison'))
 
@@ -4695,22 +4710,211 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         self.publish_status('')
         return template
 
+    def _paste_options(self):
+        try:
+            payload = json.loads(self._annotation_settings.value(PASTE_OPTIONS_KEY, ''))
+            names = {item.name for item in fields(FormatApplicationOptions)}
+            if not isinstance(payload, dict) or set(payload) != names:
+                raise ValueError('Invalid saved paste options.')
+            return FormatApplicationOptions(**payload)
+        except (ValueError, TypeError):
+            return FormatApplicationOptions()
+
+    def _has_paste_options(self):
+        value = self._annotation_settings.value(PASTE_OPTIONS_KEY)
+        if value is None:
+            return False
+        try:
+            payload = json.loads(value)
+            return (isinstance(payload, dict)
+                    and set(payload) == {item.name for item in fields(FormatApplicationOptions)}
+                    and all(type(value) is bool for value in payload.values()))
+        except (TypeError, ValueError):
+            return False
+
+    def _save_paste_options(self, options):
+        self._annotation_settings.setValue(PASTE_OPTIONS_KEY, json.dumps(
+            {item.name: getattr(options, item.name) for item in fields(options)}))
+
+    def _paste_graph_targets(self):
+        return [(session.dataset_id, graph.graph_id) for session in self.workspace.datasets.values()
+                if session.current_cube is not None for graph in session.graphs.values()
+                if graph.published and independently_formatted(graph)]
+
     def create_paste_settings_dialog(self, *, current_only=False):
         if self._plot_settings_clipboard is None:
             raise ValueError('Copy settings from a valid source page first.')
-        sessions = (self.workspace.active,) if current_only else self.workspace.datasets.values()
         if self.workspace.active is None:
             raise ValueError('Choose an imported target dataset first.')
         self.capture_active_dataset()
-        return ApplyFormatDialog(sessions, self.workspace.active_dataset_id, self._plot_settings_clipboard,
-                                 self.root_window, source_label=self._plot_settings_source_label)
+        targets = [self._document_key()] if current_only else self._paste_graph_targets()
+        sessions = (self.workspace.active,) if current_only else self.workspace.datasets.values()
+        return ApplyFormatDialog(sessions, self.workspace.active_dataset_id,
+            self._plot_settings_clipboard, self.root_window, source_label=self._plot_settings_source_label,
+            initial_options=self._paste_options(), graph_targets=None if current_only else targets,
+            selected_targets=[self._document_key()])
 
-    def paste_plot_settings(self, dataset_ids=None, *, options=None, annotation_pairs=None):
+    def _paste_history_snapshot(self, sessions):
+        return {session.dataset_id: (self._history_for(session),
+            tuple(self._history_for(session).undo_stack), tuple(self._history_for(session).redo_stack))
+            for session in sessions}
+
+    def _capture_paste_ownership(self, operation):
+        operation.states = {}
+        for key in operation.baselines:
+            session = self.workspace.datasets[key[0]]
+            graph = session.graphs[key[1]]
+            operation.states[key] = (session, graph, deepcopy(graph.view), graph.presentation,
+                self._plot_owner_token(key), session.current_cube, session.base_cube,
+                graph.source_mode, deepcopy(graph.gate_indices), graph.result_id, graph.published,
+                None if graph.analysis is None else
+                (id(graph.analysis), graph.analysis.job_token, id(graph.analysis.science.current_cube)))
+        operation.expected_histories = self._paste_history_snapshot(
+            {state[0].dataset_id: state[0] for state in operation.states.values()}.values())
+
+    def _validate_latest_paste(self):
+        operation = self._latest_paste
+        if operation is None:
+            raise ValueError('There is no latest paste to revise or undo.')
+        if (self._history_busy() or self._pending_history_edit is not None
+                or any(bridge.has_project_drafts() for bridge in
+                       (self.dat_properties, self.analysis_header, self.ordinary_analysis, self.processing))):
+            raise ValueError('Finish the current operation or pending edit before changing the latest paste.')
+        for key, state in operation.states.items():
+            session, graph, view, presentation, token, cube, base, mode, gates, result, published, analysis = state
+            if (self.workspace.datasets.get(key[0]) is not session
+                    or session.graphs.get(key[1]) is not graph or graph.published != published):
+                raise ValueError('A pasted target was deleted or replaced.')
+            if (graph.view != view or graph.presentation != presentation
+                    or self._plot_owner_token(key) != token
+                    or session.current_cube is not cube or session.base_cube is not base
+                    or graph.source_mode != mode or graph.gate_indices != gates or graph.result_id != result
+                    or (None if graph.analysis is None else
+                        (id(graph.analysis), graph.analysis.job_token, id(graph.analysis.science.current_cube))) != analysis):
+                raise ValueError('A pasted graph or its data changed after the latest paste.')
+            page = self.graph_documents.document_for(key)
+            if page is None and key == self._document_key():
+                page = self.plot_page
+            if page is not None and (page.presentation_error is not None or page.has_pending_project_edits()):
+                raise ValueError('Finish the pending pasted graph editor before changing the latest paste.')
+            if key == self._document_key() and self._heat_ax is not None:
+                # Toolbar pan/zoom can precede its revision callback.
+                recipe = graph.view.plot_recipe(graph_cube(session, graph), session.applied, graph.presentation)
+                if (tuple(self._heat_ax.get_xlim()) != tuple(recipe['x_limits'])
+                        or tuple(self._heat_ax.get_ylim()) != tuple(recipe['y_limits'])):
+                    raise ValueError('The pasted graph view changed after the latest paste.')
+        for dataset_id, (history, undo, redo) in operation.expected_histories.items():
+            current = self._history_for(self.workspace.datasets[dataset_id])
+            if (current is not history or len(current.undo_stack) != len(undo)
+                    or len(current.redo_stack) != len(redo)
+                    or any(a is not b for a, b in zip(current.undo_stack, undo))
+                    or any(a is not b for a, b in zip(current.redo_stack, redo))):
+                raise ValueError('Edit history changed after the latest paste.')
+        return operation
+
+    def paste_plot_settings(self, dataset_ids=None, *, options=None, annotation_pairs=None, graph_targets=None):
         if self._plot_settings_clipboard is None:
             raise ValueError('Copy settings from a valid source page first.')
-        ids = [self.workspace.active_dataset_id] if dataset_ids is None else dataset_ids
-        return self._apply_plot_template(self._plot_settings_clipboard, ids,
-            options=options or FormatApplicationOptions(), annotation_pairs=annotation_pairs)
+        self._finish_graph_editors(capture_science=False)
+        self._finish_history_edit()
+        legacy_targets = graph_targets is None
+        if graph_targets is None:
+            ids = [self.workspace.active_dataset_id] if dataset_ids is None else dataset_ids
+            graph_targets = [(identifier, self.workspace.datasets[identifier].active_graph_id
+                              if identifier in self.workspace.datasets else None) for identifier in ids]
+        targets = list(dict.fromkeys(tuple(key) for key in graph_targets))
+        baselines = {}
+        for key in targets:
+            session = self.workspace.datasets.get(key[0])
+            if session is None or key[1] not in session.graphs:
+                continue
+            try:
+                baselines[key] = graph_candidate(session, key[1])
+            except (KeyError, ValueError, TypeError):
+                # The application path reports this target's preparation error
+                # alongside successes instead of aborting the entire batch.
+                continue
+        histories = self._paste_history_snapshot(
+            {key[0]: self.workspace.datasets[key[0]] for key in baselines}.values())
+        chosen = options if options is not None else self._paste_options()
+        normalized_pairs = {key: deepcopy((annotation_pairs or {}).get(key,
+            (annotation_pairs or {}).get(key[0], {}))) for key in baselines}
+        operation = PasteOperation(deepcopy(self._plot_settings_clipboard), baselines, chosen,
+                                   normalized_pairs, histories)
+        outcomes = self._apply_plot_template(operation.source, (),
+            options=effective_paste_options(operation.source, chosen),
+            annotation_pairs=operation.pairs, graph_targets=targets, _allow_unpublished=legacy_targets)
+        applied = {(item['dataset_id'], item['graph_id']) for item in outcomes if item.get('applied')}
+        operation.baselines = {key: value for key, value in baselines.items() if key in applied}
+        operation.histories = {key: value for key, value in histories.items()
+                               if any(target[0] == key for target in applied)}
+        if operation.baselines:
+            self._latest_paste = operation
+            self._capture_paste_ownership(operation)
+        self._refresh_paste_commands()
+        return outcomes
+
+    def create_adjust_paste_dialog(self):
+        operation = self._validate_latest_paste()
+        targets = list(operation.baselines)
+        return ApplyFormatDialog(self.workspace.datasets.values(), self.workspace.active_dataset_id,
+            operation.source, self.root_window, initial_options=operation.options,
+            graph_targets=targets, selected_targets=targets, baseline_sessions=operation.baselines,
+            adjustment=True, initial_annotation_pairs=operation.pairs)
+
+    def adjust_last_paste(self, options, annotation_pairs=None):
+        operation = self._validate_latest_paste()
+        pairs = operation.pairs if annotation_pairs is None else annotation_pairs
+        normalized_pairs = {key: deepcopy(pairs.get(key, pairs.get(key[0], {}))) for key in operation.baselines}
+        outcomes = self._apply_plot_template(operation.source, (),
+            options=effective_paste_options(operation.source, options),
+            annotation_pairs=normalized_pairs, graph_targets=list(operation.baselines),
+            _baselines=operation.baselines, _history_prefixes=operation.histories, _status_action='revised')
+        if all(item.get('applied') for item in outcomes):
+            operation.options, operation.pairs = options, normalized_pairs
+            self._capture_paste_ownership(operation)
+            self._save_paste_options(options)
+        self._refresh_paste_commands()
+        return outcomes
+
+    def undo_last_paste(self):
+        operation = self._validate_latest_paste()
+        # The staging path validates/renders every baseline before touching any target.
+        outcomes = self._apply_plot_template(None, (), graph_targets=list(operation.baselines),
+            _baselines=operation.baselines, _history_prefixes=operation.histories, _status_action='restored')
+        if not all(item.get('applied') for item in outcomes):
+            self._report_format_outcomes(outcomes)
+            return False
+        self._latest_paste = None
+        self._refresh_paste_commands()
+        self._report_format_outcomes(outcomes)
+        return all(item['success'] for item in outcomes)
+
+    def _refresh_paste_commands(self):
+        if not hasattr(self, 'plot_page'):
+            return
+        available = (self.workspace.active is not None and self.workspace.active.current_cube is not None
+                     and self.plot_page.presentation_error is None and not self._auxiliary_active()
+                     and not self._history_busy())
+        copied = self._plot_settings_clipboard is not None
+        independent = self.workspace.active is not None and independently_formatted(self.workspace.active.active_graph)
+        current_available = available and independent
+        try:
+            self._validate_latest_paste()
+            revisable, reason = True, ''
+        except ValueError as exc:
+            revisable, reason = False, str(exc)
+        for key, enabled in (('settings_paste', current_available and copied),
+                ('settings_paste_to', available and copied), ('settings_paste_options', current_available and copied),
+                ('settings_adjust', revisable), ('settings_undo_paste', revisable)):
+            tooltip = reason if key in ('settings_adjust', 'settings_undo_paste') else (
+                'This Analysis Graph inherits its source format; select the source graph.'
+                if key in ('settings_paste', 'settings_paste_options') and not independent else None)
+            self.plot_page.set_command_availability(key, enabled, tooltip)
+            action = getattr(self, '_' + key + '_action', None)
+            if action is not None:
+                action.setEnabled(enabled)
+                action.setToolTip(self.plot_page.command_tooltip(key))
 
     def open_plot_comparison(self):
         session, snapshot, page = self._capture_formal_source()
@@ -4740,7 +4944,42 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             self._show_error(f'Cannot copy settings: {exc}')
 
     def _on_paste_plot_settings(self):
+        if (not self._has_paste_options() or self._paste_options().annotation_positions
+                and getattr(self._plot_settings_clipboard, 'annotation_layout', ())):
+            self._show_paste_settings_dialog(current_only=True)
+            return
+        try:
+            self._report_format_outcomes(self.paste_plot_settings())
+        except Exception as exc:
+            self._show_error(f'Cannot paste settings: {exc}')
+
+    def _on_paste_settings_to_graphs(self):
+        self._show_paste_settings_dialog(current_only=False)
+
+    def _on_paste_settings_options(self):
         self._show_paste_settings_dialog(current_only=True)
+
+    def _on_adjust_last_paste(self):
+        dialog = None
+        try:
+            dialog = self.create_adjust_paste_dialog()
+            if dialog.exec() == 1:
+                outcomes = self.adjust_last_paste(dialog.options(), dialog.annotation_pairs())
+                if outcomes and all(item.get('applied') for item in outcomes):
+                    self._latest_paste.options = dialog.preference_options()
+                    self._save_paste_options(dialog.preference_options())
+                self._report_format_outcomes(outcomes)
+        except Exception as exc:
+            self._show_error(f'Cannot adjust latest paste: {exc}')
+        finally:
+            if dialog is not None:
+                dialog.deleteLater()
+
+    def _on_undo_last_paste(self):
+        try:
+            self.undo_last_paste()
+        except Exception as exc:
+            self._show_error(f'Cannot undo latest paste: {exc}')
 
     def _on_copy_settings_to_datasets(self):
         try:
@@ -4755,8 +4994,14 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
         try:
             dialog = self.create_paste_settings_dialog(current_only=current_only)
             if dialog.exec() == 1:
-                self._report_format_outcomes(self.paste_plot_settings(dialog.selected_ids(),
-                    options=dialog.options(), annotation_pairs=dialog.annotation_pairs()))
+                outcomes = self.paste_plot_settings(
+                    dialog.selected_ids() if current_only else None,
+                    graph_targets=None if current_only else dialog.selected_graph_targets(),
+                    options=dialog.options(), annotation_pairs=dialog.annotation_pairs())
+                if any(item.get('applied') for item in outcomes):
+                    self._latest_paste.options = dialog.preference_options()
+                    self._save_paste_options(dialog.preference_options())
+                self._report_format_outcomes(outcomes)
         except Exception as exc:
             self._show_error(f'Cannot paste settings: {exc}')
         finally:
@@ -4805,73 +5050,94 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             copy_color_limits=copy_color_limits, options=options, annotation_pairs=annotation_pairs)
 
     def _apply_plot_template(self, template, dataset_ids, *, copy_mapping=False, copy_color_limits=False,
-                             options=None, annotation_pairs=None):
+                             options=None, annotation_pairs=None, graph_targets=None,
+                             _baselines=None, _history_prefixes=None, _allow_unpublished=False, _status_action='applied'):
         self._finish_history_edit()
-        outcomes = []
-        active_changed = False
-        prepared = {}
-        for dataset_id in dataset_ids:
+        exact = graph_targets is not None
+        targets = list(dict.fromkeys(tuple(key) for key in graph_targets)) if exact else [
+            (identifier, self.workspace.datasets[identifier].active_graph_id
+             if identifier in self.workspace.datasets else None) for identifier in dataset_ids]
+        outcomes, staged = [], []
+        for key in targets:
+            dataset_id, graph_id = key
             session = self.workspace.datasets.get(dataset_id)
-            label = f'{session.source_path} — {session.active_graph.name}' if session else dataset_id
+            graph = session.graphs.get(graph_id) if session else None
+            label = f'{session.source_path} — {graph.name} [ID: {dataset_id}/{graph_id}]' if graph else str(key)
             notice = ''
             try:
-                if session is None or session.current_cube is None:
-                    raise ValueError('The imported dataset is unavailable.')
-                before = capture_fields(session, STYLE_FIELDS + ('presentation',))
-                candidate = detached_graph_session(session)
-                pairs = (annotation_pairs or {}).get(dataset_id, {})
+                if session is None or session.current_cube is None or graph is None:
+                    raise ValueError('The imported graph is unavailable.')
+                if exact and not independently_formatted(graph):
+                    raise ValueError('This Analysis Graph inherits its format; paste to its source graph instead.')
+                if exact and not _allow_unpublished and _baselines is None and not graph.published:
+                    raise ValueError('Only published heatmap graphs support Paste Format.')
+                current = graph_candidate(session, graph_id)
+                before = capture_fields(current, STYLE_FIELDS + ('presentation',))
+                candidate = graph_candidate((_baselines or {}).get(key, session), graph_id)
+                baseline = capture_fields(candidate, STYLE_FIELDS + ('presentation',))
+                pairs = (annotation_pairs or {}).get(key, (annotation_pairs or {}).get(dataset_id, {}))
                 effective = options
                 if options is not None and options.annotation_positions and not pairs:
                     effective = replace(options, annotation_positions=False)
                     notice = 'Annotation positions skipped: no explicit usable pairs selected.'
-                result = apply_format(candidate, template, copy_mapping=copy_mapping,
-                                      copy_color_limits=copy_color_limits, options=effective, annotation_pairs=pairs)
-                key = (dataset_id, session.active_graph_id)
+                result = (apply_format(candidate, template, copy_mapping=copy_mapping,
+                    copy_color_limits=copy_color_limits, options=effective, annotation_pairs=pairs)
+                    if template is not None else None)
                 target = self.graph_documents.document_for(key)
                 if target is None and key == self._document_key():
                     target = self.plot_page
                 unchanged = not field_changes(before, capture_fields(candidate, STYLE_FIELDS + ('presentation',)))
-                already_valid = unchanged and self._formal_page_matches_view(target, candidate)
-                if not already_valid:
-                    # Keep the exact final bytes used to validate retained
-                    # text/ticks/data, including any measured paper growth.
+                snapshot = rendered = None
+                if not (unchanged and self._formal_page_matches_view(target, candidate)):
                     snapshot = self.snapshot_plot_dataset(candidate)
                     candidate.presentation, rendered = prepare_heatmap_page(
                         snapshot, candidate.presentation, renderer=render_hybrid_svg)
-                    prepared[key] = (session, snapshot, candidate.presentation, rendered)
-                session.view, session.presentation = candidate.view, candidate.presentation
+                staged.append((key, session, candidate, before, baseline, target, snapshot, rendered))
+                outcomes.append({'dataset_id': dataset_id, 'graph_id': graph_id, 'source': label,
+                    'success': True, 'applied': False,
+                    'changed_fields': result.changed_fields if result is not None else (),
+                    'notice': notice, 'error': ''})
             except Exception as exc:
-                outcomes.append({'dataset_id':dataset_id,'source':label,'success':False,'error':str(exc)})
-                continue
-            after = capture_fields(session, STYLE_FIELDS + ('presentation',))
+                outcomes.append({'dataset_id': dataset_id, 'graph_id': graph_id, 'source': label,
+                                 'success': False, 'applied': False, 'error': str(exc)})
+        if _history_prefixes is not None and any(not item['success'] for item in outcomes):
+            for item in outcomes:
+                if item['success']:
+                    item.update(success=False, error='Batch unchanged: another target failed validation.')
+            return outcomes
+        # Adjust/Undo owns each dataset's whole suffix, including multiple graphs.
+        if _history_prefixes is not None:
+            for history, undo, redo in _history_prefixes.values():
+                history.undo_stack[:] = undo
+                history.redo_stack[:] = redo
+        active_changed = False
+        prepared = {}
+        by_key = {(item['dataset_id'], item['graph_id']): item for item in outcomes}
+        for key, session, candidate, before, baseline, target, snapshot, rendered in staged:
+            graph = session.graphs[key[1]]
+            graph.view, graph.presentation = candidate.view, candidate.presentation
+            after = capture_fields(candidate, STYLE_FIELDS + ('presentation',))
+            if template is not None:
+                history_before = baseline if _baselines is not None else before
+                if field_changes(history_before, after):
+                    self._record_history(session, 'Paste plot format', history_before, after, graph_id=key[1])
             if field_changes(before, after):
-                self._record_history(session, 'Paste plot format', before, after)
                 self._invalidate_graph_document(key, kind='presentation')
                 if target is not None:
-                    target.set_presentation(session.presentation)
-                active_changed |= dataset_id == self.workspace.active_dataset_id
-            try:
-                self._save_plot_dataset(session)
-            except (ValueError, OSError, TypeError) as exc:
-                outcomes.append({'dataset_id':dataset_id,'source':label,'success':False,
-                                 'changed_fields':result.changed_fields,'notice':notice,'error':f'Applied; sidecar save failed: {exc}'})
-            else:
-                outcomes.append({'dataset_id':dataset_id,'source':label,'success':True,
-                                 'changed_fields':result.changed_fields,'notice':notice,'error':''})
+                    target.set_presentation(candidate.presentation)
+                active_changed |= key == self._document_key()
+            if rendered is not None:
+                prepared[key] = (session, snapshot, candidate.presentation, rendered)
+            by_key[key]['applied'] = True
         if active_changed:
             self._project_plot_dataset(self.workspace.active)
-        # Projection can advance view and presentation revisions. Publish the
-        # validated candidate only after those revisions have their final owner.
         for key, (session, snapshot, presentation, rendered) in prepared.items():
-            # Inactive documents keep their established lazy preparation and
-            # invalidation boundary; this operation presents the active target.
             if key != self._document_key():
                 continue
             target = self.graph_documents.document_for(key)
-            if target is None and key == self._document_key():
+            if target is None:
                 target = self.plot_page
-            if (target is None or self.workspace.datasets.get(key[0]) is not session
-                    or session.graphs[key[1]].presentation != presentation
+            if (target is None or session.graphs[key[1]].presentation != presentation
                     or target.presentation_error is not None or target.has_pending_project_edits()):
                 continue
             owner = self._plot_owner_token(key)
@@ -4882,14 +5148,25 @@ class ApplicationController(AnalysisWorkbenchMixin, QObject):
             target.preview.set_geometry(snapshot, presentation)
             self._refresh_formal_colorbar_norms(target, snapshot)
             target.commit_rendered_page(replace(rendered, owner_token=owner))
+        # Save after every graph in a dataset has committed; a failed save is
+        # still an applied in-memory target owned by the latest operation.
+        for dataset_id in dict.fromkeys(key[0] for key, *_ in staged):
+            try:
+                self._save_plot_dataset(self.workspace.datasets[dataset_id])
+            except (ValueError, OSError, TypeError) as exc:
+                for item in outcomes:
+                    if item['dataset_id'] == dataset_id and item['applied']:
+                        item.update(success=False, error=f'Applied; sidecar save failed: {exc}')
         if self.plot_page.rendered_page is not None:
             self._plot_render_timer.stop()
         if any(self.graph_documents.document_for(key).rendered_page is None
                for key in self.graph_documents.visible_keys() if len(key) == 2):
             self._schedule_plot_page_render()
+        self._refresh_graph_commands()
         failures = sum(not item['success'] for item in outcomes)
-        self.publish_status(
-            f'Format applied: {len(outcomes)-failures}/{len(outcomes)} datasets; {failures} failed' if failures else '')
+        self.publish_status(f'Format {_status_action}: {len(outcomes)-failures}/{len(outcomes)} graphs; '
+            f'{failures} failed. ' + '; '.join(item['source'] + (': ' + item['error'] if item['error'] else ': ' + _status_action)
+                                           for item in outcomes))
         skipped = [item['source'] for item in outcomes if item.get('notice')]
         if skipped:
             self.plot_page.set_status_message('Annotation positions skipped (no explicit usable pairs): ' + '; '.join(skipped))

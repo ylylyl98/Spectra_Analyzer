@@ -121,9 +121,18 @@ try {
     $windowsSearchPaths = @((Join-Path $env:WINDIR 'System32'), $env:WINDIR)
     $env:PATH = $windowsSearchPaths -join ';'
     $versionSource = Join-Path $repository 'spectra_app\app_version.py'
-    $version = & $BuildPython -c 'import ast,sys; tree=ast.parse(open(sys.argv[1], encoding="utf-8").read()); print(next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="APP_VERSION" for t in n.targets)))' $versionSource
+    # Keep Python source out of native arguments for Windows PowerShell 5.1.
+    $version = @'
+import ast, sys
+with open(sys.argv[1], encoding="utf-8-sig") as source:
+    tree = ast.parse(source.read())
+print(next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "APP_VERSION" for t in n.targets)))
+'@ | & $BuildPython - $versionSource
     if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'APP_VERSION must be a numeric major.minor.patch string.' }
-    $runtimeJson = & $BuildPython -c 'import json,platform,struct,sys; print(json.dumps(dict(version=platform.python_version(),bits=struct.calcsize("P")*8,prefix=sys.prefix,base_prefix=sys.base_prefix)))'
+    $runtimeJson = @'
+import json, platform, struct, sys
+print(json.dumps(dict(version=platform.python_version(), bits=struct.calcsize("P") * 8, prefix=sys.prefix, base_prefix=sys.base_prefix)))
+'@ | & $BuildPython -
     if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the build Python environment.' }
     $runtime = $runtimeJson | ConvertFrom-Json
     if ($runtime.version -ne '3.14.0' -or $runtime.bits -ne 64) {

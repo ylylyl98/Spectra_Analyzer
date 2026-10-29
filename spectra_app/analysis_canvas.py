@@ -207,7 +207,7 @@ class AnalysisCanvasBridge(QObject):
     @Property('QVariantMap', notify=stateChanged)
     def formatCommands(self):
         return {action['key']: action['enabled'] for action in self._navigation.actions
-                if action['key'] in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste')} if self._navigation is not None else {}
+                if action['key'] in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste', 'settings_paste_to', 'settings_paste_options', 'settings_adjust', 'settings_undo_paste')} if self._navigation is not None else {}
 
     def request_format_menu(self, pointer):
         if isinstance(pointer, CanvasPointerContext) and self.allowed(pointer.owner) and self._navigation is not None:
@@ -250,12 +250,12 @@ class AnalysisCanvasBridge(QObject):
     @Slot(str, str, str, result=bool)
     def choosePeakMenu(self, request_id, key, owner):
         request = self._peak_menu_request
-        if (key not in ('set_label', 'delete', 'copy_svg', 'copy_png', 'settings_copy', 'settings_paste')
+        if (key not in ('set_label', 'delete', 'copy_svg', 'copy_png', 'settings_copy', 'settings_paste', 'settings_paste_to', 'settings_paste_options', 'settings_adjust', 'settings_undo_paste')
                 or request is None or not self._peak_menu_ready
                 or request.request_id != request_id or request.pointer.owner != owner):
             return False
         self.clear_peak_menu()  # Consume before the prompt's nested event loop.
-        if key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste'):
+        if key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste', 'settings_paste_to', 'settings_paste_options', 'settings_adjust', 'settings_undo_paste'):
             accepted = self._invoke_format_command(key, owner)
             self.restorePeakMenuFocus(owner)
             return accepted

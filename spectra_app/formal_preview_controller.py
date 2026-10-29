@@ -111,8 +111,8 @@ class FormalPreviewController(QObject):
     formatCommands = Property('QVariantMap', lambda self: dict(self._format_commands), notify=stateChanged)
 
     def set_format_commands(self, commands):
-        commands = {key: bool(commands[key]['enabled'])
-                    for key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste')}
+        commands = {key: bool(commands.get(key, {}).get('enabled', False))
+                    for key in ('copy_svg', 'copy_png', 'settings_copy', 'settings_paste', 'settings_paste_to', 'settings_paste_options', 'settings_adjust', 'settings_undo_paste')}
         if commands != self._format_commands:
             self._format_commands = commands
             self.stateChanged.emit()

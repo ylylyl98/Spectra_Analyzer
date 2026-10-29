@@ -12,6 +12,24 @@ used as a standalone distribution.
 
 ## Build
 
+For stable releases, use the GitHub Actions **Windows release** workflow. Push the
+release commit to `main`, wait for **Windows full suite** and its full-suite gate
+to pass, then dispatch `release.yml` with `source_commit` set to that exact
+40-character SHA. All release testing and packaging run on GitHub Windows runners.
+`APP_VERSION` and `docs/releases/vVERSION.md` must describe the intended version.
+
+The workflow retains the exact-commit verdict, provisions CPython 3.14.0 and
+checksum/signature-verified Inno Setup 6.7.3 outside the checkout, then performs
+source smoke, a clean Release build, frozen/production smoke and isolated installer
+validation. It verifies artifact hashes and creates a draft with every asset before
+publishing it as stable/latest for the updater. Existing tags or releases cause a
+failure instead of being overwritten. A failed publication may leave a draft for
+manual inspection. Download `windows-release-SHA` for logs and validation reports.
+Hidden startup checks do not replace native visual/high-DPI review.
+
+The commands below document development packaging; they are not required for the
+GitHub release workflow.
+
 Use CPython **3.14.0 x64**, matching the validated dependency lock, and the
 official Inno Setup 6 compiler. Obtain Inno Setup from
 <https://jrsoftware.org/isdl.php> and verify its Authenticode signature. The
@@ -47,7 +65,7 @@ Inno Setup is not required and no installer or ZIP is compressed.
   -OutputDirectory 'C:\BuildOutput\spectra-preview-001'
 ```
 
-To deliver only `SpectraAnalyzer-0.1.4-Setup.exe`, select `-Mode Installer`, provide
+To deliver only `SpectraAnalyzer-0.1.5-Setup.exe`, select `-Mode Installer`, provide
 `-InnoCompiler`, and keep the same cache directory. This freezes once, compresses
 one installer, and skips the portable ZIP. `Preview` and `Installer` share cache
 entries. A preceding Preview build is optional. Each still creates a fresh bundle

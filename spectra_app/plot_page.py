@@ -17,6 +17,10 @@ class PlotPage(QWidget):
     formatApplyRequested = Signal(str)
     settingsCopyRequested = Signal()
     settingsPasteRequested = Signal()
+    settingsPasteToRequested = Signal()
+    settingsPasteOptionsRequested = Signal()
+    settingsAdjustRequested = Signal()
+    settingsUndoPasteRequested = Signal()
     settingsCopyToRequested = Signal()
     comparisonRequested = Signal()
     batchExportRequested = Signal()
@@ -32,7 +36,7 @@ class PlotPage(QWidget):
         super().__init__(parent)
         self.controller = FormalPlotController(self, prompt_window=self._prompt_window)
         self.controller.set_enabled(self.isEnabled())
-        for name in ('presentationChanged', 'presentationError', 'exportRequested', 'formatSaveRequested', 'formatLoadRequested', 'formatDeleteRequested', 'formatApplyRequested', 'settingsCopyRequested', 'settingsPasteRequested', 'settingsCopyToRequested', 'comparisonRequested', 'batchExportRequested', 'batchCancelRequested', 'batchResultsRequested', 'displayScaleChanged', 'displayZoomChanged', 'propertyEditRequested', 'graphCopyRequested', 'analysisRequested'):
+        for name in ('presentationChanged', 'presentationError', 'exportRequested', 'formatSaveRequested', 'formatLoadRequested', 'formatDeleteRequested', 'formatApplyRequested', 'settingsCopyRequested', 'settingsPasteRequested', 'settingsPasteToRequested', 'settingsPasteOptionsRequested', 'settingsAdjustRequested', 'settingsUndoPasteRequested', 'settingsCopyToRequested', 'comparisonRequested', 'batchExportRequested', 'batchCancelRequested', 'batchResultsRequested', 'displayScaleChanged', 'displayZoomChanged', 'propertyEditRequested', 'graphCopyRequested', 'analysisRequested'):
             getattr(self.controller, name).connect(getattr(self, name))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)

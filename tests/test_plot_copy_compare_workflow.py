@@ -289,6 +289,7 @@ class PlotCopyCompareWorkflowTests(QuickMigrationCase):
 
     def test_dialog_selects_independent_groups_previews_ranges_and_disables_old_missing_fields(self):
         self.copy_source()
+        self.w.open_graph_document(self.a.dataset_id)
         dialog = self.w.create_paste_settings_dialog()
         self.addCleanup(dialog.close)
         self.assertTrue(dialog.options().layout)
@@ -377,6 +378,10 @@ class PlotCopyCompareWorkflowTests(QuickMigrationCase):
                    PlotAnnotation('t2', text='same', position=(.7, .2)),
                    PlotAnnotation('ta', kind='arrow', text='2', position=(.6, .3), target=(.11, .22)))
         self.b.presentation = replace(self.b.presentation, annotations=targets)
+        # The exact-graph batch picker lists published graph documents.
+        for session in (self.a, self.b, self.c):
+            w.open_graph_document(session.dataset_id)
+        w.activate_dataset(self.a.dataset_id)
         dialog = w.create_paste_settings_dialog()
         self.addCleanup(dialog.close)
         dialog.bridge.selectAll(True)

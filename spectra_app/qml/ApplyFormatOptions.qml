@@ -68,7 +68,7 @@ Controls.ScrollView {
                 Controls.Label { text: modelData.targetLabel; wrapMode: Text.Wrap; Layout.fillWidth: true; font.bold: true }
                 Controls.Label { text: modelData.label + " →"; wrapMode: Text.Wrap; Layout.fillWidth: true; font: Qt.application.font }
                 Controls.ComboBox {
-                    objectName: "annotationPair_" + modelData.datasetId + "_" + modelData.sourceId
+                    objectName: "annotationPair_" + modelData.datasetId + "_" + modelData.graphId + "_" + modelData.sourceId
                     Layout.fillWidth: true
                     model: modelData.choices
                     currentIndex: modelData.currentIndex

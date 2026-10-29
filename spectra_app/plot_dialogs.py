@@ -16,14 +16,24 @@ class PlotTargetsDialog(QuickDialog):
 
 
 class ApplyFormatDialog(QuickDialog):
-    def __init__(self, sessions, active_id, template, parent=None, *, source_label=None):
-        bridge = ApplyFormatBridge(sessions, active_id, template, source_label)
-        super().__init__(bridge, 'ApplyFormatDialog.qml', parent, title='Apply format — ' + template.name,
+    def __init__(self, sessions, active_id, template, parent=None, *, source_label=None, initial_options=None,
+                 graph_targets=None, selected_targets=None, baseline_sessions=None,
+                 adjustment=False, initial_annotation_pairs=None):
+        bridge = ApplyFormatBridge(sessions, active_id, template, source_label,
+            initial_options=initial_options, graph_targets=graph_targets, selected_targets=selected_targets,
+            baseline_sessions=baseline_sessions, adjustment=adjustment, initial_annotation_pairs=initial_annotation_pairs)
+        super().__init__(bridge, 'ApplyFormatDialog.qml', parent, title=('Adjust last paste — ' if adjustment else 'Apply format — ') + template.name,
                          size=(940, 680), image_provider=bridge.image_provider)
         self.sessions, self.template = bridge.sessions, template
 
     def selected_ids(self):
         return self.bridge.selected_ids()
+
+    def selected_graph_targets(self):
+        return self.bridge.selected_graph_targets()
+
+    def preference_options(self):
+        return self.bridge.preference_options()
 
     def options(self):
         return self.bridge.options()

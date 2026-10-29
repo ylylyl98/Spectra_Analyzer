@@ -252,6 +252,30 @@ FocusScope {
             enabled: root.bridge.formatCommands.settings_paste === true
             onTriggered: { root.peakChoice = "settings_paste"; peakMenu.close() }
         }
+        Controls.MenuItem {
+            objectName: "analysisFormat_settings_paste_to"
+            text: "Paste Format to Graphs…"
+            enabled: root.bridge.formatCommands.settings_paste_to === true
+            onTriggered: { root.peakChoice = "settings_paste_to"; peakMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "analysisFormat_settings_paste_options"
+            text: "Paste Format Options…"
+            enabled: root.bridge.formatCommands.settings_paste_options === true
+            onTriggered: { root.peakChoice = "settings_paste_options"; peakMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "analysisFormat_settings_adjust"
+            text: "Adjust Last Paste…"
+            enabled: root.bridge.formatCommands.settings_adjust === true
+            onTriggered: { root.peakChoice = "settings_adjust"; peakMenu.close() }
+        }
+        Controls.MenuItem {
+            objectName: "analysisFormat_settings_undo_paste"
+            text: "Undo Last Paste"
+            enabled: root.bridge.formatCommands.settings_undo_paste === true
+            onTriggered: { root.peakChoice = "settings_undo_paste"; peakMenu.close() }
+        }
     }
 
     Connections {

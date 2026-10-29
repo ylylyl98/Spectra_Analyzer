@@ -114,8 +114,12 @@ Rectangle {
                     font: root.controlFont
                     background: MenuHoverBackground { id: settingsHoverBackground }
                     MenuCommand { commandKey: "settings_copy"; text: "Copy settings"; hoverTracker: settingsHoverBackground.hoverTracker }
-                    MenuCommand { commandKey: "settings_paste"; text: "Paste settings"; hoverTracker: settingsHoverBackground.hoverTracker }
-                    MenuCommand { commandKey: "settings_copy_to"; text: "Copy to active graphs…"; hoverTracker: settingsHoverBackground.hoverTracker }
+                    MenuCommand { commandKey: "settings_paste"; text: "Paste Format"; hoverTracker: settingsHoverBackground.hoverTracker }
+                    MenuCommand { commandKey: "settings_paste_to"; text: "Paste Format to Graphs…"; hoverTracker: settingsHoverBackground.hoverTracker }
+                    MenuCommand { commandKey: "settings_paste_options"; text: "Paste Format Options…"; hoverTracker: settingsHoverBackground.hoverTracker }
+                    MenuCommand { commandKey: "settings_adjust"; text: "Adjust Last Paste…"; hoverTracker: settingsHoverBackground.hoverTracker }
+                    MenuCommand { commandKey: "settings_undo_paste"; text: "Undo Last Paste"; hoverTracker: settingsHoverBackground.hoverTracker }
+                    MenuCommand { commandKey: "settings_copy_to"; text: "Copy Format to Graphs…"; hoverTracker: settingsHoverBackground.hoverTracker }
                     Controls.MenuSeparator {}
                     MenuCommand { commandKey: "comparison"; text: "Comparison snapshot…"; hoverTracker: settingsHoverBackground.hoverTracker }
                 }

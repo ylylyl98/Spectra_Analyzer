@@ -155,7 +155,7 @@ class PeakMenuQuickTests(QuickMigrationCase):
         ac.release(w, point, button=Qt.RightButton); ac.pump(70)
         menu = ac.peak_menu(w)
         self.assertTrue(menu.property('visible'))
-        self.assertEqual(menu.property('count'), 9)
+        self.assertEqual(menu.property('count'), 13)
         self.assertIn('8', item(host, 'analysisPeakSetLabel').property('text'))
         self.assertEqual(item(host, 'analysisPeakDelete').property('text'), 'Delete Peak')
         self.assertTrue(ac.peak_menu(w).property('visible'))

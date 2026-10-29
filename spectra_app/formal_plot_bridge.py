@@ -38,7 +38,7 @@ CHOICES = {'axis_x_mode': ('Auto', 'By increment', 'By count'),
            'bar_label_format': ('auto', 'decimal', 'scientific', 'engineering'),
            'bar_scientific_style': ('e', 'times-ten'), 'bar_alignment': ('right', 'center', 'left'),
            'bar_signal_position': ('left', 'above')}
-COMMANDS = ('analyze', 'copy_svg', 'copy_png', 'export_svg', 'export_png', 'settings_copy', 'settings_paste',
+COMMANDS = ('analyze', 'copy_svg', 'copy_png', 'export_svg', 'export_png', 'settings_copy', 'settings_paste', 'settings_paste_to', 'settings_paste_options', 'settings_adjust', 'settings_undo_paste',
     'settings_copy_to', 'comparison', 'format_save', 'format_load', 'format_delete', 'format_apply',
     'batch_export', 'batch_results', 'batch_cancel')
 
@@ -78,7 +78,8 @@ class FormalPlotBridge(QObject):
         self._formats = []
         self._selected_format = ''
         self._commands = {key: {'enabled': key not in ('copy_svg', 'copy_png', 'export_svg', 'export_png',
-            'format_load', 'format_delete', 'format_apply', 'batch_results', 'batch_cancel'),
+            'format_load', 'format_delete', 'format_apply', 'batch_results', 'batch_cancel',
+            'settings_adjust', 'settings_undo_paste'),
             'tooltip': ''} for key in COMMANDS}
         self._clipboard = ''
         self._batch = {'visible': False, 'maximum': 0, 'value': 0, 'status': '', 'tooltip': '',

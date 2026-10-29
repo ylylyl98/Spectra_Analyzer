@@ -48,11 +48,75 @@ Rectangle {
                 Layout.minimumWidth: 0
                 spacing: 8
                 PlotTargetsList {
+                    visible: !root.bridge.graphTargetMode
                     bridge: root.bridge
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     Layout.preferredHeight: 180
                     Layout.minimumHeight: 206
+                }
+                Controls.ScrollView {
+                    visible: bridge.graphTargetMode
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.preferredHeight: 180
+                    clip: true
+                    contentWidth: availableWidth
+                    ColumnLayout {
+                        width: parent.width
+                        Repeater {
+                            model: bridge.targetGroups
+                            ColumnLayout {
+                                required property var modelData
+                                Layout.fillWidth: true
+                                Controls.CheckBox {
+                                    objectName: "formatDataset_" + modelData.children[0].datasetId
+                                    Layout.fillWidth: true
+                                    text: modelData.label
+                                    contentItem: Text {
+                                        text: parent.text
+                                        font: parent.font
+                                        leftPadding: parent.indicator.width + parent.spacing
+                                        color: "#263447"
+                                        wrapMode: Text.Wrap
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    tristate: true
+                                    checkState: modelData.checkState
+                                    enabled: !bridge.adjustment
+                                    nextCheckState: function() { return checkState === Qt.Checked ? Qt.Unchecked : Qt.Checked }
+                                    onClicked: modelData.setChecked(checkState === Qt.Checked)
+                                }
+                                Repeater {
+                                    model: modelData.children
+                                    Controls.CheckBox {
+                                        required property var modelData
+                                        objectName: "formatGraph_" + modelData.datasetId + "_" + modelData.graphId
+                                        Layout.fillWidth: true
+                                        Layout.leftMargin: 22
+                                        text: modelData.label
+                                        contentItem: Text {
+                                            text: parent.text
+                                            font: parent.font
+                                            leftPadding: parent.indicator.width + parent.spacing
+                                            color: "#263447"
+                                            wrapMode: Text.Wrap
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+                                        checked: modelData.checked
+                                        enabled: !bridge.adjustment
+                                        onToggled: modelData.setChecked(checked)
+                                    }
+                                }
+                            }
+                        }
+                        Controls.Label { visible: bridge.adjustment; text: "Targets fixed for this paste. Deselect format groups to restore originals."; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                    }
+                }
+                RowLayout {
+                    visible: root.bridge.graphTargetMode && !root.bridge.adjustment
+                    SurfaceButton { text: "Select all"; onClicked: bridge.selectAll(true) }
+                    SurfaceButton { text: "Clear"; onClicked: bridge.selectAll(false) }
                 }
                 Controls.TabBar {
                     id: previewTabs
@@ -124,7 +188,7 @@ Rectangle {
         PlotDialogFooter {
             bridge: root.bridge
             dialogHost: root.dialogHost
-            actionText: "Apply format"
+            actionText: bridge.actionText
             Layout.fillWidth: true
         }
     }
