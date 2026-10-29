@@ -28,7 +28,7 @@ def main():
     app = host = None
     original_settings = None
     try:
-        from PySide6.QtCore import QEvent, QSettings, QTimer
+        from PySide6.QtCore import QEvent, QObject, QSettings, QTimer
         from PySide6.QtGui import QGuiApplication
         import numpy as np
         import spectra_app.main_window as owner_module
@@ -69,7 +69,9 @@ def main():
 
             def exercise():
                 try:
-                    wait(lambda: host.window.isVisible(), 'Quick root visible')
+                    wait(lambda: host.window.isVisible() and host.window.isExposed()
+                         and host.window.width() > 0 and host.window.height() > 0,
+                         'Quick root exposed and laid out')
                     source = scratch / 'curve.csv'
                     x = np.arange(21, dtype=float)
                     np.savetxt(source, np.column_stack((x, x*x + 2)), delimiter=',')
@@ -78,7 +80,19 @@ def main():
                     comparison = create_comparison(owner.workspace, 'Release smoke')
                     add_curve(owner.workspace, comparison.comparison_id, book.sheet_ids[0], 0, 1)
                     xy = owner.open_xy_comparison(comparison.comparison_id)
-                    wait(lambda: xy._scene is not None and bool(xy._scene.provider.images), 'XY frame')
+                    def xy_ready():
+                        scene = xy._scene
+                        if scene is None or not xy.presentation_eligible():
+                            return False
+                        item = scene._item
+                        if item is None or item.width() < 1 or item.height() < 1:
+                            return False
+                        image_item = item.findChild(QObject, 'XYCanvasImage')
+                        images = scene.provider.images
+                        return (image_item is not None and image_item.property('status') == 1
+                                and bool(images) and not list(images.values())[-1].isNull())
+
+                    wait(xy_ready, 'visible XY frame loaded')
                     assert np.array_equal(xy.axes.lines[0].get_ydata(), x*x + 2)
                     svg = xy.export(output / 'xy-export.svg').read_bytes()
                     assert b'<svg' in svg and len(svg) > 1000
@@ -115,8 +129,9 @@ def main():
                     try:
                         assert dialog.bridge is not None
                         dialog.show()
-                        app.processEvents()
-                        assert dialog.rootObject() is not None
+                        wait(lambda: dialog.rootObject() is not None
+                             and dialog.window().isVisible() and dialog.window().isExposed(),
+                             'Paste Format dialog exposed')
                     finally:
                         dialog.close()
                         dialog.deleteLater()

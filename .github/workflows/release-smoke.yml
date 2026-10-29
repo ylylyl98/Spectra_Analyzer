@@ -1,0 +1,57 @@
+name: Windows release smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-smoke:
+    name: Windows source release smoke
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14.0'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: tools/windows/requirements-standalone.txt
+      - name: Install pinned standalone dependencies
+        run: python -m pip install -r tools/windows/requirements-standalone.txt
+      - name: Prepare canonical temporary paths and Windows PowerShell modules
+        shell: powershell
+        run: |
+          $privateTemp = Join-Path $env:RUNNER_TEMP 'spectra-test-temp'
+          New-Item -ItemType Directory -Path $privateTemp -Force | Out-Null
+          $canonicalTemp = python -c "from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))" $privateTemp
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the private temporary directory' }
+          if ([IO.Path]::GetPathRoot($canonicalTemp) -ne [IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)) {
+            throw 'Temporary fixtures and the checkout must use the same drive'
+          }
+          $nativeModules = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\Modules'
+          $env:PSModulePath = $nativeModules
+          Import-Module Microsoft.PowerShell.Utility,Microsoft.PowerShell.Archive -Force
+          $lines = "TMP=$canonicalTemp`nTEMP=$canonicalTemp`nPSModulePath=$nativeModules`n"
+          [IO.File]::AppendAllText($env:GITHUB_ENV, $lines, [Text.UTF8Encoding]::new($false))
+          Write-Host "Canonical private temporary directory: $canonicalTemp"
+          Write-Host "Windows PowerShell module path: $nativeModules"
+      - name: Run source release smoke diagnostic
+        shell: powershell
+        run: |
+          python -B tools/windows/release_smoke.py --output "${{ runner.temp }}/release-smoke"
+          if ($LASTEXITCODE -ne 0) { throw 'Release smoke diagnostic failed' }
+          $report = Get-Content -Raw "${{ runner.temp }}/release-smoke/release-smoke.json" | ConvertFrom-Json
+          if ($report.status -ne 'passed') { throw "Release smoke report status: $($report.status)" }
+      - name: Upload release smoke evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-release-smoke
+          path: ${{ runner.temp }}/release-smoke
+          if-no-files-found: warn
+          retention-days: 14
