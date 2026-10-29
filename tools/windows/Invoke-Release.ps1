@@ -65,8 +65,20 @@ print(next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Ass
     $process = Start-Process -FilePath $innoInstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',('"/DIR=' + $inno + '"')) -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw 'Inno Setup installation failed.' }
     $compiler = Join-Path $inno 'ISCC.exe'
-    if ((Get-Item $compiler).VersionInfo.ProductVersion -notmatch '^6\.7\.3') { throw 'Unexpected Inno compiler version.' }
-    [ordered]@{sha256=$innoHash;signature=[string]$signature.Status;publisher=$signature.SignerCertificate.Subject;compilerVersion=(Get-Item $compiler).VersionInfo.ProductVersion} | ConvertTo-Json | Set-Content "$evidence/inno.json" -Encoding UTF8
+    # ISCC's PE version resource is not the compiler engine version. A real,
+    # output-disabled compile reports the engine version loaded from ISCmplr.dll.
+    $compilerInfo = (Get-Item -LiteralPath $compiler).VersionInfo
+    $probe = Join-Path $privateTemp 'inno-version-probe.iss'
+    @('[Setup]', 'AppName=Version probe', 'AppVersion=1', 'DefaultDirName={autopf}\VersionProbe', 'Output=no') | Set-Content -LiteralPath $probe -Encoding ASCII
+    $priorErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $compilerOutput = @(& $compiler $probe 2>&1 | ForEach-Object { "$_" })
+        $compilerExitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $priorErrorPreference }
+    $engineLines = @($compilerOutput | Where-Object { $_ -like 'Compiler engine version:*' })
+    [ordered]@{sha256=$innoHash;signature=[string]$signature.Status;publisher=$signature.SignerCertificate.Subject;compilerFileVersion=$compilerInfo.FileVersion;compilerProductVersion=$compilerInfo.ProductVersion;compilerEngineVersion=$engineLines;probeExitCode=$compilerExitCode;probeOutput=$compilerOutput} | ConvertTo-Json | Set-Content "$evidence/inno.json" -Encoding UTF8
+    if ($compilerExitCode -ne 0 -or $engineLines.Count -ne 1 -or $engineLines[0] -cne 'Compiler engine version: Inno Setup 6.7.3') { throw "Unexpected Inno compiler identity: exit=$compilerExitCode; fileVersion='$($compilerInfo.FileVersion)'; productVersion='$($compilerInfo.ProductVersion)'; engine='$($engineLines -join '; ')'. See inno.json for probe output." }
     & $python -m pip install -r tools/windows/requirements-standalone.txt
     Assert-Exit 'Install pinned release dependencies'
     & $python -m pip check
